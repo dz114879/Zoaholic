@@ -686,8 +686,18 @@ async def process_request_passthrough(
         original_model=original_model,
     )
 
-    # 渠道级透传 payload 修饰（把“渠道特殊逻辑”收敛在各自 channel 文件内）
-    if channel and getattr(channel, "passthrough_payload_adapter", None):
+    # 渠道级透传 payload 修饰（把“渠道特殊逻辑”收敛在各自 channel 文件内）。
+    # Responses compact 是原生辅助端点，必须保留 compact 请求语义，不应用普通
+    # /v1/responses 的 system/instructions/store=false 兼容 patch。
+    skip_passthrough_payload_adapter = (
+        passthrough_ctx.dialect_id == "openai-responses"
+        and endpoint == "/v1/responses/compact"
+    )
+    if (
+        channel
+        and getattr(channel, "passthrough_payload_adapter", None)
+        and not skip_passthrough_payload_adapter
+    ):
         payload = await channel.passthrough_payload_adapter(
             payload,
             passthrough_ctx.modifications,
