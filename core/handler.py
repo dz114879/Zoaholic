@@ -52,6 +52,22 @@ def set_debug_mode(debug: bool):
     is_debug = debug
 
 
+def _fill_failure_provider_info(
+    current_info: Dict[str, Any],
+    provider_name: Optional[str],
+    request_model_name: str,
+) -> None:
+    # 修改原因：错误路径过去只记录成功请求中的 provider 和 model，导致 500 日志显示“未知”或“-”。
+    # 修改方式：在失败统计写入前统一补齐最后尝试的 provider、缺失的 provider_id 和缺失的 model。
+    # 目的：让不重试错误和所有重试耗尽错误都能在日志中定位最后失败渠道与请求模型。
+    provider_value = provider_name if provider_name else None
+    current_info["provider"] = provider_value
+    if not current_info.get("provider_id"):
+        current_info["provider_id"] = provider_value
+    if not current_info.get("model"):
+        current_info["model"] = request_model_name
+
+
 def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
     """异步写入 ChannelStat，不依赖 FastAPI BackgroundTasks。
 
@@ -1286,7 +1302,7 @@ class ModelRequestHandler:
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
                 # ── Key Rules 统一错误处理 ──
-                from core.key_rules import resolve_key_rules, match_key_rules
+                from core.key_rules import apply_key_rule_retry_override, resolve_key_rules, match_key_rules
                 _key_rules = resolve_key_rules(provider.get("preferences") or {})
                 _rule_result = match_key_rules(_key_rules, status_code, error_message) if _key_rules else None
 
@@ -1312,16 +1328,71 @@ class ModelRequestHandler:
 
                 channel_id = provider['provider']
 
-                if (self.app.state.channel_manager.cooldown_period > 0 
+                # ★ 修复：优先从 request_info 获取本次实际使用的 api_key，
+                # 避免并发场景下 after_next_current() 返回其他请求的 key，
+                # 导致冷却/禁用操作作用在错误的 key 上。
+                _current_info_for_key = self.request_info_getter()
+                current_api = _current_info_for_key.get("_used_api_key") or \
+                    await provider_api_circular_list[channel_id].after_next_current()
+
+                should_consider_channel_cooldown = (
+                    self.app.state.channel_manager.cooldown_period > 0
                     and override_providers is None
                     and num_matching_providers > 1
-                    and all(error not in error_message for error in exclude_error_rate_limit)):
-                    # 修改原因：override 模式中的 provider 列表可能是前端或虚拟路由测试构造的临时候选池。
-                    # 修改方式：只有正常请求才进入 channel_manager 冷却后重算全局路由；override 测试保持原候选列表顺序。
-                    # 目的：避免虚拟路由测试重试时因 api_index 授权或全局路由重算而脱离本次测试链条。
+                    and all(error not in error_message for error in exclude_error_rate_limit)
+                )
+
+                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判。
+                try:
+                    api_key_count_before_rule = provider_api_circular_list[channel_id].get_enabled_items_count()
+                except Exception:
+                    api_key_count_before_rule = provider_api_circular_list[channel_id].get_items_count()
+
+                key_rule_disabled_current = False
+                # ── 应用 Key Rules 规则：冷却 / 禁用 ──
+                if _rule_result and current_api:
+                    _duration = _rule_result.get("duration", 0)
+                    _reason = _rule_result.get("reason", "key_rule")
+                    if _duration == -1:
+                        # 永久禁用
+                        await provider_api_circular_list[channel_id].set_auto_disabled(
+                            current_api, duration=0, reason=_reason
+                        )
+                        key_rule_disabled_current = True
+                    elif _duration > 0:
+                        # 修改原因：旧逻辑只在多 key 时冷却，单渠道单 key 依赖原有重试行为；但多渠道降级时，最后一个失败 key 必须能让渠道被判定为耗尽。
+                        # 修改方式：多 key 仍按旧规则冷却；当渠道级降级条件成立时，最后一个 key 也执行冷却。
+                        # 目的：既保留单渠道单 key 的旧行为，又让多渠道虚拟路由能在所有 key 不可用后再进入 fallback。
+                        if (
+                            (api_key_count_before_rule > 1 or should_consider_channel_cooldown)
+                            and all(error not in error_message for error in exclude_error_rate_limit)
+                        ):
+                            await provider_api_circular_list[channel_id].set_auto_disabled(
+                                current_api, duration=_duration, reason=_reason
+                            )
+                            key_rule_disabled_current = True
+
+                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判。
+                # 修改原因：旧逻辑先冷却渠道再冷却 key，会把同渠道剩余 key 从候选列表中埋没。
+                # 修改方式：key 级规则执行后，再检查该渠道是否还有启用 key。
+                # 目的：只有当前渠道所有 key 都不可用时，才进入渠道级冷却和候选列表重建。
+                try:
+                    api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
+                except Exception:
+                    api_key_count = provider_api_circular_list[channel_id].get_items_count()
+
+                should_rebuild_after_channel_cooldown = (
+                    should_consider_channel_cooldown
+                    and (api_key_count <= 0 or not key_rule_disabled_current)
+                )
+
+                if should_rebuild_after_channel_cooldown:
+                    # 修改原因：只有当前错误确实触发 key 禁用时，才应等待当前渠道所有 key 耗尽；未命中 key_rules 时继续留在当前渠道会反复取到同一 key。
+                    # 修改方式：key 已被禁用时沿用“启用 key 数量为 0 才冷却渠道”；key 未被禁用时立即走渠道级冷却并重建候选列表。
+                    # 目的：既保留多 key 渠道先耗尽 key 的行为，又避免无匹配 key_rules 的渠道在虚拟路由中循环重试。
                     await self.app.state.channel_manager.exclude_model(channel_id, request_model_name)
                     matching_providers = await get_right_order_providers(
-                        request_model_name, config, api_index, scheduling_algorithm, 
+                        request_model_name, config, api_index, scheduling_algorithm,
                         self.app, request_total_tokens=request_total_tokens
                     )
                     matching_providers = await self._build_attempt_providers(
@@ -1337,34 +1408,9 @@ class ModelRequestHandler:
                     max_attempts = num_matching_providers + retry_count
                     if num_matching_providers != last_num_matching_providers:
                         index = 0
-
-                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判
-                try:
-                    api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
-                except Exception:
-                    api_key_count = provider_api_circular_list[channel_id].get_items_count()
-                # ★ 修复：优先从 request_info 获取本次实际使用的 api_key，
-                # 避免并发场景下 after_next_current() 返回其他请求的 key，
-                # 导致冷却/禁用操作作用在错误的 key 上。
-                _current_info_for_key = self.request_info_getter()
-                current_api = _current_info_for_key.get("_used_api_key") or \
-                    await provider_api_circular_list[channel_id].after_next_current()
-
-                # ── 应用 Key Rules 规则：冷却 / 禁用 ──
-                if _rule_result and current_api:
-                    _duration = _rule_result.get("duration", 0)
-                    _reason = _rule_result.get("reason", "key_rule")
-                    if _duration == -1:
-                        # 永久禁用
-                        await provider_api_circular_list[channel_id].set_auto_disabled(
-                            current_api, duration=0, reason=_reason
-                        )
-                    elif _duration > 0 and api_key_count > 1:
-                        # 定时冷却（仅多 key 时生效）
-                        if all(error not in error_message for error in exclude_error_rate_limit):
-                            await provider_api_circular_list[channel_id].set_auto_disabled(
-                                current_api, duration=_duration, reason=_reason
-                            )
+                # 当 key 被冷却但渠道仍有可用 key 时：不做 exclude_model，也不回退 index。
+                # index 正常前进，通过 max_attempts 的 modulo 循环回来时 circular_list 自动取下一个 key。
+                # 不能 index = current_index，否则 index 永远到不了 max_attempts，死循环。
 
                 # 有些错误并没有请求成功，所以需要删除请求记录
                 if (current_api 
@@ -1417,6 +1463,11 @@ class ModelRequestHandler:
                     )
                 )
 
+                # 修改原因：Key Rules 新增 retry 三态，需要在默认硬编码判断之后提供按规则覆盖的能力。
+                # 修改方式：只有 _rule_result.retry 为 bool 时覆盖 retry_enabled，缺失时保持默认结果。
+                # 目的：支持 retry=true 强制允许重试、retry=false 强制禁止重试，同时不影响旧配置。
+                retry_enabled = apply_key_rule_retry_override(_rule_result, retry_enabled)
+
                 # 特定场景禁止重试：
                 # 1. 图像生成失败（no image was generated）通常是内容审核或模型能力问题，重试无效且增加负载
                 if "no image was generated" in error_message.lower():
@@ -1443,6 +1494,10 @@ class ModelRequestHandler:
                 # 不重试：直接返回本次错误
                 # 失败时也记录重试信息和统计
                 current_info = self.request_info_getter()
+                # 修改原因：不重试错误会直接写入失败统计，过去没有补齐渠道和模型字段。
+                # 修改方式：在写 retry_path 和失败状态前调用统一 helper，写入最后尝试 provider 与请求模型。
+                # 目的：避免直接返回 500 或其他错误时日志 provider 显示“未知”、model 显示“-”。
+                _fill_failure_provider_info(current_info, provider_name, request_model_name)
                 if retry_path:
                     current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
                 current_info["retry_count"] = current_retry_count
@@ -1464,7 +1519,10 @@ class ModelRequestHandler:
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["status_code"] = status_code
-        current_info["provider"] = None
+        # 修改原因：所有重试失败时旧逻辑把 provider 写成 None，丢失最后一次尝试的渠道。
+        # 修改方式：复用失败字段补全 helper，只在 provider_id 和 model 缺失时补写它们。
+        # 目的：让重试耗尽后的日志至少保留最后失败渠道和原始请求模型。
+        _fill_failure_provider_info(current_info, provider_name, request_model_name)
         # 记录最终的重试信息
         if retry_path:
             current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)

@@ -299,6 +299,13 @@ class StatsMiddleware:
             "retry_path": None,
             "request_headers": None,
             "request_body": None,
+            # 修改原因：日志上下文需要完整承载上下游请求与响应的原始数据字段。
+            # 修改方式：初始化上游请求头、上游请求体、上游响应头和上游响应体字段为 None。
+            # 目的：让后续采集逻辑和数据库写入使用稳定的字段集合。
+            "upstream_request_headers": None,
+            "upstream_request_body": None,
+            "upstream_response_headers": None,
+            "upstream_response_body": None,
             "response_body": None,
             "raw_data_expires_at": None,
         }

@@ -110,10 +110,13 @@ async def cleanup_expired_raw_data():
                 if (DB_TYPE or "sqlite").lower() == "d1":
                     result = await db.execute(
                         "UPDATE request_stats "
-                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
+                        # 修改原因：新增 upstream_response_headers 后，过期原始数据清理需要同步覆盖该列。
+                        # 修改方式：在 D1 清理 SQL 的 SET 和非空判断中加入 upstream_response_headers。
+                        # 目的：避免响应头超过保留期后仍留在 request_stats。
+                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_headers = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
                         "WHERE raw_data_expires_at IS NOT NULL "
                         "AND raw_data_expires_at < ? "
-                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
+                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
                         [now],
                     )
                     rowcount = int((result.get("meta") or {}).get("changes") or 0)
@@ -132,6 +135,10 @@ async def cleanup_expired_raw_data():
                         (RequestStat.request_body.isnot(None)) |
                         (RequestStat.upstream_request_headers.isnot(None)) |
                         (RequestStat.upstream_request_body.isnot(None)) |
+                        # 修改原因：SQLAlchemy 分支的过期清理条件也必须包含新增响应头字段。
+                        # 修改方式：在非空条件中追加 RequestStat.upstream_response_headers。
+                        # 目的：只有响应头未清理的旧记录也能被匹配并清空。
+                        (RequestStat.upstream_response_headers.isnot(None)) |
                         (RequestStat.upstream_response_body.isnot(None)) |
                         (RequestStat.response_body.isnot(None)) |
                         (RequestStat.retry_path.isnot(None))
@@ -141,6 +148,10 @@ async def cleanup_expired_raw_data():
                         request_body=None,
                         upstream_request_headers=None,
                         upstream_request_body=None,
+                        # 修改原因：清理动作匹配后需要实际清空新增响应头字段。
+                        # 修改方式：在 update().values 中把 upstream_response_headers 设为 None。
+                        # 目的：保证 SQLAlchemy 数据库类型与 D1 的清理结果一致。
+                        upstream_response_headers=None,
                         upstream_response_body=None,
                         response_body=None,
                         retry_path=None,

@@ -7,7 +7,7 @@ import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Files, Play,
-  Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical
+  Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical, ChevronUp, ChevronDown
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -25,6 +25,16 @@ import {
   getProviderWeight,
   summarizeVirtualChain,
 } from '../lib/virtualModels';
+import {
+  formatKeyRuleKeywordsInput,
+  formatKeyRuleStatusInput,
+  getKeyRuleRetryMode,
+  parseKeyRuleKeywordsInput,
+  parseKeyRuleStatusInput,
+  sanitizeKeyRulesForSave,
+  setKeyRuleRetryMode,
+  type KeyRuleRetryMode,
+} from '../lib/keyRules';
 
 // ========== Types ==========
 interface ApiKeyObj {
@@ -132,6 +142,17 @@ function readBooleanPreference(value: any): boolean {
   // 目的：让表单初始化时能够稳定显示共享路由池开关的实际状态。
   if (typeof value === 'string') return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase());
   return Boolean(value);
+}
+
+function serializeChannelPreferences(preferences: Record<string, any>): Record<string, any> {
+  // 修改原因：Key Rules 的 retry 默认态和 remap 空值不能原样写入配置，否则后端会难以区分默认和显式动作。
+  // 修改方式：保存和测试预览前复制 preferences，并用统一 helper 清理 key_rules 字段。
+  // 目的：保证 retry 只在强制重试或禁止重试时保存，remap 只在填写有效目标状态码时保存。
+  const next = { ...(preferences || {}) };
+  if (Array.isArray(next.key_rules)) {
+    next.key_rules = sanitizeKeyRulesForSave(next.key_rules);
+  }
+  return next;
 }
 
 // ── 余额类型 ──
@@ -1533,6 +1554,19 @@ export default function Channels() {
     });
   };
 
+  const swapVirtualEditorNode = (idx: number, direction: -1 | 1) => {
+    // 修改原因：触摸屏不会触发 HTML5 原生 Drag and Drop 事件，手机端需要不依赖拖拽的排序入口。
+    // 修改方式：根据上移或下移方向计算相邻目标索引，并在本地 chain 草稿中交换两个节点。
+    // 目的：在保留桌面拖拽排序的同时，让移动端用户也能调整虚拟模型链条优先级。
+    updateVirtualEditorChainDraft(prev => {
+      const targetIdx = idx + direction;
+      if (idx < 0 || idx >= prev.length || targetIdx < 0 || targetIdx >= prev.length) return prev;
+      const next = [...prev];
+      [next[idx], next[targetIdx]] = [next[targetIdx], next[idx]];
+      return next;
+    });
+  };
+
   const appendVirtualEditorNodeByType = () => {
     // 修改原因：移动端或不使用拖拽的场景仍需要显式添加节点入口。
     // 修改方式：读取当前虚拟模型的添加类型状态，向抽屉 chain 追加空节点。
@@ -1651,6 +1685,7 @@ export default function Channels() {
     // 修改方式：构造预览/测试 payload 时同步归一化该字段。
     // 目的：避免测试渠道时使用与正式保存不同的路由池共享状态。
     const normalizedPoolSharing = formData.model_prefix.trim() ? !!formData.preferences.pool_sharing : false;
+    const serializedPreferences = serializeChannelPreferences(formData.preferences);
 
     return {
       provider: formData.provider,
@@ -1663,7 +1698,7 @@ export default function Channels() {
       enabled: formData.enabled,
       groups: formData.groups,
       preferences: {
-        ...formData.preferences,
+        ...serializedPreferences,
         pool_sharing: normalizedPoolSharing,
         headers: headersObj,
         post_body_parameter_overrides: overridesObj,
@@ -1771,6 +1806,7 @@ export default function Channels() {
     // 修改方式：保存前统一计算 normalizedPoolSharing，并覆盖 preferences 中的同名字段。
     // 目的：保证后端收到的配置不会出现无前缀但共享路由池开启的状态。
     const normalizedPoolSharing = formData.model_prefix.trim() ? !!formData.preferences.pool_sharing : false;
+    const serializedPreferences = serializeChannelPreferences(formData.preferences);
 
     // 序列化子渠道
     const serializedSubChannels = formData.sub_channels
@@ -1788,7 +1824,8 @@ export default function Channels() {
         if (sub.model_prefix) subObj.model_prefix = sub.model_prefix;
         if (sub.remark) subObj.remark = sub.remark;
         if (sub.enabled === false) subObj.enabled = false;
-        if (Object.keys(sub.preferences).length > 0) subObj.preferences = sub.preferences;
+        const serializedSubPreferences = serializeChannelPreferences(sub.preferences || {});
+        if (Object.keys(serializedSubPreferences).length > 0) subObj.preferences = serializedSubPreferences;
         return subObj;
       });
 
@@ -1803,7 +1840,7 @@ export default function Channels() {
       enabled: formData.enabled,
       groups: formData.groups,
       preferences: {
-        ...formData.preferences,
+        ...serializedPreferences,
         pool_sharing: normalizedPoolSharing,
         model_price: cleanedModelPrice,
         headers: headersObj,
@@ -1824,7 +1861,7 @@ export default function Channels() {
       // 计算子渠道 diff preferences（只保存和主渠道不同的部分）
       const subPrefs: Record<string, any> = {};
       const mergedPrefs = {
-        ...formData.preferences,
+        ...serializedPreferences,
         pool_sharing: normalizedPoolSharing,
         model_price: cleanedModelPrice,
         headers: headersObj,
@@ -3007,9 +3044,34 @@ export default function Channels() {
                                       </div>
                                     )}
                                   </div>
-                                  <button onClick={() => updateVirtualEditorChainDraft(prev => prev.filter((_, removeIdx) => removeIdx !== idx))} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除节点">
-                                    <X className="w-4 h-4" />
-                                  </button>
+                                  {/* 修改原因：移动端无法使用 HTML5 原生拖拽排序，节点卡片需要额外提供触摸可点的排序控件。
+                                      修改方式：在删除按钮左侧加入上移和下移小按钮，禁用首尾无法移动的方向，并调用相邻交换函数。
+                                      目的：不移除桌面拖拽能力的前提下，保证手机端也能调整链条节点顺序。 */}
+                                  <div className="flex items-center gap-1 flex-shrink-0">
+                                    <button
+                                      type="button"
+                                      onClick={() => swapVirtualEditorNode(idx, -1)}
+                                      disabled={idx === 0}
+                                      className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                      title="上移节点"
+                                      aria-label={`上移第 ${idx + 1} 个节点`}
+                                    >
+                                      <ChevronUp className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => swapVirtualEditorNode(idx, 1)}
+                                      disabled={idx === virtualEditorChain.length - 1}
+                                      className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                      title="下移节点"
+                                      aria-label={`下移第 ${idx + 1} 个节点`}
+                                    >
+                                      <ChevronDown className="w-4 h-4" />
+                                    </button>
+                                    <button type="button" onClick={() => updateVirtualEditorChainDraft(prev => prev.filter((_, removeIdx) => removeIdx !== idx))} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除节点">
+                                      <X className="w-4 h-4" />
+                                    </button>
+                                  </div>
                                 </div>
 
                                 {isChannel ? (
@@ -3765,121 +3827,56 @@ export default function Channels() {
                         </div>
                       </div>
                       <p className="text-xs text-muted-foreground mb-3">
-                        按顺序匹配，第一个命中的规则生效。duration: -1 = 永久禁用，0 = 仅映射不处理 Key，&gt;0 = 冷却秒数。
+                        按顺序匹配，首条命中生效。Key 处理：冷却=暂时停用，永久禁用=需手动恢复。重试：自动=沿用内置逻辑(4xx不重试，5xx/429重试)，换Key=强制用其他Key重试，报错=跳过重试直接返回客户端。
                       </p>
 
                       {/* 规则列表 */}
-                      <div className="space-y-2">
+                      {/* 修改原因：旧版 Key Rules 使用序号列和两行卡片，导致规则区域过高且条件与动作被割裂。 */}
+                      {/* 修改方式：改为桌面端单行、移动端两行的紧凑列表，并用底部分隔线替代卡片背景。 */}
+                      {/* 目的：保留原有编辑、重试三态和 remap 折叠功能，同时减少纵向空间占用。 */}
+                      <div className="space-y-1">
                         {(formData.preferences.key_rules || []).map((rule: any, idx: number) => {
                           const rules = formData.preferences.key_rules || [];
-                          const updateRule = (patch: any) => {
-                            const next = [...rules];
-                            next[idx] = { ...next[idx], ...patch };
-                            updatePreference('key_rules', next);
-                          };
-                          const removeRule = () => {
-                            updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
-                          };
-                          const matchType = rule.match === 'default' ? 'default' : rule.match?.status ? 'status' : rule.match?.keyword ? 'keyword' : 'status';
-                          const matchValue = matchType === 'status'
-                            ? (rule.match?.status || []).join(', ')
-                            : matchType === 'keyword'
-                            ? (Array.isArray(rule.match?.keyword) ? rule.match.keyword.join(', ') : rule.match?.keyword || '')
-                            : '';
-
+                          const replaceRule = (r: any) => { const n = [...rules]; n[idx] = r; updatePreference('key_rules', n); };
+                          const updateRule = (p: any) => replaceRule({ ...rules[idx], ...p });
+                          const clearField = (f: 'remap' | 'retry') => { const r = { ...rules[idx] }; delete r[f]; replaceRule(r); };
+                          const removeRule = () => updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
+                          const mt = rule.match === 'default' ? 'default' : rule.match?.keyword ? 'keyword' : 'status';
+                          const retryMode = getKeyRuleRetryMode(rule);
+                          const durationMode = rule.duration === -1 ? '-1' : Number(rule.duration) > 0 ? 'cd' : '0';
+                          const controlClass = 'h-6 bg-background border border-border rounded px-1 py-0 text-[11px] leading-none text-foreground';
+                          const inputClass = `${controlClass} font-mono`;
+                          const retryOptions: [KeyRuleRetryMode, string, string][] = [['default', '自动', '沿用内置重试逻辑'], ['force', '换Key', '强制用其他Key重试'], ['disable', '报错', '跳过重试直接返回']];
                           return (
-                            <div key={idx} className="flex items-center gap-2 bg-muted/30 border border-border rounded-lg px-3 py-2">
-                              {/* 匹配类型 */}
-                              <select
-                                value={matchType}
-                                onChange={e => {
-                                  const t = e.target.value;
-                                  if (t === 'default') updateRule({ match: 'default' });
-                                  else if (t === 'status') updateRule({ match: { status: [429] } });
-                                  else if (t === 'keyword') updateRule({ match: { keyword: [''] } });
-                                }}
-                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-20 flex-shrink-0"
-                              >
-                                <option value="status">状态码</option>
-                                <option value="keyword">关键词</option>
-                                <option value="default">默认</option>
-                              </select>
-
-                              {/* 匹配值 */}
-                              {matchType !== 'default' && (
-                                <input
-                                  type="text"
-                                  value={matchValue}
-                                  onChange={e => {
-                                    const val = e.target.value;
-                                    if (matchType === 'status') {
-                                      const codes = val.split(/[,\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-                                      updateRule({ match: { status: codes } });
-                                    } else {
-                                      const kws = val.split(/[,]/).map(s => s.trim()).filter(Boolean);
-                                      updateRule({ match: { keyword: kws.length > 0 ? kws : [''] } });
-                                    }
-                                  }}
-                                  placeholder={matchType === 'status' ? '429, 500' : 'quota, billing'}
-                                  className="flex-1 min-w-0 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
-                                />
-                              )}
-                              {matchType === 'default' && <div className="flex-1 text-xs text-muted-foreground italic">兜底规则</div>}
-
-                              {/* 箭头 */}
-                              <span className="text-muted-foreground text-xs flex-shrink-0">→</span>
-
-                              {/* Duration */}
-                              <select
-                                value={rule.duration === -1 ? '-1' : rule.duration > 0 ? 'custom' : '0'}
-                                onChange={e => {
-                                  const v = e.target.value;
-                                  if (v === '-1') updateRule({ duration: -1 });
-                                  else if (v === '0') updateRule({ duration: 0 });
-                                  else updateRule({ duration: rule.duration > 0 ? rule.duration : 60 });
-                                }}
-                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-24 flex-shrink-0"
-                              >
-                                <option value="-1">永久禁用</option>
-                                <option value="custom">冷却</option>
-                                <option value="0">仅映射</option>
-                              </select>
-
-                              {rule.duration > 0 && (
-                                <div className="flex items-center gap-1 flex-shrink-0">
-                                  <input
-                                    type="number"
-                                    value={rule.duration}
-                                    onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value) || 1) })}
-                                    min={1}
-                                    className="w-16 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
-                                  />
-                                  <span className="text-xs text-muted-foreground">秒</span>
+                            <div key={idx} className="border-b border-border py-1 text-[11px]">
+                              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-1 sm:flex-nowrap">
+                                <div className="flex min-w-0 items-center gap-1 sm:shrink-0">
+                                  <select value={mt} onChange={e => { const v = e.target.value; if (v === 'default') updateRule({ match: 'default' }); else if (v === 'status') updateRule({ match: { status: [429] } }); else updateRule({ match: { keyword: [''] } }); }} className={`${controlClass} w-[64px] sm:w-[66px]`}>
+                                    <option value="status">状态码</option>
+                                    <option value="keyword">关键词</option>
+                                    <option value="default">default</option>
+                                  </select>
+                                  {mt === 'status' && <input type="text" inputMode="numeric" value={formatKeyRuleStatusInput(rule.match?.status)} onChange={e => updateRule({ match: { status: parseKeyRuleStatusInput(e.target.value) } })} placeholder="429" className={`${inputClass} w-[68px]`} />}
+                                  {mt === 'keyword' && <input type="text" value={formatKeyRuleKeywordsInput(rule.match?.keyword)} onChange={e => updateRule({ match: { keyword: parseKeyRuleKeywordsInput(e.target.value) } })} placeholder="quota" className={`${inputClass} w-[110px] sm:w-[118px]`} />}
+                                  <button type="button" onClick={removeRule} className="ml-auto inline-flex h-6 w-6 items-center justify-center text-red-500/60 hover:text-red-500 sm:hidden" title="删除"><X className="h-3 w-3" /></button>
                                 </div>
-                              )}
-
-                              {/* Remap (可选) */}
-                              {matchType === 'status' && (
-                                <div className="flex items-center gap-1 flex-shrink-0">
-                                  <span className="text-[10px] text-muted-foreground">映射</span>
-                                  <input
-                                    type="number"
-                                    value={rule.remap || ''}
-                                    onChange={e => {
-                                      const v = parseInt(e.target.value);
-                                      if (!isNaN(v) && v >= 100 && v <= 599) updateRule({ remap: v });
-                                      else { const { remap: _, ...rest } = rules[idx]; const next = [...rules]; next[idx] = rest; updatePreference('key_rules', next); }
-                                    }}
-                                    placeholder="-"
-                                    className="w-14 bg-background border border-border rounded px-1.5 py-1 text-xs font-mono text-foreground"
-                                  />
+                                <span className="hidden h-5 w-px bg-border sm:block" aria-hidden="true" />
+                                <div className="flex min-w-0 flex-wrap items-center gap-1 sm:flex-1 sm:flex-nowrap">
+                                  <select value={durationMode} onChange={e => { const v = e.target.value; if (v === '-1') updateRule({ duration: -1 }); else if (v === '0') updateRule({ duration: 0 }); else updateRule({ duration: Number(rule.duration) > 0 ? Number(rule.duration) : 60 }); }} className={`${controlClass} w-[72px]`}>
+                                    <option value="cd">冷却</option>
+                                    <option value="-1">永久禁用</option>
+                                    <option value="0">不处理</option>
+                                  </select>
+                                  {Number(rule.duration) > 0 && <><input type="number" min={1} value={rule.duration} onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value, 10) || 1) })} className={`${inputClass} w-[46px]`} /><span className="text-[10px] text-muted-foreground">s</span></>}
+                                  <div className="inline-flex h-6 overflow-hidden rounded border border-border" title="重试控制">
+                                    {retryOptions.map(([v, l, tip]) => (
+                                      <button key={v} type="button" title={tip} onClick={() => replaceRule(setKeyRuleRetryMode(rule, v))} className={`px-1.5 text-[10px] leading-none transition-colors ${retryMode === v ? v === 'force' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold' : v === 'disable' ? 'bg-red-500/15 text-red-600 dark:text-red-400 font-semibold' : 'bg-muted text-muted-foreground font-semibold' : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'}`}>{l}</button>
+                                    ))}
+                                  </div>
+                                  {rule.remap != null ? (<span className="inline-flex h-6 items-center gap-0.5"><span className="text-[10px] text-muted-foreground">↔</span><input type="number" min={100} max={599} value={rule.remap} onChange={e => { const raw = e.target.value.trim(); if (!raw) clearField('remap'); else updateRule({ remap: raw }); }} placeholder="码" title="错误码映射" className={`${inputClass} w-[42px]`} /><button type="button" onClick={() => clearField('remap')} className="inline-flex h-6 w-4 items-center justify-center text-[10px] text-muted-foreground hover:text-foreground" title="移除映射">×</button></span>) : (<button type="button" onClick={() => updateRule({ remap: '' })} className="inline-flex h-6 w-6 items-center justify-center rounded border border-transparent text-[11px] text-muted-foreground hover:border-border hover:text-foreground" title="添加错误码映射">↔</button>)}
                                 </div>
-                              )}
-
-                              {/* 删除 */}
-                              <button onClick={removeRule} className="text-red-500 hover:text-red-400 flex-shrink-0 p-0.5">
-                                <X className="w-3.5 h-3.5" />
-                              </button>
+                                <button type="button" onClick={removeRule} className="ml-auto hidden h-6 w-6 shrink-0 items-center justify-center text-red-500/60 hover:text-red-500 sm:inline-flex" title="删除"><X className="h-3 w-3" /></button>
+                              </div>
                             </div>
                           );
                         })}

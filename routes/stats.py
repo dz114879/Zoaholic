@@ -133,7 +133,12 @@ class LogEntry(BaseModel):
     retry_path: Optional[str] = None  # JSON格式的重试路径
     request_headers: Optional[str] = None  # 用户请求头
     request_body: Optional[str] = None  # 用户请求体
+    # 修改原因：前端日志详情需要展示上游请求头和上游响应头，响应模型必须显式暴露这些字段。
+    # 修改方式：在 LogEntry 中补齐 upstream_request_headers 与 upstream_response_headers。
+    # 目的：避免 response_model 过滤掉数据库中已经保存的头信息。
+    upstream_request_headers: Optional[str] = None  # 发送到上游的请求头
     upstream_request_body: Optional[str] = None  # 发送到上游的请求体
+    upstream_response_headers: Optional[str] = None  # 上游返回的响应头
     upstream_response_body: Optional[str] = None  # 上游返回的响应体
     response_body: Optional[str] = None  # 返回给用户的响应体
     raw_data_expires_at: Optional[datetime] = None  # 原始数据过期时间
@@ -169,6 +174,10 @@ LOG_CLEARABLE_FIELDS: Dict[str, str] = {
     "request_body": "用户请求体(request_body)",
     "upstream_request_headers": "上游请求头(upstream_request_headers)",
     "upstream_request_body": "上游请求体(upstream_request_body)",
+    # 修改原因：新增上游响应头后，日志清理接口也需要允许清空该字段。
+    # 修改方式：把 upstream_response_headers 加入后端清理白名单。
+    # 目的：保持 Settings.tsx 可选字段与后端可清理字段一致。
+    "upstream_response_headers": "上游响应头(upstream_response_headers)",
     "upstream_response_body": "上游响应体(upstream_response_body)",
     "response_body": "返回给用户的响应体(response_body)",
     "retry_path": "重试路径(retry_path)",
@@ -180,6 +189,10 @@ DEFAULT_LOG_CLEANUP_FIELDS: List[str] = [
     "request_body",
     "upstream_request_headers",
     "upstream_request_body",
+    # 修改原因：默认清理原始日志数据时也应覆盖新增的上游响应头字段。
+    # 修改方式：将 upstream_response_headers 加入 DEFAULT_LOG_CLEANUP_FIELDS。
+    # 目的：避免自动默认选择遗漏该字段导致旧响应头长期保留。
+    "upstream_response_headers",
     "upstream_response_body",
     "response_body",
     "retry_path",
@@ -1431,7 +1444,12 @@ async def get_logs(
                     retry_path=row.get("retry_path") if not raw_data_expired else None,
                     request_headers=row.get("request_headers") if not raw_data_expired else None,
                     request_body=row.get("request_body") if not raw_data_expired else None,
+                    # 修改原因：D1 查询使用字典行，必须把新增头字段传入 LogEntry。
+                    # 修改方式：按原始数据过期规则读取上下游头字段。
+                    # 目的：保证未过期日志能在前端展示上游请求头和上游响应头。
+                    upstream_request_headers=row.get("upstream_request_headers") if not raw_data_expired else None,
                     upstream_request_body=row.get("upstream_request_body") if not raw_data_expired else None,
+                    upstream_response_headers=row.get("upstream_response_headers") if not raw_data_expired else None,
                     upstream_response_body=row.get("upstream_response_body") if not raw_data_expired else None,
                     response_body=row.get("response_body") if not raw_data_expired else None,
                     raw_data_expires_at=raw_expires_at,
@@ -1574,7 +1592,12 @@ async def get_logs(
                 retry_path=row.retry_path if not raw_data_expired else None,
                 request_headers=row.request_headers if not raw_data_expired else None,
                 request_body=row.request_body if not raw_data_expired else None,
+                # 修改原因：SQLAlchemy 查询分支也需要返回新增头字段，不能只在 D1 分支处理。
+                # 修改方式：用 getattr 兼容旧 ORM 对象，并沿用原始数据过期隐藏逻辑。
+                # 目的：保证 SQLite、PostgreSQL 和 MySQL 模式下前端日志详情字段完整。
+                upstream_request_headers=getattr(row, 'upstream_request_headers', None) if not raw_data_expired else None,
                 upstream_request_body=getattr(row, 'upstream_request_body', None) if not raw_data_expired else None,
+                upstream_response_headers=getattr(row, 'upstream_response_headers', None) if not raw_data_expired else None,
                 upstream_response_body=getattr(row, 'upstream_response_body', None) if not raw_data_expired else None,
                 response_body=row.response_body if not raw_data_expired else None,
                 raw_data_expires_at=row.raw_data_expires_at,

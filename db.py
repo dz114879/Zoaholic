@@ -394,6 +394,10 @@ class RequestStat(Base):
     request_body = Column(_BODY_TEXT, nullable=True)  # 用户请求体
     upstream_request_headers = Column(Text, nullable=True)  # 发送到上游的请求头JSON格式
     upstream_request_body = Column(_BODY_TEXT, nullable=True)  # 发送到上游的请求体
+    # 修改原因：后端需要持久化上游返回的响应头，便于日志详情排查上游行为。
+    # 修改方式：新增 JSON 字符串列，与 upstream_request_headers 保持 Text 类型一致。
+    # 目的：让通用 SQLAlchemy 迁移和 RequestStat 写入都能识别 upstream_response_headers。
+    upstream_response_headers = Column(Text, nullable=True)  # 上游返回的响应头JSON格式
     upstream_response_body = Column(_BODY_TEXT, nullable=True)  # 上游返回的原始响应体
     response_body = Column(_BODY_TEXT, nullable=True)  # 返回给用户的响应体
     raw_data_expires_at = Column(DateTime(timezone=True), nullable=True)  # 原始数据过期时间

@@ -281,7 +281,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         elif tool_call_id:
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_id,
+                "tool_use_id": tool_call_id,
                 "content": content
             }]})
         elif msg.role == "function":

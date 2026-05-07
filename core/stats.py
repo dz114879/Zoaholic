@@ -31,6 +31,10 @@ SQLITE_RETRY_DELAY = 0.5  # 初始重试延迟（秒）
 
 # Prompt Caching 新增列需要在各数据库的简易迁移中显式带 DEFAULT 0，避免旧表新增列后出现 NULL。
 PROMPT_CACHE_STAT_COLUMNS = {"cached_tokens", "cache_creation_tokens"}
+# 修改原因：D1 的 CREATE TABLE IF NOT EXISTS 不会给旧表补列，而新增上游响应头后 D1 写入会包含该列。
+# 修改方式：为 D1 启动迁移单独维护新增的文本日志列集合。
+# 目的：确保旧 D1 表在服务启动时补齐 upstream_response_headers，避免插入日志时报缺列。
+D1_TEXT_STAT_COLUMNS = {"upstream_response_headers"}
 
 is_debug = env_bool("DEBUG", False)
 
@@ -190,6 +194,7 @@ async def _create_tables_d1():
             request_body TEXT,
             upstream_request_headers TEXT,
             upstream_request_body TEXT,
+            upstream_response_headers TEXT,
             upstream_response_body TEXT,
             response_body TEXT,
             raw_data_expires_at DATETIME
@@ -254,7 +259,19 @@ async def _create_tables_d1():
             await d1_client.execute(
                 f"ALTER TABLE request_stats ADD COLUMN {column_name} INTEGER DEFAULT 0"
             )
+            existing_columns.add(column_name)
             logger.info("Added D1 request_stats column '%s' for Prompt Caching stats.", column_name)
+
+    for column_name in D1_TEXT_STAT_COLUMNS:
+        if column_name not in existing_columns:
+            # 修改原因：旧 D1 表不会自动拥有新加入的上游响应头列。
+            # 修改方式：启动时用 ALTER TABLE ADD COLUMN 补齐 TEXT 列。
+            # 目的：保证 D1 模式下日志插入、查询和清理都能使用 upstream_response_headers。
+            await d1_client.execute(
+                f"ALTER TABLE request_stats ADD COLUMN {column_name} TEXT"
+            )
+            existing_columns.add(column_name)
+            logger.info("Added D1 request_stats text column '%s'.", column_name)
 
 
 async def create_tables():

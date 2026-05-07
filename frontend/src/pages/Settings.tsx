@@ -48,6 +48,10 @@ const LOG_CLEANUP_FIELD_OPTIONS: { key: string; label: string }[] = [
   { key: 'request_body', label: '用户请求体' },
   { key: 'upstream_request_headers', label: '上游请求头' },
   { key: 'upstream_request_body', label: '上游请求体' },
+  // 修改原因：日志清理界面需要能选择新增的上游响应头字段。
+  // 修改方式：在上游请求体之后加入 upstream_response_headers 选项。
+  // 目的：保持前端清理选项与后端 LOG_CLEARABLE_FIELDS 一致。
+  { key: 'upstream_response_headers', label: '上游响应头' },
   { key: 'upstream_response_body', label: '上游响应体' },
   { key: 'response_body', label: '返回给用户的响应体' },
   { key: 'retry_path', label: '重试路径' },

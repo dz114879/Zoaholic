@@ -28,6 +28,14 @@ def _read_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+def _is_provider_enabled(provider: Dict[str, Any]) -> bool:
+    """判断渠道是否处于启用状态。"""
+    # 修改原因：虚拟路由会在普通 provider 过滤前自行展开 chain，必须在这里尊重渠道启用状态。
+    # 修改方式：统一读取 provider.enabled，并复用 _read_bool 兼容布尔值和字符串形式的 false。
+    # 目的：防止前端已禁用的渠道被虚拟模型 chain 节点继续选中并发送请求。
+    return _read_bool(provider.get("enabled"), default=True)
+
+
 def _is_pool_sharing_enabled(provider: Dict[str, Any]) -> bool:
     """判断渠道是否开启共享路由池。"""
     # 修改原因：虚拟模型的 model 节点也需要复用普通路由中的 pool_sharing 语义。
@@ -177,7 +185,7 @@ def resolve_virtual_model(
             if not model_name:
                 continue
             for provider in providers:
-                if not isinstance(provider, dict) or provider.get("enabled") is False:
+                if not isinstance(provider, dict) or not _is_provider_enabled(provider):
                     continue
                 match = _match_provider_model(provider, model_name)
                 if match:
@@ -189,7 +197,7 @@ def resolve_virtual_model(
             if not provider_name:
                 continue
             for provider in providers:
-                if not isinstance(provider, dict) or provider.get("enabled") is False:
+                if not isinstance(provider, dict) or not _is_provider_enabled(provider):
                     continue
                 if str(provider.get("provider") or "") != provider_name:
                     continue

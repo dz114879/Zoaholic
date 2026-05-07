@@ -460,7 +460,17 @@ async def test_channel(
         success = 200 <= status_code < 300
         auth_failed = status_code in (401, 403)
 
-        # 解析错误信息
+        # 解析错误信息，剥离 Zoaholic 内部前缀
+        def _strip_gateway_prefix(msg: str) -> str:
+            if not msg:
+                return msg
+            p = "Error: Current provider response failed: "
+            if msg.startswith(p):
+                return msg[len(p):]
+            if msg.startswith("All ") and " error: " in msg:
+                return msg.split(" error: ", 1)[1]
+            return msg
+
         error_detail = None
         if not success and preview:
             try:
@@ -468,13 +478,13 @@ async def test_channel(
                 if isinstance(resp_json, dict):
                     err_obj = resp_json.get("error")
                     if isinstance(err_obj, dict):
-                        error_detail = err_obj.get("message") or str(err_obj)
+                        error_detail = _strip_gateway_prefix(err_obj.get("message") or str(err_obj))
                     elif err_obj:
-                        error_detail = str(err_obj)
+                        error_detail = _strip_gateway_prefix(str(err_obj))
                     elif resp_json.get("detail"):
                         error_detail = str(resp_json["detail"])
             except (json.JSONDecodeError, ValueError):
-                error_detail = preview
+                error_detail = _strip_gateway_prefix(preview)
 
         return JSONResponse(content={
             "success": success,

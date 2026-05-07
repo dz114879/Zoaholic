@@ -51,9 +51,10 @@ def _normalize_responses_base_url(base_url: str) -> str:
 # ============================================================
 
 
-def format_input_text(text: str) -> dict:
-    """格式化文本为 Responses API input_text 格式"""
-    return {"type": "input_text", "text": text}
+def format_text_item(text: str, role: str) -> dict:
+    """格式化文本为 Responses API 格式，assistant 用 output_text，其他用 input_text"""
+    item_type = "output_text" if role == "assistant" else "input_text"
+    return {"type": item_type, "text": text}
 
 
 async def format_input_image(image_url: str) -> dict:
@@ -276,7 +277,7 @@ async def get_responses_payload(request, engine, provider, api_key=None):
             content_items = []
             for item in content:
                 if getattr(item, "type", None) == "text":
-                    content_items.append(format_input_text(item.text))
+                    content_items.append(format_text_item(item.text, role))
                 elif getattr(item, "type", None) == "image_url" and provider.get("image", True):
                     image_item = await format_input_image(item.image_url.url)
                     content_items.append(image_item)
@@ -318,7 +319,7 @@ async def get_responses_payload(request, engine, provider, api_key=None):
                 input_items.append({
                     "type": "message",
                     "role": role,
-                    "content": [{"type": "input_text", "text": content or ""}],
+                    "content": [format_text_item(content or "", role)],
                 })
 
             # tool_calls -> function_call（顶层 item）

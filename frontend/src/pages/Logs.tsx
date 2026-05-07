@@ -39,7 +39,12 @@ interface LogEntry {
   retry_path?: string;
   request_headers?: string;
   request_body?: string;
+  // 修改原因：日志详情需要展示后端已保存的上游请求头和新增的上游响应头。
+  // 修改方式：在前端 LogEntry 类型中补齐两个可选字段。
+  // 目的：让 TypeScript 能识别接口返回的上下游头信息。
+  upstream_request_headers?: string;
   upstream_request_body?: string;
+  upstream_response_headers?: string;
   upstream_response_body?: string;
   response_body?: string;
   raw_data_expires_at?: string;
@@ -402,11 +407,22 @@ export default function Logs() {
               </div>
             )}
             <div className="space-y-2">
-              <JsonAccordion title="请求头" data={log.request_headers} icon={<FileText className="w-4 h-4" />} />
-              <JsonAccordion title="用户请求体" data={log.request_body} icon={<Eye className="w-4 h-4" />} />
-              <JsonAccordion title="上游请求体" data={log.upstream_request_body} icon={<Server className="w-4 h-4" />} />
-              <JsonAccordion title="上游响应体" data={log.upstream_response_body} icon={<Server className="w-4 h-4" />} />
-              <JsonAccordion title="用户响应体" data={log.response_body} icon={<EyeOff className="w-4 h-4" />} />
+              {/* 修改原因：日志详情同时展示客户端和上游的请求响应数据，平铺七个折叠项会让管理员难以快速定位来源。
+                  修改方式：在原有容器内分为“客户端”和“上游”两段，并把折叠项标题改成来源内的短标题。
+                  目的：保留 JsonAccordion 行为不变，同时降低展开详情中的重复文案和视觉负担。 */}
+              <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
+                <div className="text-xs font-medium text-muted-foreground tracking-wide">客户端</div>
+                <JsonAccordion title="请求头" data={log.request_headers} icon={<FileText className="w-4 h-4" />} />
+                <JsonAccordion title="请求体" data={log.request_body} icon={<Eye className="w-4 h-4" />} />
+                <JsonAccordion title="响应体" data={log.response_body} icon={<EyeOff className="w-4 h-4" />} />
+              </div>
+              <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
+                <div className="text-xs font-medium text-muted-foreground tracking-wide">上游</div>
+                <JsonAccordion title="请求头" data={log.upstream_request_headers} icon={<Server className="w-4 h-4" />} />
+                <JsonAccordion title="请求体" data={log.upstream_request_body} icon={<Server className="w-4 h-4" />} />
+                <JsonAccordion title="响应头" data={log.upstream_response_headers} icon={<Server className="w-4 h-4" />} />
+                <JsonAccordion title="响应体" data={log.upstream_response_body} icon={<Server className="w-4 h-4" />} />
+              </div>
             </div>
           </div>
         )}

@@ -15,6 +15,7 @@ import {
   Settings2,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { formatApiKeyTestError, getInitialApiKeyTestModel, normalizeApiKeyTestModels } from '../lib/apiKeyTestDialog';
 import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import { useAuthStore } from '../store/authStore';
 
@@ -88,20 +89,19 @@ export function ApiKeyTestDialog({
   const [expandedErrorKeyIndex, setExpandedErrorKeyIndex] = useState<number | null>(null);
   const [copiedErrorKeyIndex, setCopiedErrorKeyIndex] = useState<number | null>(null);
 
-  const modelOptions = useMemo(() => {
-    const set = new Set<string>();
-    (availableModels || []).forEach(m => {
-      const s = String(m || '').trim();
-      if (s) set.add(s);
-    });
-    return Array.from(set);
-  }, [availableModels]);
+  // 修改原因：模型列表归一化逻辑需要和回归测试共用，避免弹窗重新打开后使用旧渠道模型。
+  // 修改方式：改为调用纯 helper 去重、去空白，并保留当前渠道传入列表的顺序。
+  // 目的：选择框和自动测试入口都基于同一份当前渠道模型列表。
+  const modelOptions = useMemo(() => normalizeApiKeyTestModels(availableModels), [availableModels]);
 
   // 弹窗打开时初始化
   useEffect(() => {
     if (!open) return;
 
-    const firstModel = modelOptions[0] || '';
+    // 修改原因：自动单 Key 测试会在同一个 effect 中触发，不能依赖 setModel 立即同步到闭包。
+    // 修改方式：先从当前渠道 availableModels 解析 firstModel，再同时写入状态并传给自动测试调用。
+    // 目的：避免请求体里的 model 落回上一次打开弹窗时缓存的模型名。
+    const firstModel = getInitialApiKeyTestModel(availableModels);
     setModel(firstModel);
 
     const init = new Map<number, KeyTestResult>();
@@ -116,7 +116,10 @@ export function ApiKeyTestDialog({
     // 如果是单 key 测试入口，自动触发
     if (typeof initialKeyIndex === 'number' && initialKeyIndex >= 0) {
       setTimeout(() => {
-        void testSingleKey(initialKeyIndex);
+        // 修改原因：这里的 testSingleKey 闭包仍可能读到 setModel 前的旧状态。
+        // 修改方式：把当前渠道解析出的 firstModel 作为本次自动测试的显式覆盖值传入。
+        // 目的：从 Key 行点击自动测试时，请求始终使用当前渠道模型。
+        void testSingleKey(initialKeyIndex, firstModel);
       }, 50);
     }
   }, [open]);
@@ -133,13 +136,18 @@ export function ApiKeyTestDialog({
     return hasModel && hasKey;
   };
 
-  const testSingleKey = async (idx: number) => {
+  const testSingleKey = async (idx: number, modelOverride?: string) => {
     const keyObj = apiKeys[idx];
     if (!keyObj) return;
     if (!includeDisabled && keyObj.disabled) return;
 
     const apiKey = keyObj.key.trim();
     if (!apiKey) return;
+
+    // 修改原因：自动测试入口需要绕过 React 状态更新延迟，手动测试入口仍应读取当前选择框状态。
+    // 修改方式：优先使用调用方传入的 modelOverride，否则回退到组件当前 model 状态。
+    // 目的：同一个测试函数同时支持自动打开测试和用户点击测试两种路径。
+    const requestModel = (modelOverride ?? model).trim();
 
     setResults(prev => {
       const next = new Map(prev);
@@ -159,7 +167,10 @@ export function ApiKeyTestDialog({
           base_url,
           provider_snapshot,
           api_key: apiKey,
-          model: model.trim(),
+          // 修改原因：请求模型可能来自本次自动测试覆盖值，而不一定来自已同步的 React state。
+          // 修改方式：统一发送前面解析出的 requestModel。
+          // 目的：确保请求体中的 model 与当前渠道弹窗模型一致。
+          model: requestModel,
           temperature,
           stream,
           max_tokens: maxTokens,
@@ -187,7 +198,10 @@ export function ApiKeyTestDialog({
         return;
       }
 
-      const errMsg = data?.error || data?.detail || data?.message || `HTTP ${res.status}`;
+      // 修改原因：测试接口失败时 detail/error/message 可能是对象，直接 String 会显示 [object Object]。
+      // 修改方式：统一调用错误格式化 helper，并保留 HTTP 状态作为兜底文案。
+      // 目的：错误摘要、详情和复制内容都能展示实际错误信息。
+      const errMsg = formatApiKeyTestError(data, `HTTP ${res.status}`);
       const authFailed = Boolean(data?.auth_failed);
 
       setResults(prev => {
@@ -197,7 +211,7 @@ export function ApiKeyTestDialog({
           latency_ms: data?.latency_ms ?? null,
           upstream_status_code: data?.upstream_status_code ?? null,
           auth_failed: authFailed,
-          error: String(errMsg),
+          error: errMsg,
           response_preview: data?.response_preview ?? null,
         });
         return next;
@@ -216,11 +230,14 @@ export function ApiKeyTestDialog({
         return;
       }
 
+      // 修改原因：网络异常或运行时异常也可能是普通对象，不能直接拼接或 String 化。
+      // 修改方式：复用测试接口错误格式化 helper，把未知对象转换成可读文本。
+      // 目的：保证 catch 分支不会在界面中显示 [object Object]。
       setResults(prev => {
         const next = new Map(prev);
         next.set(idx, {
           status: 'error',
-          error: e?.message || String(e),
+          error: formatApiKeyTestError(e, '请求失败'),
         });
         return next;
       });
