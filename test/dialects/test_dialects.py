@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI
-from fastapi.testclient import TestClient
 
 from core.dialects.gemini import parse_gemini_request, render_gemini_response
 from core.dialects.claude import parse_claude_request
@@ -26,6 +25,19 @@ def _compact_test_app():
     app.state.api_keys_db = [{"role": "user"}]
     app.include_router(dialect_router)
     return app
+
+
+async def _post_compact_test_app(path, payload, headers=None):
+    app = _compact_test_app()
+    # 修改原因：当前测试环境的 Starlette TestClient 仍向 httpx.Client 传入 app 参数，
+    # 而 httpx 0.28 已移除该参数，导致路由测试在进入被测逻辑前失败。
+    # 修改方式：直接使用 httpx.ASGITransport 调用 FastAPI 应用，绕过不兼容的 TestClient 封装。
+    # 修改目的：保持测试目标集中在 Responses 子端点的路由、鉴权和参数校验行为上。
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        return await client.post(path, json=payload, headers=headers)
 
 
 async def _read_response_json(response):
@@ -241,24 +253,18 @@ def test_openai_responses_parse_instructions():
 
 
 def test_openai_responses_compact_no_auth_enters_auth_layer():
-    app = _compact_test_app()
-
-    with TestClient(app) as client:
-        response = client.post("/v1/responses/compact", json={"model": "gpt-5"})
+    response = run(_post_compact_test_app("/v1/responses/compact", {"model": "gpt-5"}))
 
     assert response.status_code == 403
     assert response.status_code not in (404, 405)
 
 
 def test_openai_responses_compact_requires_model():
-    app = _compact_test_app()
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/responses/compact",
-            json={"input": []},
-            headers={"Authorization": "Bearer test-key"},
-        )
+    response = run(_post_compact_test_app(
+        "/v1/responses/compact",
+        {"input": []},
+        headers={"Authorization": "Bearer test-key"},
+    ))
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
