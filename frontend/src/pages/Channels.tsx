@@ -1058,36 +1058,50 @@ export default function Channels() {
   // ── 子渠道操作 ──
   const handleToggleSubChannel = async (parentIdx: number, subIdx: number) => {
     const parent = providers[parentIdx];
+    const providerId = String(parent.provider || '').trim();
+    if (!providerId) {
+      toastError('操作失败：主渠道名为空');
+      return;
+    }
     const subs = [...(parent.sub_channels || [])];
     subs[subIdx] = { ...subs[subIdx], enabled: subs[subIdx].enabled === false ? true : false };
-    const newProviders = [...providers];
-    newProviders[parentIdx] = { ...parent, sub_channels: subs };
+    const updatedParent = { ...parent, sub_channels: subs };
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：子渠道开关实际只修改所属主渠道的 sub_channels 字段，全量 POST 会覆盖其他渠道的并发改动。
+      // 修改方式：构造更新后的主渠道对象，并通过 PUT /v1/providers/{provider_id} 保存单个主渠道。
+      // 目的：让子渠道启用状态变更只影响所属主渠道，成功后再从后端刷新最新列表。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedParent),
       });
-      if (res.ok) setProviders(newProviders);
+      if (res.ok) await refreshProviders();
       else toastError('操作失败');
     } catch { toastError('网络错误'); }
   };
 
   const handleDeleteSubChannel = async (parentIdx: number, subIdx: number) => {
     const parent = providers[parentIdx];
+    const providerId = String(parent.provider || '').trim();
+    if (!providerId) {
+      toastError('删除失败：主渠道名为空');
+      return;
+    }
     const sub = (parent.sub_channels || [])[subIdx];
     const name = sub?.remark || sub?.engine || `子渠道 ${subIdx + 1}`;
     if (!confirm(`确定要删除子渠道 "${name}" 吗？`)) return;
     const subs = (parent.sub_channels || []).filter((_: any, i: number) => i !== subIdx);
-    const newProviders = [...providers];
-    newProviders[parentIdx] = { ...parent, sub_channels: subs.length > 0 ? subs : undefined };
+    const updatedParent = { ...parent, sub_channels: subs.length > 0 ? subs : undefined };
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：删除子渠道同样只改所属主渠道的 sub_channels 字段，不能再把完整 providers 数组写回后端。
+      // 修改方式：把删除后的主渠道对象 PUT 到单个 provider 路径，并保留空数组清理为 undefined 的旧行为。
+      // 目的：降低子渠道删除操作的写入范围，避免覆盖其他渠道的新配置。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedParent),
       });
-      if (res.ok) { setProviders(newProviders); }
+      if (res.ok) { await refreshProviders(); }
       else toastError('删除失败');
     } catch { toastError('网络错误'); }
   };
@@ -1908,11 +1922,19 @@ export default function Channels() {
     let newProviders: any[] | null = null;
     let providerSavePath = '/v1/providers';
     let providerSaveMethod: 'POST' | 'PUT' = 'POST';
+    let subChannelParentProviderId = '';
 
     if (editingSubChannel) {
-      // 子渠道模式：保存回 parent.sub_channels
+      // 修改原因：子渠道编辑保存只需要更新所属主渠道的 sub_channels 字段，不能继续全量提交 providers。
+      // 修改方式：先记录父渠道 provider_id，后续把更新后的父渠道对象 PUT 到单个 provider 路径。
+      // 目的：把子渠道编辑的写入范围限制在所属主渠道，避免覆盖其他渠道的并发变更。
       const { parentIdx, subIdx } = editingSubChannel;
       const parent = providers[parentIdx];
+      subChannelParentProviderId = String(parent.provider || '').trim();
+      if (!subChannelParentProviderId) {
+        toastError('保存失败：主渠道名为空');
+        return;
+      }
       const parentPrefs = parent.preferences || {};
 
       // 计算子渠道 diff preferences（只保存和主渠道不同的部分）
@@ -1959,14 +1981,14 @@ export default function Channels() {
     }
 
     try {
-      // 修改原因：主渠道新增和编辑已经有局部 API，只有子渠道仍保留全量 providers 保存。
-      // 修改方式：子渠道走原 /v1/api_config/update；主渠道新增走 POST /v1/providers，编辑走 PUT /v1/providers/{provider_id}。
-      // 目的：解决主渠道保存时用陈旧 providers 数组覆盖其他设备修改的问题。
+      // 修改原因：主渠道和子渠道都已有可限定写入范围的单渠道 API，继续对子渠道全量保存会覆盖并发修改。
+      // 修改方式：子渠道编辑保存 PUT 更新后的父渠道对象；主渠道新增走 POST /v1/providers，编辑走 PUT /v1/providers/{provider_id}。
+      // 目的：所有渠道保存成功后统一 refreshProviders，以后端最新配置作为页面状态来源。
       const res = editingSubChannel
-        ? await apiFetch('/v1/api_config/update', {
-          method: 'POST',
+        ? await apiFetch(buildProviderApiPath(subChannelParentProviderId), {
+          method: 'PUT',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ providers: newProviders }),
+          body: JSON.stringify(newProviders![editingSubChannel.parentIdx]),
         })
         : await apiFetch(providerSavePath, {
           method: providerSaveMethod,
@@ -1975,11 +1997,7 @@ export default function Channels() {
         });
 
       if (res.ok) {
-        if (editingSubChannel && newProviders) {
-          setProviders(sortByWeight(newProviders));
-        } else {
-          await refreshProviders();
-        }
+        await refreshProviders();
         setIsModalOpen(false);
         setEditingSubChannel(null);
       } else {
