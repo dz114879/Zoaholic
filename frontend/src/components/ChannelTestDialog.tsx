@@ -3,6 +3,7 @@ import * as Dialog from '@radix-ui/react-dialog';
 import { X, Play, Square, Search, Loader2, CheckCircle2, XCircle, Clock, Copy, CopyCheck } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { formatApiKeyTestError } from '../lib/apiKeyTestDialog';
 
 interface ModelInfo {
   display: string;  // 别名
@@ -162,7 +163,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
           return newResults;
         });
       } else {
-        const errorMsg = data.error || data.detail || data.message || `HTTP ${res.status}`;
+        const errorMsg = formatApiKeyTestError(data, `HTTP ${res.status}`);
         setResults(prev => {
           const newResults = new Map(prev);
           newResults.set(display, { status: 'error', latency: null, error: errorMsg });

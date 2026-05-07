@@ -44,6 +44,12 @@ export function formatApiKeyTestError(errorPayload: unknown, fallback?: string |
     value = record.detail ?? record.error ?? record.message;
   }
 
+  // OpenAI 风格 {message, type} 嵌套对象：再提取一层 message
+  if (value && typeof value === 'object' && !(value instanceof Error)) {
+    const inner = value as Record<string, unknown>;
+    if (typeof inner.message === 'string') value = inner.message;
+  }
+
   if (value === undefined || value === null || value === '') {
     value = fallback ?? 'unknown error';
   }

@@ -504,7 +504,7 @@ async def test_channel(
                 "success": False,
                 "latency_ms": latency_ms,
                 "message": "测试失败",
-                "error": str(he.detail),
+                "error": str(he.detail) if not isinstance(he.detail, dict) else (he.detail.get("message") or str(he.detail)),
                 "upstream_status_code": he.status_code,
                 "auth_failed": he.status_code in (401, 403),
             }
