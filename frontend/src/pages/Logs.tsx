@@ -407,21 +407,19 @@ export default function Logs() {
               </div>
             )}
             <div className="space-y-2">
-              {/* 修改原因：日志详情同时展示客户端和上游的请求响应数据，平铺七个折叠项会让管理员难以快速定位来源。
-                  修改方式：在原有容器内分为“客户端”和“上游”两段，并把折叠项标题改成来源内的短标题。
-                  目的：保留 JsonAccordion 行为不变，同时降低展开详情中的重复文案和视觉负担。 */}
+              {/* 按数据流方向分组：请求链路（用户→上游）、响应链路（上游→用户） */}
               <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
-                <div className="text-xs font-medium text-muted-foreground tracking-wide">客户端</div>
-                <JsonAccordion title="请求头" data={log.request_headers} icon={<FileText className="w-4 h-4" />} />
-                <JsonAccordion title="请求体" data={log.request_body} icon={<Eye className="w-4 h-4" />} />
-                <JsonAccordion title="响应体" data={log.response_body} icon={<EyeOff className="w-4 h-4" />} />
+                <div className="text-xs font-medium text-muted-foreground tracking-wide">请求 →</div>
+                <JsonAccordion title="客户端请求头" data={log.request_headers} icon={<FileText className="w-4 h-4" />} />
+                <JsonAccordion title="客户端请求体" data={log.request_body} icon={<Eye className="w-4 h-4" />} />
+                <JsonAccordion title="上游请求头" data={log.upstream_request_headers} icon={<Server className="w-4 h-4" />} />
+                <JsonAccordion title="上游请求体" data={log.upstream_request_body} icon={<Server className="w-4 h-4" />} />
               </div>
               <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
-                <div className="text-xs font-medium text-muted-foreground tracking-wide">上游</div>
-                <JsonAccordion title="请求头" data={log.upstream_request_headers} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="请求体" data={log.upstream_request_body} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="响应头" data={log.upstream_response_headers} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="响应体" data={log.upstream_response_body} icon={<Server className="w-4 h-4" />} />
+                <div className="text-xs font-medium text-muted-foreground tracking-wide">← 响应</div>
+                <JsonAccordion title="上游响应头" data={log.upstream_response_headers} icon={<Server className="w-4 h-4" />} />
+                <JsonAccordion title="上游响应体" data={log.upstream_response_body} icon={<Server className="w-4 h-4" />} />
+                <JsonAccordion title="客户端响应体" data={log.response_body} icon={<EyeOff className="w-4 h-4" />} />
               </div>
             </div>
           </div>
