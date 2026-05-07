@@ -530,7 +530,7 @@ async def responses_handler(
     )
 
 
-async def responses_compact_handler(
+async def responses_subpath_handler(
     request: "Request",
     background_tasks: "BackgroundTasks",
     api_index: int,
@@ -600,15 +600,16 @@ def register() -> None:
                     summary="Create Response",
                     description="创建响应请求，兼容 OpenAI Responses API 格式（GPT-5/o1/o3 等新模型）",
                 ),
+                # POST /v1/responses/* - Responses 子端点通配透传入口
                 EndpointDefinition(
-                    path="/v1/responses/compact",
-                    methods=["POST"],
-                    handler=responses_compact_handler,
-                    tags=["Responses"],
-                    summary="Compact Response",
-                    description="原生透传 OpenAI Responses compact 请求，仅支持 openai-responses provider",
-                    passthrough_only=True,
+                    path="/v1/responses/{subpath:path}",
                     passthrough_root="/v1/responses",
+                    methods=["POST"],
+                    handler=responses_subpath_handler,
+                    tags=["Responses"],
+                    summary="Responses Passthrough Subpaths",
+                    description="OpenAI Responses API 子端点透传入口（仅在上游为 openai-responses 时可用）",
+                    passthrough_only=True,
                 ),
             ],
         )
