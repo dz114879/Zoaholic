@@ -124,18 +124,20 @@ async def get_aws_payload(request, engine, provider, api_key=None):
     original_model = model_dict[request.model]
     base_url = provider.get('base_url')
     is_fixed_url = base_url.endswith('#')
+
+    # 从 base_url 提取 region：支持直连和反代 URL
+    import re as _re
+    _region_match = _re.search(r'bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com', base_url)
+    if _region_match:
+        AWS_REGION = _region_match.group(1)
+    else:
+        AWS_REGION = provider.get('aws_region', 'us-east-1')
+    # 签名始终用 AWS 原始 host（反代会透传 Host header）
+    HOST = f"bedrock-runtime.{AWS_REGION}.amazonaws.com"
+
     if is_fixed_url:
         url = base_url[:-1].rstrip('/')
-        # 固定 URL 模式：从实际 URL 解析 host/region，用于可能的签名
-        from urllib.parse import urlparse as _urlparse
-        _parsed = _urlparse(url)
-        HOST = _parsed.netloc
-        # 尝试从 host 提取 region，如 bedrock-runtime.us-east-1.amazonaws.com
-        _parts = HOST.split('.')
-        AWS_REGION = _parts[1] if len(_parts) > 2 else provider.get('aws_region', 'us-east-1')
     else:
-        AWS_REGION = base_url.split('.')[1]
-        HOST = f"bedrock-runtime.{AWS_REGION}.amazonaws.com"
         url = f"{base_url}/model/{original_model}/invoke-with-response-stream"
 
     messages = []
