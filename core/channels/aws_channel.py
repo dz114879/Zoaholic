@@ -68,7 +68,8 @@ def get_signature_key(key, date_stamp, region_name, service_name):
 
 def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_region, host, content_type, accept_header, endpoint_suffix='invoke-with-response-stream'):
     import urllib.parse
-    request_body = json.dumps(request_body)
+    # 必须用 json_dumps_text 与实际发送保持一致（orjson 无空格，stdlib 有空格）
+    request_body = json_dumps_text(request_body)
     SERVICE = "bedrock"
     canonical_querystring = ''
     method = 'POST'
