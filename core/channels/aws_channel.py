@@ -284,12 +284,12 @@ async def get_aws_payload(request, engine, provider, api_key=None):
             'X-Amz-Bedrock-Accept': ACCEPT_HEADER,
             'X-Amz-Content-Sha256': payload_hash,
             'Authorization': authorization_header,
-            # 存储签名参数供非流式路径重新签名（临时字段，会在 fetch_aws_response 中 pop 掉）
-            '_aws_signing': json.dumps({
-                'ak': aws_ak, 'sk': aws_sk, 'region': AWS_REGION,
-                'host': HOST, 'ct': CONTENT_TYPE, 'accept': ACCEPT_HEADER,
-                'model': original_model,
-            }),
+        }
+        # 存储签名参数供非流式路径重新签名（塞 payload 临时字段，不污染 headers）
+        payload['_aws_signing'] = {
+            'ak': aws_ak, 'sk': aws_sk, 'region': AWS_REGION,
+            'host': HOST, 'ct': CONTENT_TYPE, 'accept': ACCEPT_HEADER,
+            'model': original_model,
         }
 
     return url, headers, payload
@@ -302,13 +302,12 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
     
     timestamp = int(dt.timestamp(dt.now()))
     
-    # 从 headers 中取出签名上下文，重新计算非流式端点的签名
-    signing_json = headers.pop('_aws_signing', None)
-    if signing_json:
-        ctx = json.loads(signing_json)
+    # 从 payload 中取出签名上下文，重新计算非流式端点的签名
+    signing_ctx = payload.pop('_aws_signing', None)
+    if signing_ctx:
         amz_date, payload_hash, authorization_header = await asyncio.to_thread(
-            get_signature, payload, ctx['model'], ctx['ak'], ctx['sk'],
-            ctx['region'], ctx['host'], ctx['ct'], ctx['accept'],
+            get_signature, payload, signing_ctx['model'], signing_ctx['ak'], signing_ctx['sk'],
+            signing_ctx['region'], signing_ctx['host'], signing_ctx['ct'], signing_ctx['accept'],
             endpoint_suffix='invoke'
         )
         headers['X-Amz-Date'] = amz_date
@@ -360,6 +359,9 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
 async def fetch_aws_response_stream(client, url, headers, payload, model, timeout):
     """处理 AWS Bedrock 流式响应"""
     from ..log_config import logger
+    
+    # 流式路径不需要重签，但要清理临时字段避免发到上游
+    payload.pop('_aws_signing', None)
     
     timestamp = int(dt.timestamp(dt.now()))
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
