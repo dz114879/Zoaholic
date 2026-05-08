@@ -4296,6 +4296,17 @@ export default function Channels() {
                                   <p className="text-xs text-muted-foreground mt-1">相对路径拼接到域名下，绝对 URL 直接使用</p>
                                 </div>
                                 <div>
+                                  <label className="text-xs font-medium text-muted-foreground mb-1 block">请求方式</label>
+                                  <select
+                                    value={bal.method || 'GET'}
+                                    onChange={e => updatePreference('balance', { ...bal, method: e.target.value })}
+                                    className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs focus:border-primary outline-none text-foreground"
+                                  >
+                                    <option value="GET">GET</option>
+                                    <option value="POST">POST</option>
+                                  </select>
+                                </div>
+                                <div>
                                   <label className="text-xs font-medium text-muted-foreground mb-1 block">值类型</label>
                                   <select
                                     value={bal.mapping?.value_type === "'percent'" ? 'percent' : 'amount'}
