@@ -265,10 +265,17 @@ async def get_aws_payload(request, engine, provider, api_key=None):
         payload.pop("tool_choice", None)
 
     headers = {}
-    if provider.get("aws_access_key") and provider.get("aws_secret_key"):
+    # 解析 AK/SK：优先从 api_key 参数按 "AK:SK" 格式拆分，兼容旧的 aws_access_key/aws_secret_key 字段
+    aws_ak = provider.get("aws_access_key") or ""
+    aws_sk = provider.get("aws_secret_key") or ""
+    if not aws_ak and api_key and ":" in str(api_key):
+        parts = str(api_key).split(":", 1)
+        aws_ak = parts[0].strip()
+        aws_sk = parts[1].strip()
+    if aws_ak and aws_sk:
         ACCEPT_HEADER = "application/vnd.amazon.bedrock.payload+json"
         amz_date, payload_hash, authorization_header = await asyncio.to_thread(
-            get_signature, payload, original_model, provider.get("aws_access_key"), provider.get("aws_secret_key"), AWS_REGION, HOST, CONTENT_TYPE, ACCEPT_HEADER
+            get_signature, payload, original_model, aws_ak, aws_sk, AWS_REGION, HOST, CONTENT_TYPE, ACCEPT_HEADER
         )
         headers = {
             'Accept': ACCEPT_HEADER,
