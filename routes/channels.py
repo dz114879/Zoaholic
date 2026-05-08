@@ -371,12 +371,19 @@ async def test_channel(
         provider.pop("models", None)
 
         model_dict = get_model_dict(provider)
+        prefix = provider.get('model_prefix', '').strip()
+
         if model not in model_dict:
-            if upstream_model_hint and upstream_model_hint != model:
-                provider["model"].append({upstream_model_hint: model})
+            # 前端可能传了不带前缀的模型名，尝试自动匹配带前缀的版本
+            prefixed_model = f"{prefix}{model}" if prefix else None
+            if prefixed_model and prefixed_model in model_dict:
+                model = prefixed_model
             else:
-                provider["model"].append(model)
-            model_dict = get_model_dict(provider)
+                if upstream_model_hint and upstream_model_hint != model:
+                    provider["model"].append({upstream_model_hint: model})
+                else:
+                    provider["model"].append(model)
+                model_dict = get_model_dict(provider)
 
         provider["_model_dict_cache"] = model_dict
 

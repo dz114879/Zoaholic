@@ -1857,14 +1857,16 @@ export default function Channels() {
 
   const getProviderModelNameListForUi = (): string[] => {
     if (!formData) return [];
+    const prefix = (formData as any).model_prefix || '';
     const aliasMap = getAliasMap();
     const names: string[] = [];
     formData.models.forEach(upstream => {
       const alias = aliasMap.get(upstream);
-      names.push(alias || upstream);
+      const name = alias || upstream;
+      names.push(prefix && name !== '*' ? `${prefix}${name}` : name);
     });
     formData.mappings.forEach(m => {
-      if (m.from) names.push(m.from);
+      if (m.from) names.push(prefix ? `${prefix}${m.from}` : m.from);
     });
     return Array.from(new Set(names.map(s => String(s || '').trim()).filter(Boolean)));
   };
