@@ -66,13 +66,13 @@ def get_signature_key(key, date_stamp, region_name, service_name):
     return k_signing
 
 
-def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_region, host, content_type, accept_header):
+def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_region, host, content_type, accept_header, endpoint_suffix='invoke-with-response-stream'):
     import urllib.parse
     request_body = json.dumps(request_body)
     SERVICE = "bedrock"
     canonical_querystring = ''
     method = 'POST'
-    raw_path = f'/model/{model_id}/invoke-with-response-stream'
+    raw_path = f'/model/{model_id}/{endpoint_suffix}'
     canonical_uri = urllib.parse.quote(raw_path, safe='/-_.~')
     # Create a date for headers and the credential string
     t = datetime.datetime.now(timezone.utc)
@@ -284,6 +284,12 @@ async def get_aws_payload(request, engine, provider, api_key=None):
             'X-Amz-Bedrock-Accept': ACCEPT_HEADER,
             'X-Amz-Content-Sha256': payload_hash,
             'Authorization': authorization_header,
+            # 存储签名参数供非流式路径重新签名（临时字段，会在 fetch_aws_response 中 pop 掉）
+            '_aws_signing': json.dumps({
+                'ak': aws_ak, 'sk': aws_sk, 'region': AWS_REGION,
+                'host': HOST, 'ct': CONTENT_TYPE, 'accept': ACCEPT_HEADER,
+                'model': original_model,
+            }),
         }
 
     return url, headers, payload
@@ -291,15 +297,25 @@ async def get_aws_payload(request, engine, provider, api_key=None):
 
 async def fetch_aws_response(client, url, headers, payload, model, timeout):
     """处理 AWS Bedrock 非流式响应"""
-    # 切换到非流式端点（AWS Bedrock 需要不同的签名）
+    # 切换到非流式端点并重新签名
     url = url.replace("invoke-with-response-stream", "invoke")
     
     timestamp = int(dt.timestamp(dt.now()))
-    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
-    # AWS Bedrock 非流式签名需要重新生成（此处简化，实际可能需要更完整的实现）
-    # 但根据 core/response.py 之前的硬编码，它似乎是复用 Gemini/Vertex 的解析逻辑？
-    # 实际上 AWS Bedrock 非流式返回的是一个包含 bytes 的 JSON。
+    # 从 headers 中取出签名上下文，重新计算非流式端点的签名
+    signing_json = headers.pop('_aws_signing', None)
+    if signing_json:
+        ctx = json.loads(signing_json)
+        amz_date, payload_hash, authorization_header = await asyncio.to_thread(
+            get_signature, payload, ctx['model'], ctx['ak'], ctx['sk'],
+            ctx['region'], ctx['host'], ctx['ct'], ctx['accept'],
+            endpoint_suffix='invoke'
+        )
+        headers['X-Amz-Date'] = amz_date
+        headers['X-Amz-Content-Sha256'] = payload_hash
+        headers['Authorization'] = authorization_header
+    
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     error_message = await check_response(response, "fetch_aws_response")
