@@ -507,10 +507,12 @@ async def fetch_aws_models(client, provider):
         raise ValueError('AWS credentials not configured (api key should be AK:SK format)')
 
     # 从 base_url 提取 region
-    # base_url: https://bedrock-runtime.us-east-1.amazonaws.com
-    if 'amazonaws.com' in base_url:
-        parts = base_url.replace('https://', '').replace('http://', '').split('.')
-        aws_region = parts[1] if len(parts) > 2 else 'us-east-1'
+    # 直连: https://bedrock-runtime.us-east-1.amazonaws.com
+    # 反代: https://proxy.example.com/bedrock-runtime.us-east-1.amazonaws.com
+    import re as _re
+    _region_match = _re.search(r'bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com', base_url)
+    if _region_match:
+        aws_region = _region_match.group(1)
     else:
         aws_region = provider.get('aws_region', 'us-east-1')
 
