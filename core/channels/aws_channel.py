@@ -444,6 +444,96 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
     yield "data: [DONE]" + end_of_line
 
 
+def _sign_get_request(path, aws_access_key, aws_secret_key, aws_region, host, service="bedrock"):
+    """SigV4 签名 GET 请求（无 body）"""
+    import urllib.parse
+    t = datetime.datetime.now(timezone.utc)
+    amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+    date_stamp = t.strftime('%Y%m%d')
+
+    canonical_uri = urllib.parse.quote(path, safe='/-_.~')
+    payload_hash = hashlib.sha256(b'').hexdigest()  # GET 无 body
+
+    canonical_headers = (
+        f'host:{host}\n'
+        f'x-amz-content-sha256:{payload_hash}\n'
+        f'x-amz-date:{amz_date}\n'
+    )
+    signed_headers = 'host;x-amz-content-sha256;x-amz-date'
+
+    canonical_request = (
+        f'GET\n{canonical_uri}\n\n'
+        f'{canonical_headers}\n'
+        f'{signed_headers}\n'
+        f'{payload_hash}'
+    )
+
+    algorithm = 'AWS4-HMAC-SHA256'
+    credential_scope = f'{date_stamp}/{aws_region}/{service}/aws4_request'
+    string_to_sign = (
+        f'{algorithm}\n{amz_date}\n{credential_scope}\n'
+        f'{hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()}'
+    )
+
+    signing_key = get_signature_key(aws_secret_key, date_stamp, aws_region, service)
+    signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    authorization = f'{algorithm} Credential={aws_access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
+
+    return {
+        'X-Amz-Date': amz_date,
+        'X-Amz-Content-Sha256': payload_hash,
+        'Authorization': authorization,
+    }
+
+
+async def fetch_aws_models(client, provider):
+    """获取 AWS Bedrock 可用模型列表（ListFoundationModels API）"""
+    from ..log_config import logger
+
+    base_url = provider.get('base_url', '')
+    api_key = provider.get('api') or ''
+    if isinstance(api_key, list):
+        api_key = api_key[0] if api_key else ''
+
+    # 解析 AK/SK
+    aws_ak = provider.get('aws_access_key') or ''
+    aws_sk = provider.get('aws_secret_key') or ''
+    if not aws_ak and ':' in str(api_key):
+        parts = str(api_key).split(':', 1)
+        aws_ak = parts[0].strip()
+        aws_sk = parts[1].strip()
+
+    if not aws_ak or not aws_sk:
+        raise ValueError('AWS credentials not configured (api key should be AK:SK format)')
+
+    # 从 base_url 提取 region
+    # base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+    if 'amazonaws.com' in base_url:
+        parts = base_url.replace('https://', '').replace('http://', '').split('.')
+        aws_region = parts[1] if len(parts) > 2 else 'us-east-1'
+    else:
+        aws_region = provider.get('aws_region', 'us-east-1')
+
+    # ListFoundationModels 用 bedrock 而不是 bedrock-runtime
+    host = f'bedrock.{aws_region}.amazonaws.com'
+    path = '/foundation-models'
+
+    headers = _sign_get_request(path, aws_ak, aws_sk, aws_region, host, service='bedrock')
+    url = f'https://{host}{path}'
+
+    logger.debug(f'[aws] ListFoundationModels: {url}')
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+
+    data = response.json()
+    models = []
+    for m in data.get('modelSummaries', []):
+        model_id = m.get('modelId', '')
+        if model_id:
+            models.append(model_id)
+    return sorted(models)
+
+
 def register():
     """注册 AWS 渠道到注册中心"""
     from .registry import register_channel
@@ -457,4 +547,5 @@ def register():
         request_adapter=get_aws_payload,
         response_adapter=fetch_aws_response,
         stream_adapter=fetch_aws_response_stream,
+        models_adapter=fetch_aws_models,
     )
