@@ -878,6 +878,14 @@ def apply_custom_headers(headers: dict, custom_headers: dict) -> None:
     for k, v in custom_headers.items():
         if v is None:
             continue
+        # 值为 "null" 字符串时删除该 header（用于屏蔽渠道硬编码的头）
+        if isinstance(v, str) and v.strip().lower() == "null":
+            key_lower = str(k).lower()
+            for existing_key in list(headers.keys()):
+                if str(existing_key).lower() == key_lower:
+                    del headers[existing_key]
+                    break
+            continue
         _set_header_case_insensitive(headers, k, v)
 
 def identify_audio_format(file_bytes):
