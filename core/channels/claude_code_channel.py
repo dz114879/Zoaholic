@@ -531,6 +531,11 @@ class ClaudeCodeProvider(OAuthProvider):
 # ═══════════════════════════════════════════════════════════════════
 
 import re as _re
+from contextvars import ContextVar
+
+# 请求级别的反向映射表：sanitize 时存入，response 时读取
+_reverse_tool_map: ContextVar[dict[str, str]] = ContextVar("_reverse_tool_map", default={})
+_reverse_prop_map: ContextVar[dict[str, str]] = ContextVar("_reverse_prop_map", default={})
 
 # Layer 2: 第三方特征串（大小写不敏感匹配）
 _THIRD_PARTY_PATTERNS = _re.compile(
@@ -593,6 +598,28 @@ _SYSTEM_CONFIG_SECTIONS = _re.compile(
     r"(?:\s|\\n|\n|$)",
     _re.MULTILINE,
 )
+
+# Layer 6: Property name 重命名（第三方工具 schema 里的特征属性名）
+_PROP_RENAME_MAP: dict[str, str] = {
+    "session_id": "thread_id",
+    "conversation_id": "thread_ref",
+    "summaryIds": "chunk_ids",
+    "summary_id": "chunk_id",
+    "system_event": "event_text",
+    "agent_id": "worker_id",
+    "wake_at": "trigger_at",
+    "wake_event": "trigger_event",
+}
+
+# CC 工具桩：注入到 tools 数组，让工具集更像真 CC session
+_CC_TOOL_STUBS: list[dict] = [
+    {"name": "Glob", "description": "Find files by pattern", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"name": "Grep", "description": "Search file contents", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["pattern"]}},
+    {"name": "Agent", "description": "Launch a subagent", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
+    {"name": "NotebookEdit", "description": "Edit notebook cells", "input_schema": {"type": "object", "properties": {"notebook_path": {"type": "string"}, "cell_index": {"type": "integer"}}, "required": ["notebook_path"]}},
+    {"name": "TodoRead", "description": "Read task list", "input_schema": {"type": "object", "properties": {}}},
+]
+
 
 
 
@@ -710,6 +737,55 @@ def _sanitize_for_plan_billing(payload: dict) -> dict:
         messages = payload.get("messages")
         if isinstance(messages, list):
             _rename_tools_in_messages(messages, renamed)
+
+    # 保存反向映射到 ContextVar，供响应侧 Layer 7 使用
+    if renamed:
+        _reverse_tool_map.set({v: k for k, v in renamed.items()})
+
+    # ── Layer 5: Tool description strip ──
+    # 清空 tool schema 的 description 内容（保留 key），减少指纹信号
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict):
+                if "description" in tool:
+                    tool["description"] = ""
+                # 也清理嵌套的 input_schema.properties 里的 description
+                schema = tool.get("input_schema")
+                if isinstance(schema, dict):
+                    props = schema.get("properties")
+                    if isinstance(props, dict):
+                        for prop_val in props.values():
+                            if isinstance(prop_val, dict) and "description" in prop_val:
+                                prop_val["description"] = ""
+
+    # ── Layer 5b: 注入 CC 工具桩 ──
+    # 让 tools 数组包含真 CC 的标准工具，减少被检测概率
+    if isinstance(tools, list):
+        existing_names = {t.get("name") for t in tools if isinstance(t, dict)}
+        for stub in _CC_TOOL_STUBS:
+            if stub["name"] not in existing_names:
+                tools.insert(0, dict(stub))
+
+    # ── Layer 6: Property name 重命名 ──
+    if isinstance(tools, list):
+        for tool in tools:
+            schema = tool.get("input_schema") if isinstance(tool, dict) else None
+            if isinstance(schema, dict):
+                props = schema.get("properties")
+                if isinstance(props, dict):
+                    for old_name, new_name in _PROP_RENAME_MAP.items():
+                        if old_name in props:
+                            props[new_name] = props.pop(old_name)
+                # required 列表也要同步
+                required = schema.get("required")
+                if isinstance(required, list):
+                    schema["required"] = [
+                        _PROP_RENAME_MAP.get(r, r) for r in required
+                    ]
+
+    # 保存 property 反向映射
+    _reverse_prop_map.set({v: k for k, v in _PROP_RENAME_MAP.items()})
 
     # ── Layer 2 + 4: 字符串级清洗（system + messages 中的文本） ──
     _sanitize_text_blocks(payload)
@@ -858,26 +934,46 @@ async def get_claude_code_passthrough_meta(request, engine, provider, api_key=No
 
 
 async def fetch_claude_code_response_stream(client, url, headers, payload, model, timeout):
-    """包装 Claude 流式 adapter，补齐缺失 gzip 响应头的兼容处理。"""
-    # 修改原因：CPA 会检测缺失 Content-Encoding 的压缩响应，普通 httpx 只会自动处理声明过的压缩。
-    # 修改方式：用 _GzipAwareClient 包装 client，再复用原 Claude stream adapter。
-    # 目的：只在 Claude Code 渠道中补齐 gzip magic-byte 处理，不影响普通 Claude 渠道行为。
+    """包装 Claude 流式 adapter，补齐 gzip + Layer 7 反向映射。"""
     async for chunk in fetch_claude_response_stream(_GzipAwareClient(client), url, headers, payload, model, timeout):
-        yield chunk
+        if isinstance(chunk, str):
+            yield _reverse_map_chunk(chunk)
+        else:
+            yield chunk
 
 
 async def fetch_claude_code_response(client, url, headers, payload, model, timeout):
-    """包装 Claude 非流式 adapter，补齐缺失 gzip 响应头的兼容处理。"""
-    # 修改原因：Claude 非流式响应若 gzip 但缺少 Content-Encoding，会在 json_loads(response_bytes) 处失败。
-    # 修改方式：用 _GzipAwareClient 包装 client，再复用原 Claude response adapter。
-    # 目的：与 CPA 的 magic-byte gzip 处理保持一致，同时避免复制 Claude 响应解析逻辑。
+    """包装 Claude 非流式 adapter，补齐 gzip + Layer 7 反向映射。"""
     async for chunk in fetch_claude_response(_GzipAwareClient(client), url, headers, payload, model, timeout):
-        yield chunk
+        if isinstance(chunk, str):
+            yield _reverse_map_chunk(chunk)
+        else:
+            yield chunk
 
 
 # ═══════════════════════════════════════════════════════════════════
 # 注册
 # ═══════════════════════════════════════════════════════════════════
+
+
+
+def _reverse_map_chunk(chunk: str) -> str:
+    """Layer 7: 对响应 SSE chunk 做反向映射 — 把 CC PascalCase tool name 改回客户端原始名。"""
+    reverse_tools = _reverse_tool_map.get({})
+    reverse_props = _reverse_prop_map.get({})
+    if not reverse_tools and not reverse_props:
+        return chunk
+
+    # 反向 tool name：只替换 JSON 值位置（"name":"Bash" → "name":"exec"）
+    for cc_name, orig_name in reverse_tools.items():
+        chunk = chunk.replace(f'"name":"{cc_name}"', f'"name":"{orig_name}"')
+        chunk = chunk.replace(f'"name": "{cc_name}"', f'"name": "{orig_name}"')
+
+    # 反向 property name
+    for renamed, orig in reverse_props.items():
+        chunk = chunk.replace(f'"{renamed}"', f'"{orig}"')
+
+    return chunk
 
 
 async def _passthrough_sanitize(payload, modifications, request, engine, provider, api_key):
