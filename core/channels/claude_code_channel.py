@@ -16,6 +16,7 @@ OAuth 流程参考 CLIProxyAPI (CPA) 的 internal/auth/claude/ 实现：
 import asyncio
 import gzip
 import hashlib
+import httpx
 import json
 import secrets
 import time
@@ -328,9 +329,55 @@ class ClaudeCodeProvider(OAuthProvider):
         return self._build_credential(credential, token_response)
 
     async def fetch_quota(self, credential: dict, config: dict | None = None) -> dict | None:
-        """Claude Code 目前没有专门的 quota 查询接口，返回 None。"""
-        # 未来可以通过发轻量请求读响应头来获取
-        return None
+        """调用 Anthropic OAuth usage 端点获取 Claude Code 配额。"""
+        access_token = credential.get("access_token")
+        if not access_token:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-code/2.1.80",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/api/oauth/usage",
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+        except Exception:
+            return None
+
+        result = {}
+        # five_hour → 5h 窗口
+        fh = data.get("five_hour")
+        if fh and isinstance(fh, dict):
+            result["quota_5h"] = round(100 - (fh.get("utilization") or 0), 1)
+            result["quota_5h_resets_at"] = fh.get("resets_at")
+        # seven_day → 7d 窗口
+        sd = data.get("seven_day")
+        if sd and isinstance(sd, dict):
+            result["quota_7d"] = round(100 - (sd.get("utilization") or 0), 1)
+            result["quota_7d_resets_at"] = sd.get("resets_at")
+        # model-specific weekly
+        for key, val in data.items():
+            if key.startswith("seven_day_") and isinstance(val, dict):
+                model_tag = key[len("seven_day_"):]
+                result[f"quota_7d_{model_tag}"] = round(100 - (val.get("utilization") or 0), 1)
+                result[f"quota_7d_{model_tag}_resets_at"] = val.get("resets_at")
+        # extra_usage
+        eu = data.get("extra_usage")
+        if eu and isinstance(eu, dict) and eu.get("is_enabled"):
+            result["extra_usage_enabled"] = True
+            result["extra_usage_monthly_limit"] = eu.get("monthly_limit")
+            result["extra_usage_used"] = eu.get("used_credits")
+            result["extra_usage_utilization"] = eu.get("utilization")
+
+        return result if result else None
 
     # ── 内部方法 ──
 
