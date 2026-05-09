@@ -1,0 +1,599 @@
+"""Claude Code OAuth 渠道适配器。
+
+本文件自包含 Claude Code OAuth provider、渠道注册和响应头额度采集逻辑。
+复用 claude_channel 的 request/response adapter，只处理 OAuth 认证和额度采集。
+
+OAuth 流程参考 CLIProxyAPI (CPA) 的 internal/auth/claude/ 实现：
+- Auth URL: https://claude.ai/oauth/authorize
+- Token URL: https://api.anthropic.com/v1/oauth/token
+- Client ID: 9d1c250a-e61b-44d9-88ed-5944d1962f5e
+- Redirect: http://localhost:54545/callback
+- Scope: user:profile user:inference user:sessions:claude_code ...
+- PKCE: S256
+- Token exchange/refresh 用 JSON body（不是 form-urlencoded）
+"""
+
+import asyncio
+import gzip
+import hashlib
+import json
+import secrets
+import time
+from base64 import urlsafe_b64encode
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any
+
+import httpx
+
+from core.oauth.providers.base import OAuthProvider
+from core.channels.claude_channel import (
+    fetch_claude_response_stream,
+    fetch_claude_response,
+    get_claude_payload,
+    get_claude_passthrough_meta,
+)
+
+
+_oauth_manager = None
+
+# ═══════════════════════════════════════════════════════════════════
+# OAuth 常量
+# ═══════════════════════════════════════════════════════════════════
+
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+AUTH_URL = "https://claude.ai/oauth/authorize"
+DEFAULT_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+DEFAULT_REDIRECT_URI = "http://localhost:54545/callback"
+SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+
+DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+CLAUDE_REFRESH_MIN_BACKOFF = 5
+CLAUDE_REFRESH_MAX_BACKOFF = 300
+CLAUDE_REFRESH_MAX_RETRIES = 3
+CLAUDE_CODE_USER_AGENT = "claude-code/2.1.76"
+CLAUDE_CODE_ANTHROPIC_BETA = (
+    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
+    "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
+    "structured-outputs-2025-12-15,fast-mode-2026-02-01,"
+    "redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+)
+
+# 修改原因：CPA 在 refresh 遇到 429 时会按 refresh_token 记录 Retry-After 阻塞窗口。
+# 修改方式：模块级字典保存每个 refresh_token 的 blocked_until epoch，供 refresh 前快速拒绝。
+# 目的：避免同一失效或限流凭据在 Retry-After 窗口内反复打到 Anthropic token endpoint。
+_claude_refresh_blocked_until: dict[str, float] = {}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PKCE
+# ═══════════════════════════════════════════════════════════════════
+
+def _generate_pkce():
+    """生成 PKCE code_verifier + code_challenge (S256)。"""
+    raw = secrets.token_bytes(96)
+    code_verifier = urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return code_verifier, code_challenge
+
+
+class _RefreshHTTPError(RuntimeError):
+    """Claude refresh HTTP 错误，携带是否可重试的信息。"""
+
+    def __init__(self, status_code: int, message: str, retryable: bool):
+        # 修改原因：CPA 的 RefreshTokensWithRetry 只重试网络错误或 5xx，不重试 429 等显式阻塞错误。
+        # 修改方式：自定义异常保存 status_code 和 retryable，供 refresh 重试循环判断。
+        # 目的：让 Python 实现具备与 CPA 等价的刷新退避语义。
+        self.status_code = status_code
+        self.retryable = retryable
+        super().__init__(f"token refresh failed with status {status_code}: {message}")
+
+
+def _format_rfc3339(epoch: float | None = None) -> str:
+    """把 epoch 秒格式化为 RFC3339 UTC 字符串。"""
+    # 修改原因：CPA 的 ClaudeTokenData.expired 和 last_refresh 使用 RFC3339 字符串，而本地还需要 expires_at 数值。
+    # 修改方式：保留 expires_at 的同时新增 RFC3339 字段，统一以 UTC Z 结尾输出。
+    # 目的：兼容 OAuthManager 的刷新判断，并保存 CPA TokenStorage 所需的时间字段。
+    value = time.time() if epoch is None else epoch
+    return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _clamp_refresh_backoff(seconds: float) -> float:
+    """按 CPA 的 5 秒到 5 分钟范围裁剪 Retry-After。"""
+    return max(CLAUDE_REFRESH_MIN_BACKOFF, min(CLAUDE_REFRESH_MAX_BACKOFF, seconds))
+
+
+def _parse_retry_after(headers: Any) -> float:
+    """解析 Retry-After / Retry-After-Ms 响应头。"""
+    # 修改原因：CPA 同时支持 Retry-After 秒数、HTTP 日期和 Retry-After-Ms 毫秒数。
+    # 修改方式：按大小写不敏感方式读取响应头，并将结果裁剪到 CPA 的 backoff 范围。
+    # 目的：让 Anthropic 429 限流时的本地阻塞窗口与 CPA 保持一致。
+    if not headers:
+        return CLAUDE_REFRESH_MIN_BACKOFF
+
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if retry_after is not None:
+        raw = str(retry_after).strip()
+        try:
+            return _clamp_refresh_backoff(float(raw))
+        except (TypeError, ValueError):
+            try:
+                parsed = parsedate_to_datetime(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return _clamp_refresh_backoff(parsed.timestamp() - time.time())
+            except (TypeError, ValueError, IndexError, OverflowError):
+                pass
+
+    retry_after_ms = headers.get("Retry-After-Ms") or headers.get("retry-after-ms")
+    if retry_after_ms is not None:
+        try:
+            return _clamp_refresh_backoff(float(str(retry_after_ms).strip()) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+
+    return CLAUDE_REFRESH_MIN_BACKOFF
+
+
+def _decode_gzip_if_needed(data: bytes) -> bytes:
+    """对缺失 Content-Encoding 的 gzip 响应做 magic-byte 解压。"""
+    # 修改原因：CPA 对 Claude 响应做 magic-byte 检测，处理上游返回 gzip 但缺失 Content-Encoding 的情况。
+    # 修改方式：只在响应体以 gzip magic bytes 开头时尝试 gzip.decompress，失败则保留原始字节。
+    # 目的：避免 Claude Code 非流式响应因未声明压缩而在 JSON 解析阶段失败。
+    if len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
+        try:
+            return gzip.decompress(data)
+        except OSError:
+            return data
+    return data
+
+
+class _GzipAwareResponse:
+    """包装 httpx.Response，补齐缺失 Content-Encoding 时的 gzip 解压。"""
+
+    def __init__(self, response):
+        self._response = response
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+    async def aread(self):
+        # 修改原因：fetch_claude_response 和 check_response 都通过 aread 读取完整响应体。
+        # 修改方式：读取原响应体后执行 magic-byte gzip 检测并返回解压后的字节。
+        # 目的：在不复制 Claude 普通响应解析逻辑的前提下修复缺失 gzip 响应头的兼容问题。
+        data = await self._response.aread()
+        return _decode_gzip_if_needed(data)
+
+    async def aiter_bytes(self):
+        # 修改原因：流式路径按字节迭代响应；如果上游错误地压缩 SSE 且不声明响应头，逐行解析会失败。
+        # 修改方式：先缓存到足够判断 gzip magic bytes；命中 gzip 时读完并解压，否则继续原样流式转发。
+        # 目的：兼顾正常 SSE 的低延迟与异常 gzip 响应的可解析性。
+        iterator = self._response.aiter_bytes()
+        buffered: list[bytes] = []
+        probe = b""
+        async for chunk in iterator:
+            if not chunk:
+                continue
+            buffered.append(chunk)
+            probe += chunk
+            if len(probe) >= 2:
+                break
+
+        if not buffered:
+            return
+
+        if len(probe) >= 2 and probe[0] == 0x1F and probe[1] == 0x8B:
+            chunks = list(buffered)
+            async for chunk in iterator:
+                if chunk:
+                    chunks.append(chunk)
+            yield _decode_gzip_if_needed(b"".join(chunks))
+            return
+
+        for chunk in buffered:
+            yield chunk
+        async for chunk in iterator:
+            yield chunk
+
+
+class _GzipAwareStreamContext:
+    """包装 httpx stream context，让进入上下文后返回 gzip-aware response。"""
+
+    def __init__(self, inner_context):
+        self._inner_context = inner_context
+
+    async def __aenter__(self):
+        response = await self._inner_context.__aenter__()
+        return _GzipAwareResponse(response)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._inner_context.__aexit__(exc_type, exc, tb)
+
+
+class _GzipAwareClient:
+    """代理 httpx.AsyncClient，只为 Claude Code 响应补 gzip magic-byte 解压。"""
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    async def post(self, *args, **kwargs):
+        response = await self._client.post(*args, **kwargs)
+        return _GzipAwareResponse(response)
+
+    def stream(self, *args, **kwargs):
+        return _GzipAwareStreamContext(self._client.stream(*args, **kwargs))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Claude Code OAuth Provider
+# ═══════════════════════════════════════════════════════════════════
+
+class ClaudeCodeProvider(OAuthProvider):
+    """Anthropic Claude Code OAuth provider。
+
+    跟 Codex 最大的区别：
+    1. token endpoint 用 JSON body 不是 form-urlencoded
+    2. refresh 也用 JSON body
+    3. 响应里有 organization + account 结构
+    4. 不需要 id_token 解析（邮箱直接在 account.email_address 里）
+    """
+
+    # 修改原因：CPA 的 Claude Code OAuth redirect_uri 固定为 localhost:54545/callback，路由层会读取这个字段。
+    # 修改方式：在 provider 上显式声明手动模式回调地址，避免落回 OAuthProvider 基类的 localhost:8080/callback。
+    # 目的：保证授权 URL 和 token exchange 使用 Anthropic 白名单内的固定回调地址。
+    localhost_redirect_uri = DEFAULT_REDIRECT_URI
+
+    @property
+    def type_name(self) -> str:
+        return "claude-code"
+
+    @property
+    def redirect_mode(self) -> str:
+        return "manual"
+
+    @property
+    def redirect_uri(self) -> str:
+        return DEFAULT_REDIRECT_URI
+
+    def get_default_base_url(self) -> str:
+        return DEFAULT_BASE_URL
+
+    def build_auth_url(self, state: str, redirect_uri: str = DEFAULT_REDIRECT_URI) -> tuple[str, str]:
+        """生成 Claude OAuth 授权 URL，返回 (auth_url, code_verifier)。"""
+        code_verifier, code_challenge = _generate_pkce()
+        params = {
+            "code": "true",
+            "client_id": CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri or DEFAULT_REDIRECT_URI,
+            "scope": SCOPES,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+        from urllib.parse import urlencode as _urlencode
+        url = f"{AUTH_URL}?{_urlencode(params)}"
+        return url, code_verifier
+
+    async def exchange_code(
+        self,
+        code: str,
+        redirect_uri: str = DEFAULT_REDIRECT_URI,
+        code_verifier: str | None = None,
+        config: dict | None = None,
+    ) -> dict:
+        """用授权码 + PKCE verifier 换 token。"""
+        if not code_verifier:
+            raise ValueError("code_verifier is required for Claude Code OAuth")
+
+        parsed_code, parsed_state = self._parse_code_and_state(code)
+
+        data = {
+            "code": parsed_code,
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": redirect_uri or DEFAULT_REDIRECT_URI,
+            "code_verifier": code_verifier,
+        }
+        if parsed_state:
+            # 修改原因：CPA 的 parseCodeAndState 会把 code 中的 #fragment 作为 state 覆盖进 token exchange body。
+            # 修改方式：只在 fragment 存在时加入 state 字段，避免本地路由未传 state 时制造空字段。
+            # 目的：兼容 Anthropic 授权码中携带 fragment state 的返回形式。
+            data["state"] = parsed_state
+        token_response = await self._post_token_json(data, config=config)
+        return self._build_credential({}, token_response)
+
+    async def refresh_token(self, credential: dict, config: dict | None = None) -> dict:
+        """用 refresh_token 刷新 access_token。"""
+        refresh = credential.get("refresh_token")
+        if not refresh:
+            raise ValueError("refresh_token is required")
+
+        self._raise_if_refresh_blocked(refresh)
+        data = {
+            "client_id": CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+        }
+        token_response = await self._post_token_json(data, config=config, refresh_token=refresh)
+        # 修改原因：CPA refresh 成功后会 clearClaudeRefreshBlockedUntil，避免旧 429 阻塞影响后续正常刷新。
+        # 修改方式：刷新成功后删除当前 refresh_token 的 blocked_until 记录。
+        # 目的：让临时限流恢复后账号可以重新进入 active 状态。
+        _claude_refresh_blocked_until.pop(refresh, None)
+        return self._build_credential(credential, token_response)
+
+    async def fetch_quota(self, credential: dict, config: dict | None = None) -> dict | None:
+        """Claude Code 目前没有专门的 quota 查询接口，返回 None。"""
+        # 未来可以通过发轻量请求读响应头来获取
+        return None
+
+    # ── 内部方法 ──
+
+    @staticmethod
+    def _parse_code_and_state(code: str) -> tuple[str, str]:
+        """按 CPA parseCodeAndState 语义拆分 code 与 fragment state。"""
+        # 修改原因：Anthropic 回调中的 code 可能包含 #fragment，CPA 会把 fragment 当作 state 传给 token endpoint。
+        # 修改方式：只按第一个 # 拆分，保留前半段为真实授权码，后半段为可选 state。
+        # 目的：避免 token exchange 把 fragment 一起当作 code，或丢失 Anthropic 返回的 state。
+        parsed_code, sep, parsed_state = str(code or "").partition("#")
+        return parsed_code, parsed_state if sep else ""
+
+    @staticmethod
+    def _raise_if_refresh_blocked(refresh_token: str) -> None:
+        """如果 refresh_token 仍处于 Retry-After 阻塞窗口，则直接拒绝刷新。"""
+        blocked_until = _claude_refresh_blocked_until.get(refresh_token, 0)
+        if blocked_until > time.time():
+            raise _RefreshHTTPError(
+                429,
+                f"refresh temporarily blocked until {_format_rfc3339(blocked_until)}",
+                retryable=False,
+            )
+
+    def _resolve_token_url(self, config: dict | None = None) -> str:
+        """动态读取 token_url，支持反代。"""
+        if config and isinstance(config, dict):
+            providers = config.get("providers", [])
+            for p in providers:
+                if isinstance(p, dict) and p.get("engine") == "claude-code":
+                    custom = p.get("token_url") or p.get("preferences", {}).get("token_url")
+                    if custom:
+                        # 修改原因：token_url 可能配置为根域、/v1 或完整 /v1/oauth/token，不能简单重复拼 /v1。
+                        # 修改方式：先去掉尾斜杠，再分别识别完整 endpoint、/v1 前缀和根域三种形式。
+                        # 目的：让前端保存反代地址后，exchange 与 refresh 都能请求正确 endpoint。
+                        url = str(custom).strip().rstrip("/")
+                        if url.endswith("/oauth/token"):
+                            return url
+                        if url.endswith("/v1"):
+                            return f"{url}/oauth/token"
+                        return f"{url}/v1/oauth/token"
+        return DEFAULT_TOKEN_URL
+
+    async def _post_token_json(
+        self,
+        data: dict,
+        config: dict | None = None,
+        refresh_token: str | None = None,
+    ) -> dict:
+        """向 token endpoint 发 JSON POST（Claude 用 JSON 不用 form）。"""
+        token_url = self._resolve_token_url(config)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        attempts = CLAUDE_REFRESH_MAX_RETRIES if refresh_token else 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            if refresh_token:
+                self._raise_if_refresh_blocked(refresh_token)
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(token_url, json=data, headers=headers)
+                if response.status_code >= 400:
+                    message = getattr(response, "text", "")
+                    if refresh_token and response.status_code == 429:
+                        retry_after = _parse_retry_after(getattr(response, "headers", None))
+                        _claude_refresh_blocked_until[refresh_token] = time.time() + retry_after
+                        raise _RefreshHTTPError(response.status_code, message, retryable=False)
+                    if refresh_token:
+                        raise _RefreshHTTPError(
+                            response.status_code,
+                            message,
+                            retryable=response.status_code >= 500,
+                        )
+                    raise RuntimeError(f"token request failed with status {response.status_code}: {message}")
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid token response")
+                return payload
+            except _RefreshHTTPError as exc:
+                last_error = exc
+                if not refresh_token or not exc.retryable or attempt >= attempts - 1:
+                    raise
+            except httpx.HTTPError as exc:
+                # 修改原因：CPA 的 RefreshTokensWithRetry 会对临时网络错误做指数退避式重试。
+                # 修改方式：仅 refresh 路径重试 httpx 网络异常；授权码交换仍立即失败，避免重复消费 code。
+                # 目的：提升后台刷新抗瞬时网络故障能力，同时不破坏 authorization_code 一次性语义。
+                last_error = exc
+                if not refresh_token or attempt >= attempts - 1:
+                    raise
+
+            await asyncio.sleep(attempt + 1)
+        raise RuntimeError(f"token refresh failed after {attempts} attempts: {last_error}")
+
+    def _build_credential(self, original: dict, token_response: dict) -> dict:
+        """把 token endpoint 响应转成 oauth_state 凭据对象。"""
+        # 修改原因：CPA 的 tokenResponse 解析出 access_token、refresh_token、token_type、expires_in、account 和 organization。
+        # 修改方式：在原有扁平 oauth_state 上补齐 token_type、expires_at、expired、last_refresh、账号和组织字段。
+        # 目的：既满足 OAuthManager 的本地刷新判断，也保存 CPA ClaudeTokenStorage 中需要的身份与过期信息。
+        access_token = token_response.get("access_token")
+        if not access_token:
+            raise ValueError("Token response missing access_token")
+
+        updated = dict(original or {})
+        updated["access_token"] = access_token
+
+        # refresh_token rotation — 新的覆盖旧的
+        if token_response.get("refresh_token"):
+            updated["refresh_token"] = token_response["refresh_token"]
+
+        if token_response.get("token_type"):
+            updated["token_type"] = token_response["token_type"]
+
+        try:
+            expires_in = int(token_response.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            expires_in = 0
+        if expires_in > 0:
+            expires_at = time.time() + expires_in
+            updated["expires_at"] = expires_at
+            updated["expired"] = _format_rfc3339(expires_at)
+
+        updated["last_refresh"] = _format_rfc3339()
+
+        account = token_response.get("account", {})
+        if isinstance(account, dict):
+            email = account.get("email_address")
+            if email:
+                updated["email"] = email
+            account_uuid = account.get("uuid")
+            if account_uuid:
+                updated["account_id"] = account_uuid
+
+        org = token_response.get("organization", {})
+        if isinstance(org, dict):
+            org_uuid = org.get("uuid")
+            if org_uuid:
+                updated["organization_id"] = org_uuid
+            org_name = org.get("name")
+            if org_name:
+                updated["organization_name"] = org_name
+
+        return updated
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 渠道适配器（复用 claude_channel）
+# ═══════════════════════════════════════════════════════════════════
+
+def _pop_header_case_insensitive(headers: dict, name: str):
+    """按大小写不敏感方式移除请求头。"""
+    target = name.lower()
+    for key in list(headers.keys()):
+        if str(key).lower() == target:
+            return headers.pop(key)
+    return None
+
+
+def _set_header_case_insensitive(headers: dict, name: str, value: str) -> None:
+    """按大小写不敏感方式设置请求头。"""
+    _pop_header_case_insensitive(headers, name)
+    headers[name] = value
+
+
+def _get_header_case_insensitive(headers: dict, name: str):
+    """按大小写不敏感方式读取请求头。"""
+    target = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == target:
+            return key, value
+    return None, None
+
+
+def _merge_anthropic_beta(headers: dict) -> None:
+    """把 CPA Claude Code OAuth beta 集合合并进 anthropic-beta。"""
+    # 修改原因：普通 claude_channel 只设置模型相关 beta，CPA Claude Code 请求还固定包含 oauth-2025-04-20 等 beta。
+    # 修改方式：按逗号拆分现有值和 CPA 默认值，去重后写回 anthropic-beta。
+    # 目的：让 Claude Code OAuth 请求头既保留原 adapter beta，又带上 OAuth 必需 beta。
+    existing_key, existing_value = _get_header_case_insensitive(headers, "anthropic-beta")
+    beta_values: list[str] = []
+    for raw in (existing_value or "", CLAUDE_CODE_ANTHROPIC_BETA):
+        for item in str(raw).split(","):
+            beta = item.strip()
+            if beta and beta not in beta_values:
+                beta_values.append(beta)
+    if existing_key and existing_key != "anthropic-beta":
+        headers.pop(existing_key, None)
+    headers["anthropic-beta"] = ",".join(beta_values)
+
+
+def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
+    """把普通 Claude 请求头改成 CPA Claude Code OAuth 请求头。"""
+    # 修改原因：普通 claude_channel 使用 x-api-key，而 CPA 对 OAuth access_token 使用 Authorization: Bearer。
+    # 修改方式：大小写不敏感移除 x-api-key，写入 Bearer，并补齐 Claude Code OAuth beta、X-App 与默认 UA。
+    # 目的：避免把 OAuth access_token 当 Anthropic API key 发送，同时减少与 Claude Code 官方请求头的差异。
+    _pop_header_case_insensitive(headers, "x-api-key")
+    _set_header_case_insensitive(headers, "Authorization", f"Bearer {api_key}")
+    _merge_anthropic_beta(headers)
+    if _get_header_case_insensitive(headers, "X-App")[0] is None:
+        headers["X-App"] = "cli"
+    if _get_header_case_insensitive(headers, "User-Agent")[0] is None:
+        headers["User-Agent"] = CLAUDE_CODE_USER_AGENT
+
+
+async def get_claude_code_payload(request, engine, provider, api_key=None):
+    """复用 Claude adapter 构建 payload，覆盖为 Bearer 认证。"""
+    url, headers, payload = await get_claude_payload(request, "claude", provider, api_key)
+    _apply_claude_code_headers(headers, api_key)
+    return url, headers, payload
+
+
+async def get_claude_code_passthrough_meta(request, engine, provider, api_key=None):
+    """透传模式：复用 Claude passthrough adapter，覆盖为 Bearer 认证。"""
+    url, headers, payload = await get_claude_passthrough_meta(request, "claude", provider, api_key)
+    _apply_claude_code_headers(headers, api_key)
+    return url, headers, payload
+
+
+async def fetch_claude_code_response_stream(client, url, headers, payload, model, timeout):
+    """包装 Claude 流式 adapter，补齐缺失 gzip 响应头的兼容处理。"""
+    # 修改原因：CPA 会检测缺失 Content-Encoding 的压缩响应，普通 httpx 只会自动处理声明过的压缩。
+    # 修改方式：用 _GzipAwareClient 包装 client，再复用原 Claude stream adapter。
+    # 目的：只在 Claude Code 渠道中补齐 gzip magic-byte 处理，不影响普通 Claude 渠道行为。
+    async for chunk in fetch_claude_response_stream(_GzipAwareClient(client), url, headers, payload, model, timeout):
+        yield chunk
+
+
+async def fetch_claude_code_response(client, url, headers, payload, model, timeout):
+    """包装 Claude 非流式 adapter，补齐缺失 gzip 响应头的兼容处理。"""
+    # 修改原因：Claude 非流式响应若 gzip 但缺少 Content-Encoding，会在 json_loads(response_bytes) 处失败。
+    # 修改方式：用 _GzipAwareClient 包装 client，再复用原 Claude response adapter。
+    # 目的：与 CPA 的 magic-byte gzip 处理保持一致，同时避免复制 Claude 响应解析逻辑。
+    async for chunk in fetch_claude_response(_GzipAwareClient(client), url, headers, payload, model, timeout):
+        yield chunk
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 注册
+# ═══════════════════════════════════════════════════════════════════
+
+def register():
+    """注册 Claude Code OAuth 渠道。"""
+    from .registry import register_channel
+
+    register_channel(
+        id="claude-code",
+        type_name="claude",
+        default_base_url=DEFAULT_BASE_URL,
+        default_token_url=DEFAULT_TOKEN_URL,
+        auth_header="Authorization: Bearer {api_key}",
+        description="Claude Code (OAuth subscription)",
+        request_adapter=get_claude_code_payload,
+        passthrough_adapter=get_claude_code_passthrough_meta,
+        response_adapter=fetch_claude_code_response,
+        stream_adapter=fetch_claude_code_response_stream,
+        is_oauth=True,
+        source="builtin",
+    )
+
+
+def register_oauth_provider(oauth_manager, providers: list | None = None):
+    """向 OAuthManager 注册 Claude Code provider。"""
+    global _oauth_manager
+    _oauth_manager = oauth_manager
+    provider = ClaudeCodeProvider()
+    oauth_manager.register_provider("claude-code", provider)

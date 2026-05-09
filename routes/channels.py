@@ -628,6 +628,159 @@ async def get_models_by_groups(
     return JSONResponse(content={"models": all_models})
 
 
+def _normalize_oauth_balance_key_ids(api_value: Any) -> list[str]:
+    """把 provider.api / api_key 归一化为 OAuth key_id 列表。"""
+    # 修改原因：余额入口可能收到前端逐 Key 传入的字符串，也可能收到完整 provider.api 列表。
+    # 修改方式：统一遍历列表或单值，去掉空白，并跳过以 ! 开头的禁用账号标识。
+    # 目的：OAuth 余额分流可以复用同一套遍历逻辑，且不会查询已禁用账号。
+    if isinstance(api_value, list):
+        raw_items = api_value
+    elif api_value:
+        raw_items = [api_value]
+    else:
+        raw_items = []
+
+    key_ids: list[str] = []
+    for item in raw_items:
+        key_id = str(item or "").strip()
+        if not key_id or key_id.startswith("!"):
+            continue
+        key_ids.append(key_id)
+    return key_ids
+
+
+def _coerce_oauth_percent(value: Any) -> Optional[float]:
+    """把 OAuth quota 百分比转换成 0 到 100 之间的浮点数。"""
+    # 修改原因：OAuthManager 缓存可能来自 JSON 文件或响应头解析，数值类型不一定稳定。
+    # 修改方式：尝试转成 float，失败返回 None，成功后裁剪到百分比范围。
+    # 目的：保持 BalanceResult.percent 对前端始终是安全可展示的数值或空值。
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(max(0.0, min(100.0, number)), 10)
+
+
+def _oauth_quota_to_balance_result(quota: Any, error: Optional[str] = None) -> Dict[str, Any]:
+    """把 OAuthManager.fetch_quota 的返回值转换为前端现有 BalanceResult 形状。"""
+    # 修改原因：前端余额展示读取 value_type、percent、available 等通用字段，而 OAuth quota 使用 quota_5h/quota_7d。
+    # 修改方式：保留 OAuth 原字段，同时用两个窗口中的最低剩余额度作为兼容的 percent 和 available。
+    # 目的：OAuth 渠道可以复用 /v1/channels/balance 和现有余额展示，不要求用户配置 endpoint/mapping。
+    if error or not isinstance(quota, dict):
+        return {
+            "supported": True,
+            "value_type": "percent",
+            "total": None,
+            "used": None,
+            "available": None,
+            "percent": None,
+            "quota_5h": None,
+            "quota_7d": None,
+            "raw": None,
+            "error": error or "OAuth 额度不可用",
+        }
+
+    quota_5h = _coerce_oauth_percent(quota.get("quota_5h"))
+    quota_7d = _coerce_oauth_percent(quota.get("quota_7d"))
+    percentages = [pct for pct in (quota_5h, quota_7d) if pct is not None]
+    percent = min(percentages) if percentages else None
+    total = 100.0 if percent is not None else None
+    used = round(100.0 - percent, 10) if percent is not None else None
+    return {
+        "supported": True,
+        "value_type": "percent",
+        "total": total,
+        "used": used,
+        "available": percent,
+        "percent": percent,
+        "quota_5h": quota_5h,
+        "quota_7d": quota_7d,
+        "raw": quota.get("raw") if isinstance(quota.get("raw"), dict) else None,
+        "error": None,
+    }
+
+
+def _aggregate_oauth_balance_results(results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """合并多个 OAuth 账号的 BalanceResult，并保留逐账号 results。"""
+    # 修改原因：用户可能一次请求整个 provider.api 列表，也可能逐 Key 请求；两种情况都要兼容。
+    # 修改方式：单账号时把该账号结果提升到顶层，多账号时用最低 percent 作为顶层汇总值。
+    # 目的：既满足前端旧的单行 BalanceResult 读取方式，也能让新入口返回完整账号映射。
+    if not results:
+        return {
+            "supported": False,
+            "value_type": "percent",
+            "total": None,
+            "used": None,
+            "available": None,
+            "percent": None,
+            "quota_5h": None,
+            "quota_7d": None,
+            "raw": None,
+            "error": "未配置 OAuth 账号标识",
+            "results": {},
+        }
+
+    if len(results) == 1:
+        key_id, result = next(iter(results.items()))
+        merged = dict(result)
+        merged["results"] = {key_id: result}
+        return merged
+
+    percentages = [
+        result.get("percent")
+        for result in results.values()
+        if result.get("error") is None and result.get("percent") is not None
+    ]
+    percent = min(percentages) if percentages else None
+    total = 100.0 if percent is not None else None
+    used = round(100.0 - percent, 10) if percent is not None else None
+    has_success = any(result.get("error") is None for result in results.values())
+    return {
+        "supported": True,
+        "value_type": "percent",
+        "total": total,
+        "used": used,
+        "available": percent,
+        "percent": percent,
+        "quota_5h": None,
+        "quota_7d": None,
+        "raw": results,
+        "error": None if has_success else "OAuth 额度不可用",
+        "results": results,
+    }
+
+
+async def _query_oauth_channel_balance(app: Any, provider: Dict[str, Any]) -> Dict[str, Any]:
+    """通过 OAuthManager 查询 OAuth 渠道账号额度。"""
+    # 修改原因：OAuth 渠道没有用户可配置的余额 endpoint，额度统一由 OAuthManager.fetch_quota 维护。
+    # 修改方式：遍历 provider.api 中的 key_id，逐个调用 fetch_quota，并把结果转换成 BalanceResult 后合并。
+    # 目的：让 /v1/channels/balance 成为普通渠道和 OAuth 渠道共同使用的后端入口。
+    key_ids = _normalize_oauth_balance_key_ids(provider.get("api"))
+    if not key_ids:
+        return _aggregate_oauth_balance_results({})
+
+    oauth_manager = getattr(getattr(app, "state", None), "oauth_manager", None)
+    fetch_quota = getattr(oauth_manager, "fetch_quota", None)
+    if not callable(fetch_quota):
+        return _aggregate_oauth_balance_results({
+            key_id: _oauth_quota_to_balance_result(None, "OAuth 管理器不可用")
+            for key_id in key_ids
+        })
+
+    async def fetch_one(key_id: str) -> tuple[str, Dict[str, Any]]:
+        try:
+            quota = await fetch_quota(key_id)
+            return key_id, _oauth_quota_to_balance_result(quota)
+        except Exception as exc:
+            logger.warning(f"OAuth balance query failed for {key_id}: {exc}")
+            return key_id, _oauth_quota_to_balance_result(None, f"OAuth 额度查询失败: {str(exc)}"[:500])
+
+    pairs = await asyncio.gather(*(fetch_one(key_id) for key_id in key_ids))
+    return _aggregate_oauth_balance_results(dict(pairs))
+
+
 @router.post("/v1/channels/balance", dependencies=[Depends(rate_limit_dependency)])
 async def query_channel_balance(
     token: str = Depends(verify_admin_api_key),
@@ -651,8 +804,6 @@ async def query_channel_balance(
         }
     }
     """
-    from core.balance import query_provider_balance, build_balance_config
-
     app = get_app()
 
     engine = provider_config.get("engine") or provider_config.get("type") or "openai"
@@ -671,6 +822,16 @@ async def query_channel_balance(
         "aws_access_key": provider_config.get("aws_access_key", ""),
         "aws_secret_key": provider_config.get("aws_secret_key", ""),
     }
+
+    channel = get_channel(engine)
+    if channel and getattr(channel, "is_oauth", False):
+        # 修改原因：OAuth 渠道的余额来自 OAuth 账号 quota，不存在 preferences.balance 配置。
+        # 修改方式：在普通 balance.py 逻辑之前按渠道注册表标记分流到 OAuthManager.fetch_quota。
+        # 目的：让管理端余额按钮对 Codex 等 OAuth 渠道可用，同时不影响普通 API Key 渠道。
+        result = await _query_oauth_channel_balance(app, provider)
+        return JSONResponse(content=result)
+
+    from core.balance import query_provider_balance, build_balance_config
 
     # 验证是否配置了 balance
     balance_cfg = build_balance_config(provider)

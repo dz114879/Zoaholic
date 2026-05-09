@@ -72,7 +72,13 @@ async def get_responses_passthrough_meta(request, engine, provider, api_key=None
         'Content-Type': 'application/json',
     }
     if api_key:
-        headers['Authorization'] = f"Bearer {api_key}"
+        # 支持 org-id:sk-key 格式 — 拆出组织ID注入 OpenAI-Organization 头
+        if ':' in str(api_key) and str(api_key).startswith('org-'):
+            org_id, actual_key = str(api_key).split(':', 1)
+            headers['Authorization'] = f"Bearer {actual_key}"
+            headers['OpenAI-Organization'] = org_id
+        else:
+            headers['Authorization'] = f"Bearer {api_key}"
 
     from ..utils import resolve_base_url
     url = resolve_base_url(_normalize_responses_base_url(
@@ -112,7 +118,13 @@ async def get_responses_payload(request, engine, provider, api_key=None):
     original_model = model_dict[request.model]
 
     if api_key:
-        headers['Authorization'] = f"Bearer {api_key}"
+        # 支持 org-id:sk-key 格式
+        if ':' in str(api_key) and str(api_key).startswith('org-'):
+            org_id, actual_key = str(api_key).split(':', 1)
+            headers['Authorization'] = f"Bearer {actual_key}"
+            headers['OpenAI-Organization'] = org_id
+        else:
+            headers['Authorization'] = f"Bearer {api_key}"
 
     from ..utils import resolve_base_url
     url = resolve_base_url(_normalize_responses_base_url(
@@ -764,4 +776,5 @@ def register():
         response_adapter=fetch_responses_response,
         stream_adapter=fetch_responses_stream,
         models_adapter=fetch_responses_models,
+        source="builtin",
     )

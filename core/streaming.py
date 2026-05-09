@@ -103,6 +103,34 @@ class LoggingStreamingResponse(Response):
             if "start_time" in self.current_info:
                 process_time = time() - self.current_info["start_time"]
                 self.current_info["process_time"] = process_time
+            # sticky_ip: 200 + 0 completion_tokens = 流内报错/空响应，清 session 让下次 round_robin 重新分配
+            try:
+                if (
+                    self.current_info.get("status_code") == 200
+                    and self.current_info.get("completion_tokens", 0) == 0
+                    and self.current_info.get("success")
+                    and self.app
+                ):
+                    # 标记为 "假200" — 流建立但无有效输出
+                    self.current_info["status_code"] = 502
+                    self.current_info["success"] = False
+                    self.current_info["error_message"] = "Stream completed with 0 output tokens (possible in-stream error)"
+                    logger.warning(
+                        f"[stream_guard] {self.current_info.get('provider', '?')} "
+                        f"200→502: 0 completion_tokens, marking as failed"
+                    )
+
+                    # sticky_ip: 清 session
+                    from core.utils import provider_api_circular_list
+                    channel_id = self.current_info.get("provider", "")
+                    clist = provider_api_circular_list.get(channel_id)
+                    if clist and clist.schedule_algorithm == "sticky_ip":
+                        client_ip = self.current_info.get("client_ip", "")
+                        if client_ip and client_ip in clist._sticky_sessions:
+                            clist._sticky_sessions.pop(client_ip, None)
+            except Exception:
+                pass
+
             try:
                 await update_stats(self.current_info, app=self.app)
             except Exception as e:

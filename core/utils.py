@@ -628,13 +628,17 @@ class ThreadSafeCircularList:
             self.items = items
         elif schedule_algorithm == "smart_round_robin":
             self.items = items
+        elif schedule_algorithm == "sticky_ip":
+            self.items = items
         else:
             self.items = items
-            logger.warning(f"Unknown schedule algorithm: {schedule_algorithm}, use (round_robin, random, fixed_priority, smart_round_robin) instead")
+            logger.warning(f"Unknown schedule algorithm: {schedule_algorithm}, use (round_robin, random, fixed_priority, smart_round_robin, sticky_ip) instead")
             self.schedule_algorithm = "round_robin"
 
         self.index = 0
         self.lock = asyncio.Lock()
+        # sticky_ip session 表: {client_ip: (key_index, expire_time)}
+        self._sticky_sessions: dict[str, tuple[int, float]] = {}
         self.requests = defaultdict(lambda: defaultdict(list))
         self.cooling_until = defaultdict(float)
         self.rate_limits = {}
@@ -845,8 +849,25 @@ class ThreadSafeCircularList:
 
     async def next(self, model: str = None):
         async with self.lock:
+            client_ip = ""  # sticky_ip 用
+
             if self.schedule_algorithm == "fixed_priority":
                 self.index = 0
+
+            if self.schedule_algorithm == "sticky_ip" and len(self.items) > 0:
+                from .middleware import request_info
+                info = request_info.get()
+                client_ip = info.get("client_ip", "") if isinstance(info, dict) else ""
+                now = time()
+                session = self._sticky_sessions.get(client_ip)
+                if session and session[1] > now and session[0] < len(self.items):
+                    # 已有 session 且未过期且 index 合法 → 粘滞
+                    self.index = session[0]
+                else:
+                    # 新 IP 或 session 过期 → round_robin 游标分配，保证均匀
+                    # self.index 已经是当前 round_robin 位置，不用动
+                    pass
+                # 不管是粘滞还是新分配，都在拿到 key 后更新 session（见下方）
 
             # 检查是否即将完成一个循环，并据此触发重排序
             if self.schedule_algorithm == "smart_round_robin" and len(self.items) > 0 and self.index == len(self.items) - 1:
@@ -858,6 +879,15 @@ class ThreadSafeCircularList:
                 self.index = (self.index + 1) % len(self.items)
 
                 if not await self.is_rate_limited(item, model):
+                    # sticky_ip: 记录本次分配，1小时 TTL
+                    if self.schedule_algorithm == "sticky_ip" and client_ip:
+                        key_idx = (self.index - 1) % len(self.items)
+                        self._sticky_sessions[client_ip] = (key_idx, time() + 3600)
+                        # 惰性清理过期 session（每 100 次）
+                        if len(self._sticky_sessions) > 100 and len(self._sticky_sessions) % 50 == 0:
+                            expired = [k for k, (_, exp) in self._sticky_sessions.items() if exp <= time()]
+                            for k in expired:
+                                self._sticky_sessions.pop(k, None)
                     return item
 
                 # 如果已经检查了所有的 API key 都被限制

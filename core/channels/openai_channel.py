@@ -728,4 +728,5 @@ def register():
         response_adapter=fetch_openai_response,
         stream_adapter=fetch_gpt_response_stream,
         models_adapter=fetch_openai_models,
+        source="builtin",
     )

@@ -725,4 +725,5 @@ def register():
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
         models_adapter=fetch_claude_models,
+        source="builtin",
     )

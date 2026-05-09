@@ -116,6 +116,56 @@ def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_re
     return amz_date, payload_hash, authorization_header
 
 
+def _parse_ak_sk(provider, api_key=None):
+    """解析 AWS AK/SK，兼容 provider 字段和旧的 "AK:SK" api_key 格式。"""
+    # 修改原因：普通转换路径、模型列表和 Claude 透传路径都需要相同的凭据解析逻辑。
+    # 修改方式：把重复的 provider/aws_access_key 与 api_key 拆分逻辑集中到一个函数。
+    # 目的：避免后续只修一处导致 AWS 签名来源不一致。
+    aws_ak = provider.get("aws_access_key") or ""
+    aws_sk = provider.get("aws_secret_key") or ""
+    if not aws_ak and api_key and ":" in str(api_key):
+        parts = str(api_key).split(":", 1)
+        aws_ak = parts[0].strip()
+        aws_sk = parts[1].strip()
+    return aws_ak, aws_sk
+
+
+def _extract_region(base_url, provider):
+    """从 Bedrock Runtime URL 提取 region，提取失败时回退到 provider.aws_region。"""
+    # 修改原因：直连和反代 base_url 都可能包含 bedrock-runtime.{region}.amazonaws.com。
+    # 修改方式：复用同一个正则提取 region，并在失败时使用配置默认值。
+    # 目的：让普通请求、透传请求和签名上下文始终使用同一 region 推断规则。
+    _region_match = re.search(r'bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com', base_url or "")
+    return _region_match.group(1) if _region_match else provider.get('aws_region', 'us-east-1')
+
+
+def _build_aws_sigv4_headers(payload_dict, original_model, aws_ak, aws_sk, aws_region, host, endpoint_suffix='invoke-with-response-stream'):
+    """构建 AWS SigV4 签名 headers。payload_dict 会用 json_dumps_text 序列化后计算 hash。"""
+    # 修改原因：透传签名和普通转换签名都必须用与实际发送一致的 JSON 文本计算 body hash。
+    # 修改方式：把 get_signature 的调用封装成公共 headers 构造函数，并显式传入 endpoint_suffix。
+    # 目的：确保 invoke 与 invoke-with-response-stream 两种端点都能得到匹配的 SigV4 签名。
+    content_type = "application/json"
+    accept_header = "application/json"
+    amz_date, payload_hash, authorization_header = get_signature(
+        payload_dict,
+        original_model,
+        aws_ak,
+        aws_sk,
+        aws_region,
+        host,
+        content_type,
+        accept_header,
+        endpoint_suffix,
+    )
+    return {
+        'Accept': accept_header,
+        'Content-Type': content_type,
+        'X-Amz-Date': amz_date,
+        'X-Amz-Content-Sha256': payload_hash,
+        'Authorization': authorization_header,
+    }
+
+
 async def get_aws_payload(request, engine, provider, api_key=None):
     """构建 AWS Bedrock API 的请求 payload"""
     CONTENT_TYPE = "application/json"
@@ -124,14 +174,10 @@ async def get_aws_payload(request, engine, provider, api_key=None):
     base_url = provider.get('base_url')
     is_fixed_url = base_url.endswith('#')
 
-    # 从 base_url 提取 region：支持直连和反代 URL
-    import re as _re
-    _region_match = _re.search(r'bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com', base_url)
-    if _region_match:
-        AWS_REGION = _region_match.group(1)
-    else:
-        AWS_REGION = provider.get('aws_region', 'us-east-1')
-    # 签名始终用 AWS 原始 host（反代会透传 Host header）
+    # 修改原因：Claude 透传路径和普通 OAI 转换路径必须用同一套 region/host 规则签名。
+    # 修改方式：复用 _extract_region，并固定 SigV4 canonical host 为 AWS 原始域名。
+    # 目的：支持反代 base_url 时仍按 Bedrock 真实 host 生成签名。
+    AWS_REGION = _extract_region(base_url, provider)
     HOST = f"bedrock-runtime.{AWS_REGION}.amazonaws.com"
 
     if is_fixed_url:
@@ -267,33 +313,172 @@ async def get_aws_payload(request, engine, provider, api_key=None):
         payload.pop("tool_choice", None)
 
     headers = {}
-    # 解析 AK/SK：优先从 api_key 参数按 "AK:SK" 格式拆分，兼容旧的 aws_access_key/aws_secret_key 字段
-    aws_ak = provider.get("aws_access_key") or ""
-    aws_sk = provider.get("aws_secret_key") or ""
-    if not aws_ak and api_key and ":" in str(api_key):
-        parts = str(api_key).split(":", 1)
-        aws_ak = parts[0].strip()
-        aws_sk = parts[1].strip()
+    # 修改原因：凭据解析需要与透传签名拦截器共享，避免两条路径行为不同。
+    # 修改方式：使用 _parse_ak_sk 兼容 provider 字段和 "AK:SK" api_key。
+    # 目的：保持现有配置方式在新增 Claude 透传后继续可用。
+    aws_ak, aws_sk = _parse_ak_sk(provider, api_key)
     if aws_ak and aws_sk:
-        ACCEPT_HEADER = "application/json"
-        amz_date, payload_hash, authorization_header = await asyncio.to_thread(
-            get_signature, payload, original_model, aws_ak, aws_sk, AWS_REGION, HOST, CONTENT_TYPE, ACCEPT_HEADER
+        headers = await asyncio.to_thread(
+            _build_aws_sigv4_headers, payload, original_model, aws_ak, aws_sk, AWS_REGION, HOST
         )
-        headers = {
-            'Accept': ACCEPT_HEADER,
-            'Content-Type': CONTENT_TYPE,
-            'X-Amz-Date': amz_date,
-            'X-Amz-Content-Sha256': payload_hash,
-            'Authorization': authorization_header,
-        }
         # 存储签名参数供非流式路径重新签名（塞 payload 临时字段，不污染 headers）
         payload['_aws_signing'] = {
             'ak': aws_ak, 'sk': aws_sk, 'region': AWS_REGION,
-            'host': HOST, 'ct': CONTENT_TYPE, 'accept': ACCEPT_HEADER,
+            'host': HOST, 'ct': CONTENT_TYPE, 'accept': headers.get('Accept', 'application/json'),
             'model': original_model,
         }
 
     return url, headers, payload
+
+async def get_aws_passthrough_meta(request, engine, provider, api_key=None):
+    """Claude 方言透传用：只构建 Bedrock URL 和基础 headers，SigV4 签名延迟到拦截器完成。"""
+    # 修改原因：透传 payload 会在 handler 中由原始 Claude body 生成，meta 阶段还不知道最终 body。
+    # 修改方式：这里只选择 invoke/invoke-with-response-stream URL，并把签名上下文暂存在 provider。
+    # 目的：让后续请求拦截器拿到最终 payload 后再计算准确的 SigV4 body hash。
+    model_dict = get_model_dict(provider)
+    original_model = model_dict[request.model]
+    base_url = provider.get('base_url') or "https://bedrock-runtime.us-east-1.amazonaws.com"
+    aws_region = _extract_region(base_url, provider)
+    host = f"bedrock-runtime.{aws_region}.amazonaws.com"
+
+    is_fixed_url = base_url.endswith('#')
+    if is_fixed_url:
+        url = base_url[:-1].rstrip('/')
+    else:
+        endpoint_suffix = 'invoke-with-response-stream' if getattr(request, 'stream', False) else 'invoke'
+        url = f"{base_url.rstrip('/')}/model/{original_model}/{endpoint_suffix}"
+
+    aws_ak, aws_sk = _parse_ak_sk(provider, api_key)
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+
+    if aws_ak and aws_sk:
+        provider['_aws_passthrough_ctx'] = {
+            'ak': aws_ak,
+            'sk': aws_sk,
+            'region': aws_region,
+            'host': host,
+            'model': original_model,
+        }
+
+    return url, headers, {}
+
+
+async def _aws_passthrough_signing_interceptor(request, engine, provider, api_key, url, headers, payload):
+    """Claude 透传路径的 SigV4 签名拦截器：在最终 payload 确定后完成签名。"""
+    # 修改原因：AWS SigV4 签名必须包含最终 JSON body 的 SHA256，不能在 passthrough_meta 阶段提前计算。
+    # 修改方式：从 provider 取出一次性透传上下文，根据实际 URL 判断 endpoint_suffix 后补齐签名头。
+    # 目的：避免 body hash 不匹配，同时在发送前删除临时上下文，防止污染后续请求。
+    if engine != "aws":
+        return url, headers, payload
+
+    ctx = provider.pop('_aws_passthrough_ctx', None)
+    if not ctx:
+        return url, headers, payload
+
+    has_authorization = any(str(key).lower() == 'authorization' for key in headers.keys())
+    if has_authorization:
+        return url, headers, payload
+
+    if '/invoke-with-response-stream' in url:
+        endpoint_suffix = 'invoke-with-response-stream'
+    elif '/invoke' in url:
+        endpoint_suffix = 'invoke'
+    else:
+        endpoint_suffix = 'invoke-with-response-stream'
+
+    sig_headers = await asyncio.to_thread(
+        _build_aws_sigv4_headers,
+        payload,
+        ctx['model'],
+        ctx['ak'],
+        ctx['sk'],
+        ctx['region'],
+        ctx['host'],
+        endpoint_suffix,
+    )
+    headers.update(sig_headers)
+
+    return url, headers, payload
+
+
+async def fetch_aws_passthrough_stream(client, url, headers, payload, model, timeout):
+    """解析 Bedrock 二进制事件流，并把其中的 Claude 事件原样包装为标准 SSE data 行。"""
+    # 修改原因：Bedrock invoke-with-response-stream 返回 AWS 事件流，不是 Anthropic 标准 SSE。
+    # 修改方式：沿用现有 AWS 流式解析中的 base64 bytes 解码逻辑，但不转换为 OpenAI chunk。
+    # 目的：Claude Code 等原生 Anthropic 客户端可以通过 AWS 渠道读取 Claude SSE 事件。
+    from ..log_config import logger
+    from ..response import _log_upstream_request
+    import httpx
+
+    _log_upstream_request(url, payload)
+
+    stream_timeout = httpx.Timeout(
+        connect=15.0,
+        read=None,
+        write=300.0,
+        pool=10.0,
+    )
+
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
+        error_message = await check_response(response, "fetch_aws_passthrough_stream")
+        if error_message:
+            yield error_message
+            return
+
+        async for line in aiter_decoded_lines(response.aiter_bytes(), delimiter=b"\r"):
+            if not line or line.strip() == "" or line.strip().startswith(':content-type') or line.strip().startswith(':event-type'):
+                continue
+
+            json_match = re.search(r'event{.*?}', line)
+            if not json_match:
+                continue
+
+            try:
+                chunk_data = json_loads(json_match.group(0).lstrip('event'))
+            except json.JSONDecodeError:
+                logger.error(f"AWS passthrough stream JSON parse failed: {json_match.group(0).lstrip('event')!r}")
+                continue
+
+            if "bytes" not in chunk_data:
+                continue
+
+            try:
+                decoded_bytes = base64.b64decode(chunk_data["bytes"])
+                decoded_text = decoded_bytes.decode("utf-8")
+            except Exception as exc:
+                logger.error(f"AWS passthrough stream base64 decode failed: {exc}")
+                continue
+
+            yield f"data: {decoded_text}" + end_of_line
+
+
+async def fetch_aws_passthrough_response(client, url, headers, payload, model, timeout):
+    """透传 Bedrock invoke 的非流式 Claude Messages JSON 响应。"""
+    # 修改原因：非流式 Bedrock invoke 已返回 Claude Messages API JSON，不需要 OpenAI 格式转换。
+    # 修改方式：使用与通用透传类似的 POST/JSON 发送逻辑，只保留 AWS channel 内部日志与错误检查。
+    # 目的：让 Claude 方言非流式请求通过 AWS 渠道得到原生 Claude JSON 响应。
+    from ..response import _log_upstream_request
+    import httpx
+
+    _log_upstream_request(url, payload)
+
+    request_timeout = httpx.Timeout(
+        connect=15.0,
+        read=timeout,
+        write=300.0,
+        pool=10.0,
+    )
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=request_timeout)
+    error_message = await check_response(response, "fetch_aws_passthrough_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    yield response_bytes.decode("utf-8")
+
 
 
 async def fetch_aws_response(client, url, headers, payload, model, timeout):
@@ -306,14 +491,20 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
     # 从 payload 中取出签名上下文，重新计算非流式端点的签名
     signing_ctx = payload.pop('_aws_signing', None)
     if signing_ctx:
-        amz_date, payload_hash, authorization_header = await asyncio.to_thread(
-            get_signature, payload, signing_ctx['model'], signing_ctx['ak'], signing_ctx['sk'],
-            signing_ctx['region'], signing_ctx['host'], signing_ctx['ct'], signing_ctx['accept'],
-            endpoint_suffix='invoke'
+        # 修改原因：非流式请求会把 URL 从 stream 端点切到 invoke，原 stream 签名不能复用。
+        # 修改方式：用公共 SigV4 headers 构造函数按 invoke 端点重新计算签名。
+        # 目的：确保 canonical URI 与实际 Bedrock 非流式请求路径一致。
+        sig_headers = await asyncio.to_thread(
+            _build_aws_sigv4_headers,
+            payload,
+            signing_ctx['model'],
+            signing_ctx['ak'],
+            signing_ctx['sk'],
+            signing_ctx['region'],
+            signing_ctx['host'],
+            'invoke',
         )
-        headers['X-Amz-Date'] = amz_date
-        headers['X-Amz-Content-Sha256'] = payload_hash
-        headers['Authorization'] = authorization_header
+        headers.update(sig_headers)
     
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
@@ -495,26 +686,18 @@ async def fetch_aws_models(client, provider):
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else ''
 
-    # 解析 AK/SK
-    aws_ak = provider.get('aws_access_key') or ''
-    aws_sk = provider.get('aws_secret_key') or ''
-    if not aws_ak and ':' in str(api_key):
-        parts = str(api_key).split(':', 1)
-        aws_ak = parts[0].strip()
-        aws_sk = parts[1].strip()
+    # 修改原因：模型列表请求也应复用统一的 AWS 凭据解析逻辑。
+    # 修改方式：调用 _parse_ak_sk 兼容 aws_access_key/aws_secret_key 与 "AK:SK"。
+    # 目的：避免新增透传签名后出现多套凭据解析规则。
+    aws_ak, aws_sk = _parse_ak_sk(provider, api_key)
 
     if not aws_ak or not aws_sk:
         raise ValueError('AWS credentials not configured (api key should be AK:SK format)')
 
-    # 从 base_url 提取 region
-    # 直连: https://bedrock-runtime.us-east-1.amazonaws.com
-    # 反代: https://proxy.example.com/bedrock-runtime.us-east-1.amazonaws.com
-    import re as _re
-    _region_match = _re.search(r'bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com', base_url)
-    if _region_match:
-        aws_region = _region_match.group(1)
-    else:
-        aws_region = provider.get('aws_region', 'us-east-1')
+    # 修改原因：ListFoundationModels 与 Runtime 调用同样需要从 base_url 推断 region。
+    # 修改方式：复用 _extract_region，保留直连和反代 URL 的兼容性。
+    # 目的：减少 AWS region 推断逻辑的重复实现。
+    aws_region = _extract_region(base_url, provider)
 
     # ListFoundationModels 用 bedrock 而不是 bedrock-runtime
     host = f'bedrock.{aws_region}.amazonaws.com'
@@ -539,15 +722,34 @@ async def fetch_aws_models(client, provider):
 def register():
     """注册 AWS 渠道到注册中心"""
     from .registry import register_channel
-    
+    from core.plugins import register_request_interceptor
+
+    # 修改原因：Claude 方言透传需要 detect_passthrough 通过渠道 type_name 命中 target_engine="claude"。
+    # 修改方式：AWS 渠道仍保留 id="aws"，但类型声明改为 claude，并注册 Bedrock 专用透传处理器。
+    # 目的：让 Claude Code 等原生 Anthropic 客户端可以经 aws 渠道调用 Bedrock。
     register_channel(
         id="aws",
-        type_name="aws-bedrock",
+        type_name="claude",
         default_base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
         auth_header="AWS Signature V4",
         description="AWS Bedrock (Claude, Llama, etc.)",
         request_adapter=get_aws_payload,
+        passthrough_adapter=get_aws_passthrough_meta,
+        passthrough_stream_adapter=fetch_aws_passthrough_stream,
+        passthrough_response_adapter=fetch_aws_passthrough_response,
         response_adapter=fetch_aws_response,
         stream_adapter=fetch_aws_response_stream,
         models_adapter=fetch_aws_models,
+        source="builtin",
+    )
+
+    # 修改原因：透传签名必须在 handler 合成最终 payload 后执行。
+    # 修改方式：注册一个内置全局请求拦截器；不设置 plugin_name，避免被 enabled_plugins 过滤跳过。
+    # 目的：确保所有 AWS Claude 透传请求都会在发送前补齐正确的 SigV4 headers。
+    register_request_interceptor(
+        interceptor_id="aws_passthrough_signing",
+        callback=_aws_passthrough_signing_interceptor,
+        priority=5,
+        overwrite=True,
+        metadata={"description": "AWS Bedrock 透传 SigV4 签名"},
     )

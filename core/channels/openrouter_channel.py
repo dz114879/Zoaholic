@@ -318,4 +318,5 @@ def register():
         response_adapter=fetch_openrouter_response,
         stream_adapter=fetch_openrouter_response_stream,
         models_adapter=fetch_openrouter_models,
+        source="builtin",
     )

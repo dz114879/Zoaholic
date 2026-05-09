@@ -52,6 +52,19 @@ def set_debug_mode(debug: bool):
     is_debug = debug
 
 
+async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str]) -> Optional[str]:
+    """把 OAuth key_id 解析成 access_token，静态 key 原样返回。"""
+    # 修改原因：api.yaml 中的 OAuth 账号只保存 key_id，不能把 access_token 放进 provider.api。
+    # 修改方式：若 app.state.oauth_manager 存在且能解析该 key_id，则返回 access_token，否则返回原 key。
+    # 目的：保持静态 key 向后兼容，并让日志、冷却、统计继续使用原始 key_id。
+    if not api_key or app is None or not hasattr(app, "state") or not hasattr(app.state, "oauth_manager"):
+        return api_key
+    resolved = await app.state.oauth_manager.resolve(api_key)
+    if resolved is not None:
+        return resolved
+    return api_key
+
+
 def _fill_failure_provider_info(
     current_info: Dict[str, Any],
     provider_name: Optional[str],
@@ -199,9 +212,12 @@ async def process_request(
     else:
         api_key = None
 
+    original_api_key = api_key
+
     # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
     current_info_early = request_info_getter()
-    current_info_early["_used_api_key"] = api_key
+    current_info_early["_used_api_key"] = original_api_key
+    api_key = await _resolve_oauth_api_key(app, api_key)
 
     engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
 
@@ -249,14 +265,16 @@ async def process_request(
     
     # 记录渠道ID和上游key索引
     current_info["provider_id"] = channel_id
-    if api_key:
+    if original_api_key:
         try:
-            # 从 provider_api_circular_list 中获取所有 keys
+            # 修改原因：OAuth 解析后 api_key 已是 access_token，不能用于 provider.api 索引匹配。
+            # 修改方式：索引匹配始终使用 original_api_key，也就是配置中的 key_id。
+            # 目的：避免 token 明文进入统计索引逻辑，并保持自动冷却定位正确。
             circular_list = provider_api_circular_list.get(provider['provider'])
             if circular_list and hasattr(circular_list, 'items'):
                 api_keys_list = circular_list.items
-                if api_key in api_keys_list:
-                    current_info["provider_key_index"] = api_keys_list.index(api_key)
+                if original_api_key in api_keys_list:
+                    current_info["provider_key_index"] = api_keys_list.index(original_api_key)
         except (ValueError, TypeError, AttributeError):
             pass
 
@@ -384,7 +402,7 @@ async def process_request(
                 request.model,
                 current_info["api_key"],
                 success=True,
-                provider_api_key=api_key,
+                provider_api_key=original_api_key,
             )
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
@@ -402,7 +420,7 @@ async def process_request(
             request.model,
             current_info["api_key"],
             success=False,
-            provider_api_key=api_key,
+            provider_api_key=original_api_key,
         )
         raise e
 
@@ -629,9 +647,12 @@ async def process_request_passthrough(
     else:
         api_key = None
 
+    original_api_key = api_key
+
     # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
     current_info_early = request_info_getter()
-    current_info_early["_used_api_key"] = api_key
+    current_info_early["_used_api_key"] = original_api_key
+    api_key = await _resolve_oauth_api_key(app, api_key)
 
     engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
     if stream_override is not None:
@@ -721,14 +742,16 @@ async def process_request_passthrough(
         current_info["model"] = request.model
 
     current_info["provider_id"] = channel_id
-    if api_key:
+    if original_api_key:
         try:
-            # 从 provider_api_circular_list 中获取所有 keys
+            # 修改原因：OAuth 解析后 api_key 已是 access_token，不能用于 provider.api 索引匹配。
+            # 修改方式：索引匹配始终使用 original_api_key，也就是配置中的 key_id。
+            # 目的：避免 token 明文进入统计索引逻辑，并保持自动冷却定位正确。
             circular_list = provider_api_circular_list.get(provider['provider'])
             if circular_list and hasattr(circular_list, 'items'):
                 api_keys_list = circular_list.items
-                if api_key in api_keys_list:
-                    current_info["provider_key_index"] = api_keys_list.index(api_key)
+                if original_api_key in api_keys_list:
+                    current_info["provider_key_index"] = api_keys_list.index(original_api_key)
         except (ValueError, TypeError, AttributeError):
             pass
 
@@ -764,12 +787,20 @@ async def process_request_passthrough(
             last_message_role = safe_get(request, "messages", -1, "role", default=None)
 
             if upstream_stream:
-                # 透传模式：使用原始流处理，不做格式转换
-                generator = _fetch_passthrough_stream(
-                    client, url, headers, payload, timeout_value,
-                    engine=engine, model=request.model,
-                    enabled_plugins=enabled_plugins,
-                )
+                # 修改原因：AWS Bedrock 透传流式响应不是普通 SSE，默认处理器无法解析二进制事件流。
+                # 修改方式：若渠道注册了 passthrough_stream_adapter，则优先使用渠道专用处理器。
+                # 目的：只让需要特殊解码的渠道接管透传响应读取，其他渠道继续走通用原样转发。
+                if channel and getattr(channel, "passthrough_stream_adapter", None):
+                    generator = channel.passthrough_stream_adapter(
+                        client, url, headers, payload, original_model, timeout_value
+                    )
+                else:
+                    # 透传模式：使用原始流处理，不做格式转换
+                    generator = _fetch_passthrough_stream(
+                        client, url, headers, payload, timeout_value,
+                        engine=engine, model=request.model,
+                        enabled_plugins=enabled_plugins,
+                    )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
                     generator, channel_id
@@ -799,12 +830,20 @@ async def process_request_passthrough(
                         debug=is_debug,
                     )
             else:
-                # 透传模式：使用原始响应处理，不做格式转换
-                generator = _fetch_passthrough_response(
-                    client, url, headers, payload, timeout_value,
-                    engine=engine, model=request.model,
-                    enabled_plugins=enabled_plugins,
-                )
+                # 修改原因：少数渠道需要在透传非流式路径中复用自己的上游响应读取逻辑。
+                # 修改方式：若渠道注册了 passthrough_response_adapter，则优先调用该处理器。
+                # 目的：让 AWS Bedrock 的 invoke 响应可以与流式透传一样收敛在 AWS channel 内。
+                if channel and getattr(channel, "passthrough_response_adapter", None):
+                    generator = channel.passthrough_response_adapter(
+                        client, url, headers, payload, original_model, timeout_value
+                    )
+                else:
+                    # 透传模式：使用原始响应处理，不做格式转换
+                    generator = _fetch_passthrough_response(
+                        client, url, headers, payload, timeout_value,
+                        engine=engine, model=request.model,
+                        enabled_plugins=enabled_plugins,
+                    )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
                     generator, channel_id
@@ -852,7 +891,7 @@ async def process_request_passthrough(
             request.model,
             current_info["api_key"],
             success=False,
-            provider_api_key=api_key,
+            provider_api_key=original_api_key,
         )
         raise e
 
@@ -865,7 +904,7 @@ async def process_request_passthrough(
         request.model,
         current_info["api_key"],
         success=True,
-        provider_api_key=api_key,
+        provider_api_key=original_api_key,
     )
     current_info["success"] = True
     current_info["status_code"] = 200

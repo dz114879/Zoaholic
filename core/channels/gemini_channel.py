@@ -1118,4 +1118,5 @@ def register():
         response_adapter=fetch_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=fetch_gemini_models,
+        source="builtin",
     )

@@ -218,4 +218,5 @@ def register():
         request_adapter=get_cloudflare_payload,
         response_adapter=fetch_cloudflare_response,
         stream_adapter=fetch_cloudflare_response_stream,
+        source="builtin",
     )

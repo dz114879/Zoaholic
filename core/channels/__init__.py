@@ -28,6 +28,12 @@ from . import vertex_channel
 from . import openrouter_channel
 from . import cloudflare_channel
 from . import openai_image_channel
+from . import codex_channel
+from . import claude_code_channel
+# 修改原因：Gemini CLI OAuth 是内置渠道，需要在 channels 包导入时进入注册流程。
+# 修改方式：像 Codex 和 Claude Code 一样导入自包含渠道模块。
+# 目的：让 core.channels.get_channel("gemini-cli") 能被请求路由和管理端发现。
+from . import gemini_cli_channel
 
 # 调用各渠道的 register() 函数
 openai_channel.register()
@@ -40,6 +46,12 @@ vertex_channel.register()
 openrouter_channel.register()
 cloudflare_channel.register()
 openai_image_channel.register()
+codex_channel.register()
+claude_code_channel.register()
+# 修改原因：导入模块只加载定义，必须显式调用 register 才会写入渠道注册表。
+# 修改方式：在 OAuth 内置渠道注册序列中追加 Gemini CLI。
+# 目的：让 Gemini 方言透传和普通请求都可以选择 gemini-cli engine。
+gemini_cli_channel.register()
 
 __all__ = [
     # 类型定义

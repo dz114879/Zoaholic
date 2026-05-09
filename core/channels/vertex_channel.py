@@ -884,6 +884,7 @@ def register():
         response_adapter=fetch_vertex_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=None,
+        source="builtin",
     )
     
     # 注册 Vertex Claude
@@ -897,4 +898,5 @@ def register():
         response_adapter=fetch_vertex_claude_response,
         stream_adapter=fetch_vertex_claude_response_stream,
         models_adapter=None,
+        source="builtin",
     )

@@ -271,4 +271,5 @@ def register():
         response_adapter=fetch_azure_response,
         stream_adapter=fetch_azure_response_stream,
         models_adapter=None,
+        source="builtin",
     )

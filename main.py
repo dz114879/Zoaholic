@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from core.log_config import logger
 from routes import api_router
+from routes.oauth import router as oauth_router
 from core.env import env_bool
 from core.log_config import apply_backend_log_preferences
 from core.watchdog import EventLoopBlockWatchdog as LightWatchdog
@@ -471,6 +472,28 @@ async def lifespan(app: FastAPI):
         app.state.client_manager = ClientManager(pool_size=300, max_keepalive_connections=100)
         await app.state.client_manager.init(default_config)
 
+    if app and not hasattr(app.state, 'oauth_manager'):
+        # 修改原因：handler 解析 OAuth key_id 时需要访问共享的凭据管理器。
+        # 修改方式：在 lifespan 启动期创建 OAuthManager 并加载 data/oauth_state.json。
+        # 目的：让请求路径只做内存查找和必要刷新，不在每次请求重复读取文件。
+        from core.oauth.manager import OAuthManager
+        app.state.oauth_manager = OAuthManager()
+        await app.state.oauth_manager.init()
+        # 修改原因：OAuth provider 需要实时读取 app.state.config，而不是保存启动时的 providers 快照。
+        # 修改方式：把配置 getter 注入 OAuthManager，provider 每次 token 请求前通过 manager 读取当前配置。
+        # 目的：前端保存 token_url 到 api.yaml 并同步 app.state.config 后，无需重启即可生效。
+        app.state.oauth_manager.set_config_ref(lambda: app.state.config or {})
+        # OAuth provider 注册：各渠道自行注册自己的 provider
+        from core.channels.codex_channel import register_oauth_provider as _reg_codex_oauth
+        from core.channels.claude_code_channel import register_oauth_provider as _reg_cc_oauth
+        # 修改原因：Gemini CLI OAuth provider 需要在应用启动时注册到共享 OAuthManager。
+        # 修改方式：导入 gemini_cli_channel 的 register_oauth_provider，并与现有 OAuth 渠道一起注册。
+        # 目的：让 /v1/oauth/authorize?type=gemini-cli 和请求路径的 access_token 解析可用。
+        from core.channels.gemini_cli_channel import register_oauth_provider as _reg_gemini_cli_oauth
+        _reg_codex_oauth(app.state.oauth_manager)
+        _reg_cc_oauth(app.state.oauth_manager)
+        _reg_gemini_cli_oauth(app.state.oauth_manager)
+
 
     if app and not hasattr(app.state, "channel_manager"):
         if app.state.config and 'preferences' in app.state.config:
@@ -615,6 +638,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 app.include_router(api_router)
+app.include_router(oauth_router)
 
 
 def generate_markdown_docs():

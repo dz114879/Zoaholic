@@ -92,3 +92,4 @@ test/
 # 目的：让前端轻量回归测试可以随源码一起保存，避免移动端抽屉布局问题回退。
 !frontend/test/
 !frontend/test/**frontend/test/
+.limcode/

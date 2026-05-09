@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
@@ -7,7 +8,8 @@ import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Files, Play,
-  Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical, ChevronUp, ChevronDown
+  Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical, ChevronUp, ChevronDown,
+  ClipboardPaste, LogIn
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -69,6 +71,10 @@ interface SubChannelFormData {
   enabled?: boolean;
   remark?: string;
   base_url?: string;
+  // 修改原因：OAuth 子渠道在完整编辑时也会复用同一份表单结构，需要保留独立 token endpoint 字段。
+  // 修改方式：在子渠道表单数据中加入可选 token_url，并在序列化时只保存显式填写的值。
+  // 目的：避免子渠道编辑时丢失用户配置的 OAuth token exchange/refresh 地址。
+  token_url?: string;
   model_prefix?: string;
   _collapsed?: boolean;
 }
@@ -78,6 +84,10 @@ interface ProviderFormData {
   remark: string;
   engine: string;
   base_url: string;
+  // 修改原因：OAuth 渠道的 API 地址和 token endpoint 需要分开保存，不能继续复用 base_url。
+  // 修改方式：在主渠道表单数据中加入 token_url，保存时随 provider payload 一起提交。
+  // 目的：编辑已有渠道可以回显 token_url，新建或保存渠道时也能持久化该字段。
+  token_url: string;
   api_keys: ApiKeyObj[];
   model_prefix: string;
   enabled: boolean;
@@ -94,7 +104,13 @@ interface ChannelOption {
   id: string;
   type_name: string;
   default_base_url: string;
+  default_token_url?: string;
   description?: string;
+  // 修改原因：后端渠道注册表新增 OAuth 标记，前端应优先使用服务端返回值判断管理 UI 分支。
+  // 修改方式：在 ChannelOption 中加入可选 is_oauth 字段，兼容旧后端未返回该字段的情况。
+  // 目的：余额按钮和配置面板不再只依赖硬编码 OAuth 引擎集合。
+  is_oauth?: boolean;
+  source?: string;
 }
 
 interface PluginOption {
@@ -143,7 +159,13 @@ const SCHEDULE_ALGORITHMS = [
   { value: 'fixed_priority', label: '固定优先级 (Fixed)' },
   { value: 'random', label: '随机 (Random)' },
   { value: 'smart_round_robin', label: '智能轮询 (Smart)' },
+  { value: 'sticky_ip', label: 'IP 粘滞 (Sticky IP)' },
 ];
+
+// 修改原因：codex、claude-code 和 antigravity 的凭据来自 OAuth 账号，不应继续按普通 sk-* API Key 处理。
+// 修改方式：集中维护 OAuth 类型引擎集合，并在编辑表单中用当前 engine 派生渲染分支。
+// 目的：让新增 OAuth 引擎时只需要扩展这个集合，Key 管理 UI 自动切换到账号管理模式。
+const OAUTH_ENGINES = new Set(['codex', 'claude-code', 'antigravity', 'gemini-cli']);
 
 function readBooleanPreference(value: any): boolean {
   // 修改原因：后端新增 pool_sharing 布尔开关，旧配置中也可能存在字符串形式的布尔值。
@@ -172,8 +194,22 @@ interface BalanceResult {
   used?: number | null;
   available?: number | null;
   percent?: number | null;
+  // 修改原因：OAuth 余额入口会在通用 BalanceResult 外额外返回 5 小时和 7 天 quota。
+  // 修改方式：把两个 OAuth quota 字段和逐账号 results 映射加入可选类型。
+  // 目的：同一个查询函数既能更新普通余额行，也能刷新 OAuth 双弧展示。
+  quota_5h?: number | null;
+  quota_7d?: number | null;
+  results?: Record<string, BalanceResult>;
   raw?: any;
   error?: string | null;
+}
+
+// 修改原因：OAuth 账号的可视化指标不是普通余额，而是 5 小时和 7 天两个窗口的配额百分比。
+// 修改方式：为页面内的 OAuth 配额读写定义轻量类型，后续由 getOAuthQuota 统一归一化。
+// 目的：让 Key 行渲染可以明确区分普通余额和 OAuth 双弧配额。
+interface OAuthQuota {
+  quota_5h?: number;
+  quota_7d?: number;
 }
 
 function getBalancePercent(b: BalanceResult): number | null {
@@ -196,6 +232,23 @@ function getBalanceLabel(b: BalanceResult): string | null {
   if (b.available != null && b.total != null) return `${b.available.toFixed(1)} / ${b.total.toFixed(1)}`;
   if (b.available != null) return `${b.available.toFixed(1)}`;
   return null;
+}
+
+function getOAuthQuota(account: any): OAuthQuota | null {
+  // 修改原因：/v1/oauth/accounts 当前只约定 quota_5h 和 quota_7d 是百分比，但运行时状态可能缺失或以字符串形式落盘。
+  // 修改方式：读取账号上的两个配额字段，转成 0 到 100 的 number，两个字段都不存在时返回 null。
+  // 目的：让 Key 行只在确实存在配额数据时显示双弧，否则回退到连接状态标签。
+  if (!account) return null;
+  const normalizePct = (value: any): number | undefined => {
+    if (value == null || value === '') return undefined;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return undefined;
+    return Math.max(0, Math.min(100, n));
+  };
+  const quota_5h = normalizePct(account.quota_5h);
+  const quota_7d = normalizePct(account.quota_7d);
+  if (quota_5h == null && quota_7d == null) return null;
+  return { quota_5h, quota_7d };
 }
 
 function sortProvidersByWeight(list: any[]): any[] {
@@ -254,6 +307,98 @@ function buildRoundRectPath(x: number, y: number, w: number, h: number, r: numbe
     `Z`
   ].join(' ');
 }
+
+// 构建圆角矩形上半 path（从左中点顺时针到右中点）
+// 上半 path：左中点 → 左上圆角 → 上边 → 右上圆角 → 右中点
+// 0%=左中点，50%=上边中点，100%=右中点
+function buildTopHalfPath(x: number, y: number, w: number, h: number, r: number) {
+  const my = y + h / 2;
+  return [
+    `M ${x} ${my}`,
+    `L ${x} ${y + r}`,
+    `A ${r} ${r} 0 0 1 ${x + r} ${y}`,
+    `L ${x + w - r} ${y}`,
+    `A ${r} ${r} 0 0 1 ${x + w} ${y + r}`,
+    `L ${x + w} ${my}`,
+  ].join(' ');
+}
+
+// 下半 path：左中点 → 左下圆角 → 下边 → 右下圆角 → 右中点
+// 0%=左中点，50%=下边中点，100%=右中点
+function buildBottomHalfPath(x: number, y: number, w: number, h: number, r: number) {
+  const my = y + h / 2;
+  return [
+    `M ${x} ${my}`,
+    `L ${x} ${y + h - r}`,
+    `A ${r} ${r} 0 0 0 ${x + r} ${y + h}`,
+    `L ${x + w - r} ${y + h}`,
+    `A ${r} ${r} 0 0 0 ${x + w} ${y + h - r}`,
+    `L ${x + w} ${my}`,
+  ].join(' ');
+}
+
+// OAuth 额度边框叠加层 — 上半蓝色(5h)、下半紫色(7d)
+function QuotaBorderOverlay({ quota5h, quota7d }: {
+  quota5h?: number | null; quota7d?: number | null;
+}) {
+  const selfRef = useRef<HTMLDivElement>(null);
+  const [svgViewBox, setSvgViewBox] = useState('');
+  const [topPath, setTopPath] = useState('');
+  const [bottomPath, setBottomPath] = useState('');
+
+  useEffect(() => {
+    const el = selfRef.current;
+    if (!el) return;
+    const update = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      if (w > 0 && h > 0) {
+        setSvgViewBox(`0 0 ${w} ${h}`);
+        setTopPath(buildTopHalfPath(1, 1, w - 2, h - 2, 7));
+        setBottomPath(buildBottomHalfPath(1, 1, w - 2, h - 2, 7));
+      }
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const q5 = quota5h ?? 0;
+  const q7 = quota7d ?? 0;
+  return (
+    <div ref={selfRef} className="absolute inset-0 pointer-events-none z-[1]" style={{ overflow: 'visible' }}>
+      {svgViewBox && (
+        <svg className="absolute inset-0 w-full h-full" viewBox={svgViewBox} style={{ overflow: 'visible' }}>
+          <title>{`5h: ${quota5h ?? '?'}% \u00b7 7d: ${quota7d ?? '?'}%`}</title>
+          {quota5h != null && topPath && (
+            <path d={topPath} pathLength={100} fill="none" stroke="#3b82f6" strokeWidth={2} strokeLinecap="round"
+              style={{ strokeDasharray: `${q5} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
+          )}
+          {quota7d != null && bottomPath && (
+            <path d={bottomPath} pathLength={100} fill="none" stroke="#8b5cf6" strokeWidth={2} strokeLinecap="round"
+              style={{ strokeDasharray: `${q7} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
+          )}
+        </svg>
+      )}
+    </div>
+  );
+}
+
+// 兼容 QuotaArcs 调用点 — 用最小百分比的文字 tag
+const QuotaArcs = ({ quota5h, quota7d }: { quota5h?: number; quota7d?: number }) => {
+  if (quota5h == null && quota7d == null) return null;
+  const pct = Math.min(quota5h ?? 100, quota7d ?? 100);
+  const color = pct > 50 ? 'bg-emerald-500/15 text-emerald-500' : pct > 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+  return (
+    <span
+      className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-default ${color}`}
+      title={`5h: ${quota5h ?? '?'}% · 7d: ${quota7d ?? '?'}%`}
+    >
+      {Math.round(pct)}%
+    </span>
+  );
+};
 
 // ── 冷却中 Key 行组件（SVG 边框进度） ──
 function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
@@ -375,6 +520,33 @@ export default function Channels() {
   const [balanceResults, setBalanceResults] = useState<Record<string, BalanceResult>>({});
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [focusedKeyIdx, setFocusedKeyIdx] = useState<number | null>(null);
+
+  // 修改原因：OAuth 类型引擎需要展示已导入账号状态，并允许把 refresh_token 导入为账号标识。
+  // 修改方式：新增账号列表、导入弹窗目标下标、待提交 token 和提交中状态。
+  // 目的：让 OAuth Key 行可以在不暴露 token 明文的情况下完成账号导入和状态展示。
+  const [oauthAccounts, setOauthAccounts] = useState<Record<string, any>>({});
+  // 修改原因：OAuth key 输入框 onChange 会立即更新表单值，onBlur 时需要知道焦点进入前的旧标识符。
+  // 修改方式：用 ref 按行下标保存 focus 时的 key 快照，不触发表单重渲染。
+  // 目的：在用户把 OAuth 账号标识改名后，可以调用 rename API 同步 oauth_state.json。
+  const oauthKeyFocusSnapshotRef = useRef<Record<number, string>>({});
+  const [importModalIdx, setImportModalIdx] = useState<number | null>(null);
+  const [importToken, setImportToken] = useState('');
+  const [importing, setImporting] = useState(false);
+  // 修改原因：manual OAuth 模式需要在弹窗登录后接收用户复制的 localhost 回调完整 URL。
+  // 修改方式：保存当前 Key 行下标、state、用户粘贴的 URL 和交换中的提交状态。
+  // 目的：替代旧的跨窗口 location 轮询和 prompt 降级，避免 COOP 或跨域策略导致登录不可用。
+  const [oauthManualState, setOauthManualState] = useState<{ idx: number; state: string } | null>(null);
+  const [manualUrl, setManualUrl] = useState('');
+  const [exchanging, setExchanging] = useState(false);
+  // 修改原因：OAuth 导入和手动回调弹窗通过 document.body portal 渲染，仍会被编辑抽屉的 Radix Dialog 焦点锁拉回。
+  // 修改方式：把两个 OAuth 弹窗状态合并成一个布尔值，供编辑抽屉外部焦点和外部交互事件共用。
+  // 目的：只在 OAuth 覆盖弹窗打开期间放行 portal 焦点，关闭后恢复编辑抽屉原有的模态行为。
+  const isOAuthOverlayOpen = importModalIdx !== null || oauthManualState !== null;
+  const selectedChannelType = channelTypes.find(c => c.id === (formData?.engine || ''));
+  // 修改原因：后端已经能返回 is_oauth，但旧部署或加载失败时仍需要保留前端硬编码兜底。
+  // 修改方式：优先读取渠道类型的 is_oauth，缺失时回退到 OAUTH_ENGINES 集合。
+  // 目的：新增 OAuth 引擎只要后端注册标记正确，前端余额和配置区域即可自动适配。
+  const isOAuthEngine = selectedChannelType?.is_oauth ?? OAUTH_ENGINES.has(formData?.engine || '');
 
   // ── 全局配置（用于价格提示等）──
   const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
@@ -566,11 +738,86 @@ export default function Channels() {
 
   // ── 打开编辑面板时自动查询余额 ──
   useEffect(() => {
-    if (isModalOpen && formData?.preferences?.balance && formData.base_url && formData.api_keys.some(k => k.key.trim() && !k.disabled)) {
+    // 修改原因：OAuth 编辑面板已有专门的账号列表 quota 拉取逻辑，不能再要求 preferences.balance。
+    // 修改方式：自动余额查询只保留给普通渠道，OAuth 余额由账号列表和手动余额按钮触发。
+    // 目的：避免打开 OAuth 面板时因为缺少普通余额配置产生无效请求。
+    if (isModalOpen && !isOAuthEngine && formData?.preferences?.balance && formData.base_url && formData.api_keys.some(k => k.key.trim() && !k.disabled)) {
       queryAllBalances(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isModalOpen]);
+
+  const refreshOAuthAccounts = useCallback(async () => {
+    // 修改原因：OAuth 账号列表既要在打开编辑面板时加载，也要在浏览器登录成功后刷新。
+    // 修改方式：把 /v1/oauth/accounts 请求封装为 useCallback 函数，成功时写入 oauthAccounts，失败时清空。
+    // 目的：避免登录回调和 useEffect 各自维护一份拉取逻辑，降低账号状态不同步风险。
+    try {
+      const res = await apiFetch('/v1/oauth/accounts', { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) {
+        setOauthAccounts({});
+        return;
+      }
+      const data = await res.json();
+      setOauthAccounts(data || {});
+    } catch {
+      setOauthAccounts({});
+    }
+  }, [token]);
+
+  // ── 打开 OAuth 编辑面板时同步账号状态 ──
+  useEffect(() => {
+    // 修改原因：OAuth Key 行需要根据后端运行时状态展示账号是否连接以及配额数据。
+    // 修改方式：仅在编辑面板打开且当前 engine 属于 OAuth 类型时调用 refreshOAuthAccounts。
+    // 目的：避免普通渠道产生额外请求，同时保证 OAuth 账号列表来自后端最新状态。
+    if (isModalOpen && isOAuthEngine) {
+      refreshOAuthAccounts();
+    } else if (!isModalOpen) {
+      setOauthAccounts({});
+    }
+  }, [isModalOpen, isOAuthEngine, refreshOAuthAccounts]);
+
+  useEffect(() => {
+    // 修改原因：OAuth quota 查询需要访问上游 API，不能阻塞 /v1/oauth/accounts 列表加载。
+    // 修改方式：对已连接且尚无 quota 的账号逐个调用 /quota，并用 _quota_loading 或 _quota_unavailable 避免重复请求。
+    // 目的：让 Key 行打开后异步显示双弧配额，同时不造成无限渲染循环。
+    if (!isModalOpen || !isOAuthEngine) return;
+    const targets = Object.entries(oauthAccounts).filter(([, account]) => (
+      account?.status === 'active'
+      && account.quota_5h == null
+      && account.quota_7d == null
+      && !account._quota_loading
+      && !account._quota_unavailable
+    ));
+    if (targets.length === 0) return;
+
+    targets.forEach(([keyId]) => {
+      setOauthAccounts(prev => prev[keyId] ? { ...prev, [keyId]: { ...prev[keyId], _quota_loading: true } } : prev);
+      apiFetch(`/v1/oauth/accounts/${encodeURIComponent(keyId)}/quota`, { headers: { Authorization: `Bearer ${token}` } })
+        .then(async res => (res.ok ? await res.json() : null))
+        .then(quota => {
+          setOauthAccounts(prev => {
+            const current = prev[keyId];
+            if (!current) return prev;
+            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
+            // 修改原因：上游可能只返回 reset 等原始 header，缺少可计算百分比时继续重试会形成重复请求。
+            // 修改方式：成功响应里没有 quota_5h 和 quota_7d 时，也写入 _quota_unavailable 标记。
+            // 目的：让每次账号列表刷新周期最多查询一次 quota，避免渲染循环触发连续网络请求。
+            const quotaPatch = quota && typeof quota === 'object'
+              ? { ...quota, _quota_unavailable: quota.quota_5h == null && quota.quota_7d == null }
+              : { _quota_unavailable: true };
+            return { ...prev, [keyId]: { ...accountWithoutLoading, ...quotaPatch } };
+          });
+        })
+        .catch(() => {
+          setOauthAccounts(prev => {
+            const current = prev[keyId];
+            if (!current) return prev;
+            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
+            return { ...prev, [keyId]: { ...accountWithoutLoading, _quota_unavailable: true } };
+          });
+        });
+    });
+  }, [isModalOpen, isOAuthEngine, oauthAccounts, token]);
 
   const openModal = async (provider: any = null, index: number | null = null) => {
     setOriginalIndex(index);
@@ -686,6 +933,7 @@ export default function Channels() {
           enabled: sub.enabled,
           remark: sub.remark || '',
           base_url: sub.base_url || '',
+          token_url: sub.token_url || '',
           model_prefix: sub.model_prefix || '',
           _collapsed: true,
         };
@@ -696,6 +944,7 @@ export default function Channels() {
         remark: activeProvider.remark || '',
         engine: activeProvider.engine || '',
         base_url: activeProvider.base_url || '',
+        token_url: activeProvider.token_url || '',
         api_keys: parsedKeys,
         model_prefix: activeProvider.model_prefix || '',
         enabled: activeProvider.enabled !== false,
@@ -727,6 +976,7 @@ export default function Channels() {
         remark: '',
         engine: channelTypes.length > 0 ? channelTypes[0].id : '',
         base_url: '',
+        token_url: '',
         api_keys: [],
         model_prefix: '',
         enabled: true,
@@ -764,9 +1014,12 @@ export default function Channels() {
 
   // ── 查询所有 Key 余额 ──
   const queryAllBalances = async (silent = false) => {
-    if (!formData || !formData.base_url) return;
+    // 修改原因：OAuth 渠道的余额查询不依赖 Base URL 和 preferences.balance，而是由后端 OAuthManager 按账号标识查询。
+    // 修改方式：仅普通渠道继续强制要求 base_url 和 balance 配置，OAuth 渠道直接进入 active key 查询。
+    // 目的：让 Codex 等 OAuth 渠道的余额按钮可以点击并刷新 quota。
+    if (!formData || (!isOAuthEngine && !formData.base_url)) return;
     const balanceCfg = formData.preferences?.balance;
-    if (!balanceCfg) { if (!silent) toastWarning('该渠道未配置余额查询（preferences.balance）'); return; }
+    if (!isOAuthEngine && !balanceCfg) { if (!silent) toastWarning('该渠道未配置余额查询（preferences.balance）'); return; }
 
     const activeKeys = formData.api_keys.filter(k => k.key.trim() && !k.disabled);
     if (activeKeys.length === 0) { if (!silent) toastError('没有可用的 Key'); return; }
@@ -792,7 +1045,30 @@ export default function Channels() {
             }),
           });
           const data = await res.json().catch(() => ({ supported: false, error: '响应解析失败' }));
-          results[keyObj.key] = data;
+          const resultForKey = isOAuthEngine ? (data?.results?.[keyObj.key] || data) : data;
+          results[keyObj.key] = resultForKey;
+          if (isOAuthEngine) {
+            // 修改原因：OAuth Key 行不读取普通 balanceResults 标签，而是从 oauthAccounts 中渲染双弧 quota。
+            // 修改方式：余额按钮拿到 OAuth quota 后同步写回对应账号状态，保留旧账号字段并清除加载标记。
+            // 目的：用户手动点击余额后可以立即看到 OAuth 配额刷新结果。
+            const hasQuota = resultForKey?.quota_5h != null || resultForKey?.quota_7d != null;
+            setOauthAccounts(prev => {
+              const current = prev[keyObj.key];
+              if (!hasQuota && !current) return prev;
+              const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current || {};
+              return {
+                ...prev,
+                [keyObj.key]: {
+                  status: accountWithoutLoading.status || 'active',
+                  ...accountWithoutLoading,
+                  ...(resultForKey?.quota_5h != null ? { quota_5h: resultForKey.quota_5h } : {}),
+                  ...(resultForKey?.quota_7d != null ? { quota_7d: resultForKey.quota_7d } : {}),
+                  ...(resultForKey?.raw ? { quota_raw: resultForKey.raw } : {}),
+                  _quota_unavailable: !hasQuota,
+                },
+              };
+            });
+          }
         } catch (e: any) {
           results[keyObj.key] = { supported: false, error: e.message || '网络错误' };
         }
@@ -812,6 +1088,183 @@ export default function Channels() {
     const newKeys = [...formData.api_keys];
     newKeys[idx].key = keyStr;
     updateFormData('api_keys', newKeys);
+  };
+
+  const handleOAuthKeyFocus = (idx: number, keyStr: string) => {
+    // 修改原因：rename API 需要旧 key_id，而受控输入框在 onChange 后只保留新值。
+    // 修改方式：输入框获得焦点时按行下标记录旧值，并继续更新当前聚焦行。
+    // 目的：onBlur 时可以准确判断是否需要同步 oauth_state.json。
+    oauthKeyFocusSnapshotRef.current[idx] = keyStr;
+    setFocusedKeyIdx(idx);
+  };
+
+  const handleOAuthKeyBlur = async (idx: number, newValue: string) => {
+    // 修改原因：用户改 OAuth 账号标识符时，api.yaml 和 oauth_state.json 必须同时迁移到新 key。
+    // 修改方式：对已存在于 oauthAccounts 的旧 key 调用后端 rename；失败时恢复输入框旧值并提示错误。
+    // 目的：避免保存渠道后新 key 无法解析 access_token。
+    setFocusedKeyIdx(null);
+    const oldValue = (oauthKeyFocusSnapshotRef.current[idx] || '').trim();
+    delete oauthKeyFocusSnapshotRef.current[idx];
+    const nextValue = newValue.trim();
+    if (!isOAuthEngine || !oldValue || !nextValue || oldValue === nextValue || !oauthAccounts[oldValue]) return;
+
+    try {
+      const res = await apiFetch(`/v1/oauth/accounts/${encodeURIComponent(oldValue)}/rename`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ new_key_id: nextValue }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        updateKey(idx, oldValue);
+        toastError(fmtErr(err, res.status), 'OAuth 账号重命名失败');
+        return;
+      }
+      setOauthAccounts(prev => {
+        const account = prev[oldValue];
+        if (!account) return prev;
+        const next = { ...prev };
+        delete next[oldValue];
+        next[nextValue] = account;
+        return next;
+      });
+      refreshOAuthAccounts();
+    } catch (err: any) {
+      updateKey(idx, oldValue);
+      toastError(err?.message || '网络错误', 'OAuth 账号重命名失败');
+    }
+  };
+
+  const openImportModal = (idx: number) => {
+    // 修改原因：OAuth 空 Key 行需要一个明确入口接收 refresh_token，而不是把 token 直接保存进 api_keys。
+    // 修改方式：记录当前行下标并清空上一次输入，随后由弹窗提交到 /v1/oauth/import。
+    // 目的：让 api_keys 中最终只保存邮箱或后端返回的账号标识。
+    setImportModalIdx(idx);
+    setImportToken('');
+  };
+
+  const doImport = async () => {
+    if (!importToken.trim() || importModalIdx === null || !formData) return;
+    setImporting(true);
+    try {
+      const keyId = `account_${Date.now()}`;
+      const res = await apiFetch('/v1/oauth/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ key_id: keyId, type: formData.engine, refresh_token: importToken.trim() }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        updateKey(importModalIdx, data.key_id || keyId);
+        setOauthAccounts(prev => ({ ...prev, [data.key_id || keyId]: prev[data.key_id || keyId] || { type: formData.engine, status: 'active' } }));
+        setImportModalIdx(null);
+        setImportToken('');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert(`导入失败: ${err.detail || err.message || res.statusText}`);
+      }
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const startOAuthLogin = async (idx: number) => {
+    // 修改原因：后端现在会按 provider 返回 auto 或 manual 登录模式，前端不能再用单一的弹窗地址轮询流程。
+    // 修改方式：authorize 成功后读取 mode；manual 显示粘贴弹窗，auto 监听 callback 成功页的 postMessage。
+    // 目的：同时支持 Codex 固定 localhost 回调和 Antigravity/Gemini CLI 等可自定义回调的 OAuth provider。
+    if (!formData) return;
+    try {
+      const res = await apiFetch(`/v1/oauth/authorize?type=${encodeURIComponent(formData.engine)}&origin=${encodeURIComponent(window.location.origin)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(`发起登录失败: ${err.error || err.detail || res.statusText}`);
+        return;
+      }
+      const { auth_url, state, mode } = await res.json();
+      const authWindow = window.open(auth_url, '_blank', 'width=600,height=700');
+      if (!authWindow) {
+        alert('无法打开弹出窗口，请允许弹窗后重试');
+        return;
+      }
+
+      if (mode === 'manual') {
+        // 修改原因：manual 模式的 provider 会跳转到 localhost 失败页，前端无法依赖跨窗口读取地址栏。
+        // 修改方式：打开授权窗口后记录本次 state，并显示独立粘贴弹窗让用户提交完整回调 URL。
+        // 目的：让 Codex 这类固定 localhost 回调的 OAuth 登录稳定完成 token 交换。
+        setOauthManualState({ idx, state });
+        setManualUrl('');
+        return;
+      }
+
+      const handler = (event: MessageEvent) => {
+        // 修改原因：auto 模式由后端成功页通过 postMessage 把 key_id 传回管理前端。
+        // 修改方式：只接受 oauth_callback_success 消息，并校验 state 与本次 authorize 返回值一致。
+        // 目的：避免其他窗口消息误触发当前 Key 行更新。
+        if (event.data?.type !== 'oauth_callback_success') return;
+        if (event.data?.state && event.data.state !== state) return;
+        window.removeEventListener('message', handler);
+        const keyId = event.data.key_id;
+        if (keyId) {
+          updateKey(idx, keyId);
+        }
+        refreshOAuthAccounts();
+        if (!authWindow.closed) {
+          authWindow.close();
+        }
+      };
+      window.addEventListener('message', handler);
+      window.setTimeout(() => {
+        // 修改原因：后端 pending flow 只保存 5 分钟，过期后继续监听会造成误导。
+        // 修改方式：5 分钟后移除本次 postMessage 监听器。
+        // 目的：让前端生命周期与后端授权状态有效期保持一致。
+        window.removeEventListener('message', handler);
+      }, 300000);
+    } catch (e) {
+      alert(`登录出错: ${e}`);
+    }
+  };
+
+  const doManualExchange = async () => {
+    // 修改原因：manual OAuth 模式需要用户粘贴 localhost 回调 URL 后再由前端提交 code。
+    // 修改方式：解析完整 URL 中的 authorization code，校验 state 后调用 /v1/oauth/exchange。
+    // 目的：取代 prompt 和跨窗口 location 轮询，减少浏览器安全策略对登录流程的影响。
+    if (!oauthManualState || !manualUrl.trim()) return;
+    setExchanging(true);
+    try {
+      const url = new URL(manualUrl.trim());
+      const code = url.searchParams.get('code');
+      const callbackState = url.searchParams.get('state');
+      if (!code) {
+        alert('URL 中未找到 authorization code');
+        return;
+      }
+      if (callbackState && callbackState !== oauthManualState.state) {
+        alert('state 不匹配，可能不是本次登录的回调');
+        return;
+      }
+
+      const res = await apiFetch('/v1/oauth/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ code, state: oauthManualState.state }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        updateKey(oauthManualState.idx, data.key_id || '');
+        await refreshOAuthAccounts();
+        setOauthManualState(null);
+        setManualUrl('');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert(`Token 交换失败: ${err.error || err.detail || res.statusText}`);
+      }
+    } catch (e) {
+      alert(`URL 解析失败: ${e}`);
+    } finally {
+      setExchanging(false);
+    }
   };
 
   const toggleKeyDisabled = (idx: number) => {
@@ -1189,6 +1642,7 @@ export default function Channels() {
       provider: `${freshParent.provider}:${sub.engine || 'sub'}`,
       engine: sub.engine || '',
       base_url: sub.base_url || freshParent.base_url || '',
+      token_url: sub.token_url || freshParent.token_url || '',
       api: freshParent.api,
       model: sub.model || sub.models || [],
       model_prefix: sub.model_prefix || freshParent.model_prefix || '',
@@ -1212,6 +1666,7 @@ export default function Channels() {
       provider: `${parent.provider}:${sub.engine || 'sub'}`,
       engine: sub.engine || '',
       base_url: sub.base_url || parent.base_url || '',
+      token_url: sub.token_url || parent.token_url || '',
       api: parent.api,
       model: sub.model || sub.models || [],
       model_prefix: sub.model_prefix || parent.model_prefix || '',
@@ -1833,6 +2288,10 @@ export default function Channels() {
       provider: formData.provider,
       remark: formData.remark || undefined,
       base_url: formData.base_url,
+      // 修改原因：OAuth token endpoint 已独立为 token_url，测试快照必须与正式保存 payload 保持相同字段语义。
+      // 修改方式：直接提交 formData.token_url，包括空字符串，避免 JSON.stringify 删除 undefined 字段。
+      // 目的：确保测试弹窗、保存请求和回显链路都能表达用户填写或清空 token_url 的真实状态。
+      token_url: formData.token_url,
       model_prefix: formData.model_prefix || undefined,
       api: finalApi,
       model: finalModels,
@@ -1965,6 +2424,7 @@ export default function Channels() {
           model: subModels.length > 0 ? subModels : undefined,
         };
         if (sub.base_url) subObj.base_url = sub.base_url;
+        if (sub.token_url) subObj.token_url = sub.token_url;
         if (sub.model_prefix) subObj.model_prefix = sub.model_prefix;
         if (sub.remark) subObj.remark = sub.remark;
         if (sub.enabled === false) subObj.enabled = false;
@@ -1977,6 +2437,10 @@ export default function Channels() {
       provider: formData.provider,
       remark: formData.remark || undefined,
       base_url: formData.base_url,
+      // 修改原因：PUT /v1/providers/{id} 会整体替换 provider，不提交 token_url 会把已保存的值删除。
+      // 修改方式：正式保存 payload 始终携带 formData.token_url，空字符串也作为显式清空值发送。
+      // 目的：保证保存后 api.yaml、单渠道 GET 和再次打开编辑面板都能回显同一份 token_url。
+      token_url: formData.token_url,
       model_prefix: formData.model_prefix || undefined,
       api: finalApi,
       model: finalModels,
@@ -2034,6 +2498,7 @@ export default function Channels() {
         enabled: formData.enabled,
       };
       if (formData.base_url && formData.base_url !== (parent.base_url || '')) subObj.base_url = formData.base_url;
+      if (formData.token_url && formData.token_url !== (parent.token_url || '')) subObj.token_url = formData.token_url;
       if (formData.model_prefix && formData.model_prefix !== (parent.model_prefix || '')) subObj.model_prefix = formData.model_prefix;
       if (formData.remark) subObj.remark = formData.remark;
       if (Object.keys(subPrefs).length > 0) subObj.preferences = subPrefs;
@@ -3314,11 +3779,30 @@ export default function Channels() {
         </Dialog.Portal>
       </Dialog.Root>
 
+
       {/* Editor Side Sheet - Responsive */}
-      <Dialog.Root open={isModalOpen} onOpenChange={(open) => { setIsModalOpen(open); if (!open) setEditingSubChannel(null); }}>
+      {/* 修改原因：OAuth portal 弹窗打开时，编辑抽屉仍会接收到外部交互并尝试关闭。
+          修改方式：复用 isOAuthOverlayOpen 判断，在 OAuth 覆盖弹窗存在时忽略抽屉关闭请求。
+          目的：让用户处理 OAuth 弹窗时，底层编辑面板保持原状。 */}
+      <Dialog.Root open={isModalOpen} modal={!isOAuthOverlayOpen} onOpenChange={(open) => { if (!open && isOAuthOverlayOpen) return; setIsModalOpen(open); if (!open) setEditingSubChannel(null); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40 animate-in fade-in duration-200" />
-          <Dialog.Content className="fixed right-0 top-0 h-full w-full sm:w-[560px] bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
+          {/* 修改原因：OAuth portal 弹窗位于 Dialog.Content 外部，Radix 会把外部焦点重新拉回编辑抽屉。
+              修改方式：OAuth 覆盖弹窗打开时，阻止外部焦点和外部交互事件的默认处理。
+              目的：允许 portal 弹窗中的 textarea 或 input 接收焦点，同时避免点击 OAuth 遮罩关闭底层抽屉。 */}
+          <Dialog.Content
+            className="fixed right-0 top-0 h-full w-full sm:w-[560px] bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300"
+            onFocusOutside={(e) => {
+              if (isOAuthOverlayOpen) {
+                e.preventDefault();
+              }
+            }}
+            onInteractOutside={(e) => {
+              if (isOAuthOverlayOpen) {
+                e.preventDefault();
+              }
+            }}
+          >
             <div className="p-4 sm:p-5 border-b border-border flex justify-between items-center bg-muted/30 flex-shrink-0">
               <Dialog.Title className="text-lg sm:text-xl font-bold text-foreground flex items-center gap-2">
                 <Server className="w-5 h-5 text-primary" />
@@ -3351,9 +3835,24 @@ export default function Channels() {
                           updateFormData('engine', val);
                           const sel = channelTypes.find(c => c.id === val);
                           if (sel?.default_base_url && !formData.base_url) updateFormData('base_url', sel.default_base_url);
+                          if (sel?.default_token_url && !formData.token_url) updateFormData('token_url', sel.default_token_url);
                         }} className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground">
                           <option value="">默认 (自动推断)</option>
-                          {channelTypes.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}
+                          {(() => {
+                            const sort = (a: ChannelOption, b: ChannelOption) => {
+                              if (a.id === 'openai') return -1;
+                              if (b.id === 'openai') return 1;
+                              return (a.description || a.id).localeCompare(b.description || b.id);
+                            };
+                            const builtIn = channelTypes.filter(c => !c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const oauth = channelTypes.filter(c => c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const plugin = channelTypes.filter(c => c.source === 'plugin').sort(sort);
+                            return (<>
+                              <optgroup label="内置通用">{builtIn.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>
+                              {oauth.length > 0 && <optgroup label="内置 OAuth">{oauth.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                              {plugin.length > 0 && <optgroup label="插件渠道">{plugin.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                            </>);
+                          })()}
                         </select>
                       </div>
                     </div>
@@ -3362,6 +3861,22 @@ export default function Channels() {
                       <input type="text" value={formData.base_url} onChange={e => updateFormData('base_url', e.target.value)} placeholder="留空则使用渠道默认地址，末尾加 # 则不拼接路径后缀" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono outline-none text-foreground" />
                       <span className="text-xs text-muted-foreground mt-1 block">{'末尾加 # 可直接使用完整地址，不拼接路径后缀（如 https://example.com/v1/chat#）'}</span>
                     </div>
+                    {/* 修改原因：OAuth 引擎需要单独配置 token exchange/refresh 地址，不能再把 Base URL 当作 token endpoint。
+                        修改方式：仅在 OAuth 类型引擎下显示 token_url 输入框，并直接写入 formData.token_url。
+                        目的：用户可以为 Codex、Claude Code、Antigravity 配置反代 token endpoint，留空时仍使用 provider 默认值。 */}
+                    {isOAuthEngine && (
+                      <div className="space-y-1">
+                        <label className="text-xs font-medium text-muted-foreground">Token URL</label>
+                        <input
+                          type="text"
+                          value={formData.token_url || ''}
+                          onChange={e => setFormData(prev => prev ? { ...prev, token_url: e.target.value } : prev)}
+                          placeholder={channelTypes.find(c => c.id === formData.engine)?.default_token_url || '留空使用默认地址（如需反代可填写）'}
+                          className="w-full bg-muted border border-border rounded-lg p-2.5 text-sm outline-none focus:border-primary"
+                        />
+                        <p className="text-[10px] text-muted-foreground">OAuth token exchange 地址，用于换取和刷新 token。不填则使用各 provider 内置默认值。</p>
+                      </div>
+                    )}
                     <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">备注</label>
                       <textarea
@@ -3449,9 +3964,9 @@ export default function Channels() {
                       <button onClick={copyAllKeys} className="text-muted-foreground hover:text-foreground flex items-center gap-1"><Copy className="w-3 h-3" /> 复制全部</button>
                       <button
                         onClick={() => queryAllBalances()}
-                        disabled={balanceLoading || !formData.preferences?.balance}
+                        disabled={balanceLoading || (!isOAuthEngine && !formData.preferences?.balance)}
                         className="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 dark:hover:text-emerald-300 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                        title={formData.preferences?.balance ? '查询所有 Key 的余额' : '未配置余额查询（在高级设置中配置 preferences.balance）'}
+                        title={isOAuthEngine ? '查询所有 OAuth 账号的额度' : (formData.preferences?.balance ? '查询所有 Key 的余额' : '未配置余额查询（在高级设置中配置 preferences.balance）')}
                       >
                         <Wallet className={`w-3 h-3 ${balanceLoading ? 'animate-pulse' : ''}`} /> {balanceLoading ? '查询中...' : '余额'}
                       </button>
@@ -3490,6 +4005,8 @@ export default function Channels() {
 
                       const isFocused = focusedKeyIdx === idx;
                       const bal = balanceResults[keyObj.key];
+                      const oauthAccount = oauthAccounts[keyObj.key];
+                      const oauthQuota = getOAuthQuota(oauthAccount);
 
                       if (isCooling) {
                         return (
@@ -3513,12 +4030,16 @@ export default function Channels() {
                       const balPct = bal ? getBalancePercent(bal) : null;
                       const balColor = getBalanceColor(balPct);
                       const balLabel = bal ? getBalanceLabel(bal) : null;
-                      const hasTag = !isGrayed && (!!balLabel || isPermanent);
+                      const hasTag = !isGrayed && (!!balLabel || isPermanent || (isOAuthEngine && (!!oauthQuota || !!oauthAccount)));
 
                       return (
-                        <div key={idx} className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border overflow-hidden transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? 'bg-muted/30 opacity-50' : 'bg-muted/50'}`}>
-                          {/* 余额进度条背景 */}
-                          {!isFocused && balColor && balPct != null && (
+                        <div key={idx} className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? 'bg-muted/30 opacity-50' : 'bg-muted/50'}`}>
+                          {/* OAuth 额度边框：上半蓝(5h) 下半紫(7d)，叠在普通 border 下方，冷却红条会覆盖在上面 */}
+                          {isOAuthEngine && !isFocused && oauthQuota && (
+                            <QuotaBorderOverlay quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+                          )}
+                          {/* 普通余额背景条 */}
+                          {!isOAuthEngine && !isFocused && balColor && balPct != null && (
                             <div className="absolute left-0 top-0 bottom-0 rounded-[7px] z-0 pointer-events-none transition-all duration-500"
                                  style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
                           )}
@@ -3529,13 +4050,32 @@ export default function Channels() {
                               value={keyObj.key}
                               onChange={e => updateKey(idx, e.target.value)}
                               onPaste={e => handleKeyPaste(e, idx)}
-                              onFocus={() => setFocusedKeyIdx(idx)}
-                              onBlur={() => setFocusedKeyIdx(null)}
-                              placeholder="sk-..."
+                              onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
+                              onBlur={e => isOAuthEngine ? handleOAuthKeyBlur(idx, e.currentTarget.value) : setFocusedKeyIdx(null)}
+                              placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
                               className={`w-full bg-transparent border-none text-sm font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
                             />
                           </div>
-                          {!isFocused && balLabel && balColor && (
+                          {isOAuthEngine && !keyObj.key && (
+                            <>
+                              {/* 修改原因：OAuth 新增空行需要把账号导入和后续浏览器登录入口放在输入框右侧。 */}
+                              <button onClick={() => openImportModal(idx)} className="text-xs px-2 py-1 rounded border border-border bg-muted hover:bg-muted/80 text-foreground flex items-center gap-1 relative z-[2]" title="粘贴 Refresh Token">
+                                <ClipboardPaste className="w-3 h-3" /> 导入
+                              </button>
+                              <button onClick={() => startOAuthLogin(idx)} className="text-xs px-2 py-1 rounded border border-primary/50 bg-primary/10 hover:bg-primary/20 text-primary flex items-center gap-1 relative z-[2]" title="浏览器登录">
+                                <LogIn className="w-3 h-3" /> 登录
+                              </button>
+                            </>
+                          )}
+                          {isOAuthEngine && !isFocused && oauthQuota && (
+                            <QuotaArcs quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+                          )}
+                          {isOAuthEngine && !isFocused && oauthAccount && !oauthQuota && (
+                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 relative z-[2]">
+                              {oauthAccount.status === 'active' ? '已连接' : oauthAccount.status === 'error' ? '刷新失败' : '冷却中'}
+                            </span>
+                          )}
+                          {!isOAuthEngine && !isFocused && balLabel && balColor && (
                             <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[balColor]}`}>{balLabel}</span>
                           )}
                           {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
@@ -3717,7 +4257,21 @@ export default function Channels() {
                                   className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs text-foreground"
                                 >
                                   <option value="">选择引擎</option>
-                                  {channelTypes.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}
+                                  {(() => {
+                            const sort = (a: ChannelOption, b: ChannelOption) => {
+                              if (a.id === 'openai') return -1;
+                              if (b.id === 'openai') return 1;
+                              return (a.description || a.id).localeCompare(b.description || b.id);
+                            };
+                            const builtIn = channelTypes.filter(c => !c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const oauth = channelTypes.filter(c => c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const plugin = channelTypes.filter(c => c.source === 'plugin').sort(sort);
+                            return (<>
+                              <optgroup label="内置通用">{builtIn.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>
+                              {oauth.length > 0 && <optgroup label="内置 OAuth">{oauth.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                              {plugin.length > 0 && <optgroup label="插件渠道">{plugin.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                            </>);
+                          })()}
                                 </select>
                               </div>
 
@@ -4299,8 +4853,10 @@ export default function Channels() {
                       )}
                     </div>
 
-                    {/* 余额查询配置 */}
-                    <div className="border-t border-border pt-4">
+                    {/* 修改原因：OAuth 渠道余额由后端 OAuthManager 自动查询，不需要用户配置 endpoint、template 或字段映射。
+                        修改方式：仅普通渠道渲染余额查询配置块，OAuth 渠道完全隐藏这一区域。
+                        目的：避免用户在 OAuth 引擎下看到无效的普通余额配置项。 */}
+                    {!isOAuthEngine && <div className="border-t border-border pt-4">
                       <div className="flex items-center justify-between mb-3">
                         <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
                           <Wallet className="w-3.5 h-3.5 text-emerald-500" /> 余额查询
@@ -4430,7 +4986,7 @@ export default function Channels() {
                           </div>
                         );
                       })()}
-                    </div>
+                    </div>}
 
                   </div>
                 </section>
@@ -4579,6 +5135,63 @@ export default function Channels() {
         onOpenChange={setAnalyticsOpen}
         providerName={analyticsProvider}
       />
+
+      {/* 修改原因：OAuth 导入弹窗需要脱离编辑抽屉层级，并提供可聚焦容器用于焦点回退。
+          修改方式：继续使用 createPortal 渲染到 body，并在遮罩容器添加 tabIndex={-1}。
+          目的：让导入弹窗输入框能在 Radix 编辑抽屉存在时稳定获得焦点。 */}
+      {importModalIdx !== null && createPortal(
+        <div tabIndex={-1} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={() => setImportModalIdx(null)}>
+          <div className="bg-background border border-border rounded-xl p-6 w-[400px] max-w-[90vw] space-y-4" onClick={e => e.stopPropagation()}>
+            <h3 className="text-sm font-semibold">导入 Refresh Token</h3>
+            <p className="text-xs text-muted-foreground">从 CLIProxyAPI 配置或本地 OAuth 文件中复制 refresh_token 粘贴到下方</p>
+            <textarea
+              value={importToken}
+              onChange={e => setImportToken(e.target.value)}
+              placeholder="rt_xxxxxxxx..."
+              className="w-full bg-muted border border-border rounded-lg p-3 text-sm font-mono outline-none focus:border-primary min-h-[80px] resize-none"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setImportModalIdx(null)} className="text-sm px-3 py-1.5 rounded border border-border hover:bg-muted">取消</button>
+              <button onClick={doImport} disabled={!importToken.trim() || importing} className="text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+                {importing ? '导入中...' : '导入'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* 修改原因：OAuth 手动回调弹窗同样位于编辑抽屉外部，需要避免焦点回退到 Dialog.Content。
+          修改方式：继续使用 createPortal 渲染到 body，并在遮罩容器添加 tabIndex={-1}。
+          目的：让用户粘贴完整回调 URL 时，输入框可以正常点击和输入。 */}
+      {oauthManualState !== null && createPortal(
+        <div tabIndex={-1} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={() => { setOauthManualState(null); setManualUrl(''); }}>
+          <div className="bg-background border border-border rounded-xl p-6 w-[480px] max-w-[90vw] space-y-4" onClick={e => e.stopPropagation()}>
+            <h3 className="text-sm font-semibold">完成 OAuth 登录</h3>
+            <div className="text-xs text-muted-foreground space-y-2">
+              <p>1. 在弹出的窗口中完成登录</p>
+              <p>2. 登录后浏览器会跳转到一个<strong>无法访问</strong>的页面，这是正常的</p>
+              <p>3. 复制该页面地址栏的<strong>完整 URL</strong>，粘贴到下方</p>
+            </div>
+            <input
+              type="text"
+              value={manualUrl}
+              onChange={e => setManualUrl(e.target.value)}
+              placeholder="http://localhost:1455/auth/callback?code=..."
+              className="w-full bg-muted border border-border rounded-lg p-3 text-sm font-mono outline-none focus:border-primary"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => { setOauthManualState(null); setManualUrl(''); }} className="text-sm px-3 py-1.5 rounded border border-border hover:bg-muted">取消</button>
+              <button onClick={doManualExchange} disabled={!manualUrl.trim() || exchanging} className="text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+                {exchanging ? '验证中...' : '完成登录'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
