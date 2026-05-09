@@ -19,6 +19,7 @@ import hashlib
 import httpx
 import json
 import secrets
+import uuid
 import time
 from base64 import urlsafe_b64encode
 from datetime import datetime, timezone
@@ -53,7 +54,62 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 CLAUDE_REFRESH_MIN_BACKOFF = 5
 CLAUDE_REFRESH_MAX_BACKOFF = 300
 CLAUDE_REFRESH_MAX_RETRIES = 3
-CLAUDE_CODE_USER_AGENT = "claude-code/2.1.76"
+CLAUDE_CODE_USER_AGENT = "claude-code/2.1.97"
+
+# ── Session ID 缓存（per api_key，1 小时 TTL） ──
+_session_id_cache: dict[str, tuple[str, float]] = {}
+_SESSION_TTL = 3600  # 1 hour
+
+# ── 响应头网关指纹前缀（Layer 7+ 清洗） ──
+_GATEWAY_HEADER_PREFIXES = (
+    "x-litellm-", "helicone-", "x-portkey-",
+    "cf-aig-", "x-kong-", "x-bt-",
+)
+
+
+def _get_session_id(api_key: str) -> str:
+    """获取 per-apiKey 的稳定 session UUID（TTL=1h）。"""
+    now = time.monotonic()
+    cached = _session_id_cache.get(api_key)
+    if cached and (now - cached[1]) < _SESSION_TTL:
+        return cached[0]
+    sid = str(uuid.uuid4())
+    _session_id_cache[api_key] = (sid, now)
+    return sid
+
+
+def _parse_version_from_ua(ua: str) -> str:
+    """从 User-Agent 解析 CC 版本号，如 'claude-code/2.1.97' → '2.1.97'。"""
+    if not ua:
+        return _BILLING_CC_VERSION
+    for part in ua.split():
+        if part.startswith("claude-code/"):
+            ver = part.split("/", 1)[1].split(" ")[0]
+            if ver:
+                return ver
+    return _BILLING_CC_VERSION
+
+
+def _parse_entrypoint_from_ua(ua: str) -> str:
+    """从 User-Agent 解析 entrypoint，如 'claude-code/2.1.97 vscode' → 'vscode'。"""
+    if not ua:
+        return _BILLING_ENTRYPOINT
+    # CPA 格式: claude-code/VERSION ENTRYPOINT ...
+    parts = ua.split()
+    for i, part in enumerate(parts):
+        if part.startswith("claude-code/") and i + 1 < len(parts):
+            ep = parts[i + 1].lower()
+            if ep in ("cli", "vscode", "local-agent", "jetbrains", "emacs", "vim"):
+                return ep
+    return _BILLING_ENTRYPOINT
+
+
+def _strip_gateway_headers(headers: dict) -> dict:
+    """清洗响应头中的网关/代理指纹前缀。"""
+    return {
+        k: v for k, v in headers.items()
+        if not any(k.lower().startswith(p) for p in _GATEWAY_HEADER_PREFIXES)
+    }
 CLAUDE_CODE_ANTHROPIC_BETA = (
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
     "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
@@ -660,18 +716,20 @@ def _first_user_message_text(messages: list) -> str:
     return ""
 
 
-def _build_billing_header(messages: list) -> str:
+def _build_billing_header(messages: list, version: str = "", entrypoint: str = "") -> str:
     """构造 x-anthropic-billing-header 文本。"""
+    ver = version or _BILLING_CC_VERSION
+    ep = entrypoint or _BILLING_ENTRYPOINT
     sampled = "".join(
         _sample_js_code_unit(_first_user_message_text(messages), idx)
         for idx in _BILLING_SAMPLE_INDEXES
     )
     digest = hashlib.sha256(
-        f"{_BILLING_SALT}{sampled}{_BILLING_CC_VERSION}".encode()
+        f"{_BILLING_SALT}{sampled}{ver}".encode()
     ).hexdigest()[:3]
     return (
-        f"{_BILLING_HEADER_PREFIX} cc_version={_BILLING_CC_VERSION}.{digest}; "
-        f"cc_entrypoint={_BILLING_ENTRYPOINT}; cch=00000;"
+        f"{_BILLING_HEADER_PREFIX} cc_version={ver}.{digest}; "
+        f"cc_entrypoint={ep}; cch=00000;"
     )
 
 
@@ -688,7 +746,7 @@ def _has_billing_header(system) -> bool:
     return False
 
 
-def _sanitize_for_plan_billing(payload: dict) -> dict:
+def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> dict:
     """清洗 payload 绕过 Anthropic 第三方检测，使请求走 plan limits 而非 extra usage。
 
     Layer 1: 确保 system prompt 存在
@@ -702,7 +760,16 @@ def _sanitize_for_plan_billing(payload: dict) -> dict:
     # ── Layer 1: 确保 billing header 存在 ──
     system = payload.get("system")
     if not _has_billing_header(system):
-        billing_text = _build_billing_header(payload.get("messages", []))
+        # 从请求头 UA 动态解析版本号和 entrypoint
+        _ua = ""
+        if headers:
+            _ua_key, _ua_val = _get_header_case_insensitive(headers, "User-Agent")
+            _ua = str(_ua_val or "")
+        billing_text = _build_billing_header(
+            payload.get("messages", []),
+            version=_parse_version_from_ua(_ua),
+            entrypoint=_parse_entrypoint_from_ua(_ua),
+        )
         billing_block = {"type": "text", "text": billing_text}
         if system is None:
             payload["system"] = [
@@ -897,24 +964,40 @@ def _merge_anthropic_beta(headers: dict) -> None:
 
 
 def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
-    """把普通 Claude 请求头改成 CPA Claude Code OAuth 请求头。"""
-    # 修改原因：普通 claude_channel 使用 x-api-key，而 CPA 对 OAuth access_token 使用 Authorization: Bearer。
-    # 修改方式：大小写不敏感移除 x-api-key，写入 Bearer，并补齐 Claude Code OAuth beta、X-App 与默认 UA。
-    # 目的：避免把 OAuth access_token 当 Anthropic API key 发送，同时减少与 Claude Code 官方请求头的差异。
+    """把普通 Claude 请求头改成完整的 Claude Code OAuth 请求头。"""
     _pop_header_case_insensitive(headers, "x-api-key")
     _set_header_case_insensitive(headers, "Authorization", f"Bearer {api_key}")
     _merge_anthropic_beta(headers)
+
     if _get_header_case_insensitive(headers, "X-App")[0] is None:
         headers["X-App"] = "cli"
     if _get_header_case_insensitive(headers, "User-Agent")[0] is None:
         headers["User-Agent"] = CLAUDE_CODE_USER_AGENT
+
+    # X-Claude-Code-Session-Id — per apiKey stable UUID (TTL=1h)
+    if api_key and _get_header_case_insensitive(headers, "X-Claude-Code-Session-Id")[0] is None:
+        headers["X-Claude-Code-Session-Id"] = _get_session_id(api_key)
+
+    # x-client-request-id — per request UUID
+    if _get_header_case_insensitive(headers, "x-client-request-id")[0] is None:
+        headers["x-client-request-id"] = str(uuid.uuid4())
+
+    # X-Stainless SDK 头 — 模拟 Node.js/@anthropic-ai/sdk
+    for hdr, val in [
+        ("X-Stainless-Retry-Count", "0"),
+        ("X-Stainless-Runtime", "node"),
+        ("X-Stainless-Lang", "js"),
+        ("X-Stainless-Timeout", "600"),
+    ]:
+        if _get_header_case_insensitive(headers, hdr)[0] is None:
+            headers[hdr] = val
 
 
 async def get_claude_code_payload(request, engine, provider, api_key=None):
     """复用 Claude adapter 构建 payload，覆盖为 Bearer 认证 + plan billing 清洗。"""
     url, headers, payload = await get_claude_payload(request, "claude", provider, api_key)
     _apply_claude_code_headers(headers, api_key)
-    payload = _sanitize_for_plan_billing(payload)
+    payload = _sanitize_for_plan_billing(payload, headers=headers)
     return url, headers, payload
 
 
@@ -978,7 +1061,11 @@ def _reverse_map_chunk(chunk: str) -> str:
 
 async def _passthrough_sanitize(payload, modifications, request, engine, provider, api_key):
     """透传模式下的 plan billing 清洗。"""
-    return _sanitize_for_plan_billing(payload)
+    # 透传模式下从 request 获取原始 headers 用于 UA 解析
+    original_headers = {}
+    if hasattr(request, '_passthrough_headers'):
+        original_headers = request._passthrough_headers or {}
+    return _sanitize_for_plan_billing(payload, headers=original_headers)
 
 
 def register():
