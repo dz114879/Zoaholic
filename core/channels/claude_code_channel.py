@@ -1002,17 +1002,19 @@ async def get_claude_code_payload(request, engine, provider, api_key=None):
 
 
 async def get_claude_code_passthrough_meta(request, engine, provider, api_key=None):
-    """透传模式：复用 Claude passthrough adapter，仅做 Bearer 认证转换。
+    """透传模式：复用 Claude passthrough adapter + 注入 CC 伪装头。
 
-    透传场景下客户端（如真 Claude Code CLI）已自带完整请求头
-    （anthropic-beta、User-Agent、X-App 等），这里只替换认证方式，
-    不覆盖客户端原始头。adapter 设的默认 headers 会被后续的
-    apply_custom_headers(original_headers) 覆盖为客户端值。
+    真 CC CLI 客户端自带完整请求头，后续 apply_custom_headers(original_headers)
+    会用客户端值覆盖这里的默认值。第三方客户端（Cline/Continue 等）不带
+    CC 特有头，这里注入的默认值就作为 fallback 保留。
     """
     url, headers, payload = await get_claude_passthrough_meta(request, "claude", provider, api_key)
-    # 只做认证转换: x-api-key → Bearer
-    _pop_header_case_insensitive(headers, "x-api-key")
-    _set_header_case_insensitive(headers, "Authorization", f"Bearer {api_key}")
+
+    # 完整 CC 伪装（Bearer + Session-Id + request-id + Stainless + beta flags）
+    # 第三方客户端：这些默认值保留
+    # 真 CC 客户端：后续 original_headers 覆盖为真实值
+    _apply_claude_code_headers(headers, api_key)
+
     return url, headers, payload
 
 
