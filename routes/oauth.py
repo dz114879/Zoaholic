@@ -285,27 +285,21 @@ async def import_account(request: Request):
     provider = oauth_mgr._providers.get(type_name)
 
     token_data = _token_data_from_body(body)
-    if body.get("refresh_token") and provider:
-        # 修改原因：只导入 refresh_token 时需要立即换取 access_token，避免首次请求才发现凭据无效。
-        # 修改方式：把导入体中的凭据字段传给 provider.refresh_token，并保存刷新后的 token_data。
-        # 目的：落盘时保存最新 refresh_token rotation 结果和 expires_at。
-        # 修改原因：手动导入 refresh_token 会立即访问 token endpoint，也需要使用最新 token_url。
-        # 修改方式：优先通过 oauth_mgr.refresh_provider 注入当前配置；旧测试替身不支持时回退到 provider.refresh_token。
-        # 目的：让导入、刷新和授权码交换三条路径都遵守同一套运行时配置读取规则。
-        if hasattr(oauth_mgr, "refresh_provider"):
-            updated = await oauth_mgr.refresh_provider(type_name, token_data)
+    try:
+        if body.get("refresh_token") and provider:
+            if hasattr(oauth_mgr, "refresh_provider"):
+                updated = await oauth_mgr.refresh_provider(type_name, token_data)
+            else:
+                updated = await provider.refresh_token(token_data)
+            email = updated.get("email")
+            final_key_id = email if email else key_id
+            await oauth_mgr.register(final_key_id, type_name, updated)
+            return {"message": "Account imported", "key_id": final_key_id}
         else:
-            updated = await provider.refresh_token(token_data)
-        # 修改原因：前端导入时只能生成临时 account_* key_id，真实账号标识应优先使用刷新后解析出的邮箱。
-        # 修改方式：如果 provider.refresh_token 返回 email，就用 email 替代原始 key_id 注册并返回给前端。
-        # 目的：让渠道 api_keys 保存稳定可读的账号邮箱，而不是一次性的临时时间戳标识。
-        email = updated.get("email")
-        final_key_id = email if email else key_id
-        await oauth_mgr.register(final_key_id, type_name, updated)
-        return {"message": "Account imported", "key_id": final_key_id}
-    else:
-        await oauth_mgr.register(key_id, type_name, token_data)
-    return {"message": "Account imported", "key_id": key_id}
+            await oauth_mgr.register(key_id, type_name, token_data)
+            return {"message": "Account imported", "key_id": key_id}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @router.get("/v1/oauth/accounts", dependencies=[Depends(verify_admin_api_key)])

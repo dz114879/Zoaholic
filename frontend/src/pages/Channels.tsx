@@ -1161,7 +1161,7 @@ export default function Channels() {
         setImportToken('');
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`导入失败: ${err.detail || err.message || res.statusText}`);
+        toastError(fmtErr(err, res.status), '导入失败');
       }
     } finally {
       setImporting(false);
@@ -1179,13 +1179,13 @@ export default function Channels() {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        alert(`发起登录失败: ${err.error || err.detail || res.statusText}`);
+        toastError(fmtErr(err, res.status), '发起登录失败');
         return;
       }
       const { auth_url, state, mode } = await res.json();
       const authWindow = window.open(auth_url, '_blank', 'width=600,height=700');
       if (!authWindow) {
-        alert('无法打开弹出窗口，请允许弹窗后重试');
+        toastError('无法打开弹出窗口，请允许弹窗后重试');
         return;
       }
 
@@ -1222,7 +1222,7 @@ export default function Channels() {
         window.removeEventListener('message', handler);
       }, 300000);
     } catch (e) {
-      alert(`登录出错: ${e}`);
+      toastError(e instanceof Error ? e.message : String(e), '登录出错');
     }
   };
 
@@ -1237,11 +1237,11 @@ export default function Channels() {
       const code = url.searchParams.get('code');
       const callbackState = url.searchParams.get('state');
       if (!code) {
-        alert('URL 中未找到 authorization code');
+        toastError('URL 中未找到 authorization code');
         return;
       }
       if (callbackState && callbackState !== oauthManualState.state) {
-        alert('state 不匹配，可能不是本次登录的回调');
+        toastError('state 不匹配，可能不是本次登录的回调');
         return;
       }
 
@@ -1258,10 +1258,10 @@ export default function Channels() {
         setManualUrl('');
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Token 交换失败: ${err.error || err.detail || res.statusText}`);
+        toastError(fmtErr(err, res.status), 'Token 交换失败');
       }
     } catch (e) {
-      alert(`URL 解析失败: ${e}`);
+      toastError(e instanceof Error ? e.message : String(e), 'URL 解析失败');
     } finally {
       setExchanging(false);
     }
