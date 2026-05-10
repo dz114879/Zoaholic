@@ -282,7 +282,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,
-                "content": content
+                "content": [{"type": "text", "text": content}] if isinstance(content, str) else content
             }]})
         elif msg.role == "function":
             messages.append({"role": "assistant", "content": [{
@@ -294,7 +294,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_017r5miPMV6PGSNKmhvHPic4",
-                "content": msg.content
+                "content": [{"type": "text", "text": msg.content}] if isinstance(msg.content, str) else msg.content
             }]})
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
