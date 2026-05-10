@@ -478,11 +478,11 @@ async def lifespan(app: FastAPI):
         # 目的：让请求路径只做内存查找和必要刷新，不在每次请求重复读取文件。
         from core.oauth.manager import OAuthManager
         app.state.oauth_manager = OAuthManager()
-        await app.state.oauth_manager.init()
-        # 修改原因：OAuth provider 需要实时读取 app.state.config，而不是保存启动时的 providers 快照。
-        # 修改方式：把配置 getter 注入 OAuthManager，provider 每次 token 请求前通过 manager 读取当前配置。
-        # 目的：前端保存 token_url 到 api.yaml 并同步 app.state.config 后，无需重启即可生效。
+        # 修改原因：OAuthManager.init 会把旧扁平 oauth_state.json 按 api.yaml 中的 provider name 自动迁移。
+        # 修改方式：先注入 app.state.config getter，再执行 init，让迁移阶段能读取当前 providers 配置。
+        # 目的：启动迁移可以把旧凭据放入正确渠道，而不是全部落入 _unmapped。
         app.state.oauth_manager.set_config_ref(lambda: app.state.config or {})
+        await app.state.oauth_manager.init()
         # OAuth provider 注册：各渠道自行注册自己的 provider
         from core.channels.codex_channel import register_oauth_provider as _reg_codex_oauth
         from core.channels.claude_code_channel import register_oauth_provider as _reg_cc_oauth

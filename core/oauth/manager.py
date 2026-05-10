@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 class OAuthManager:
     """负责 key_id 到 access_token 的解析、刷新和持久化。"""
 
+    UNMAPPED_CHANNEL = "_unmapped"
+
     def __init__(self, state_path: str = STATE_PATH):
-        # 修改原因：OAuth 凭据属于运行时状态，不能写入 api.yaml 或普通 provider 配置。
-        # 修改方式：manager 维护内存 state、每账号刷新锁和 provider 注册表。
-        # 目的：让 handler 只解析 access_token，不改变现有轮询、冷却和统计使用的 key_id。
+        # 修改原因：OAuth 凭据需要按渠道隔离，同一邮箱可能同时存在于多个 provider name 下。
+        # 修改方式：manager 的 _state 统一改为 {channel_id: {key_id: credential}}，锁也改为 channel:key 维度。
+        # 目的：避免不同渠道共用邮箱 key 时互相覆盖，同时保持 handler 只解析 access_token 的职责边界。
         self._state = {}
         self._locks = {}
         self._providers = {}
@@ -68,11 +70,130 @@ class OAuthManager:
 
     async def init(self):
         """加载状态文件。provider 注册由各渠道/插件自行调用 register_provider 完成。"""
-        self._state = load_state(self._state_path)
+        loaded_state = load_state(self._state_path)
+        # 修改原因：历史版本 oauth_state.json 是 {email: credential} 扁平结构，升级后必须在启动时改为分渠道结构。
+        # 修改方式：检测第一层 value 是否为“账号字典”，旧结构按 credential.type 映射到 api.yaml 中第一个同 engine 渠道。
+        # 目的：无需用户手工迁移，也能消除同邮箱跨渠道冲突；无法映射的旧账号进入 _unmapped 便于人工处理。
+        if self._is_legacy_flat_state(loaded_state):
+            self._state = self._migrate_legacy_state(loaded_state)
+            await self._persist()
+        else:
+            self._state = self._normalize_nested_state(loaded_state)
 
-    async def resolve(self, key_id: str) -> str | None:
-        """把配置中的 key_id 解析成 access_token；不存在时返回 None。"""
-        cred = self._state.get(key_id)
+    def _looks_like_credential(self, value: dict) -> bool:
+        """判断 dict 是否像单个 credential，而不是渠道下的账号映射。"""
+        # 修改原因：新旧 state 的第一层 value 都是 dict，仅靠类型无法区分。
+        # 修改方式：检查 OAuth 凭据常见字段；命中时认为它是旧扁平结构中的账号凭据。
+        # 目的：让启动迁移能准确识别旧文件，同时不误伤正常的 {channel: {email: cred}} 结构。
+        credential_fields = {
+            "type",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "expires_at",
+            "email",
+            "status",
+        }
+        return any(field in value for field in credential_fields)
+
+    def _is_legacy_flat_state(self, state: dict) -> bool:
+        """检测 oauth_state.json 是否仍是旧扁平结构。"""
+        # 修改原因：空 state 无需迁移；非空 state 要区分旧的 email->cred 和新的 channel->accounts。
+        # 修改方式：第一层 value 若不是 dict of dict，或直接带凭据字段，就判定为旧结构。
+        # 目的：兼容旧文件、空文件和已经迁移过的新文件。
+        if not isinstance(state, dict) or not state:
+            return False
+        for value in state.values():
+            if not isinstance(value, dict):
+                return True
+            if self._looks_like_credential(value):
+                return True
+            if not all(isinstance(item, dict) for item in value.values()):
+                return True
+        return False
+
+    def _normalize_nested_state(self, state: dict) -> dict:
+        """把已是新结构的 state 清理为可安全访问的嵌套 dict。"""
+        # 修改原因：手工编辑或历史异常可能留下非 dict 的渠道值或账号值。
+        # 修改方式：只保留 dict 渠道和 dict 凭据，并把渠道名、账号名统一转成字符串 key。
+        # 目的：后续读写不因脏数据抛出，同时不改变已经合法的新结构。
+        normalized: dict[str, dict[str, dict]] = {}
+        if not isinstance(state, dict):
+            return normalized
+        for channel_id, accounts in state.items():
+            if not isinstance(accounts, dict):
+                continue
+            channel_key = self._normalize_channel_id(str(channel_id))
+            normalized[channel_key] = {
+                str(key_id): cred
+                for key_id, cred in accounts.items()
+                if isinstance(cred, dict)
+            }
+        return normalized
+
+    def _engine_channel_map(self) -> dict[str, str]:
+        """从当前配置中生成 engine -> 第一个 provider name 的映射。"""
+        # 修改原因：旧扁平 state 只有 credential.type，没有渠道名，只能用 api.yaml 中 engine 相同的第一个渠道作为迁移目标。
+        # 修改方式：遍历 runtime config.providers，按首次出现顺序记录 engine 到 provider/name 的映射。
+        # 目的：符合用户要求的自动迁移规则，并在多个同 engine 渠道存在时保持确定性。
+        config = self.get_config()
+        providers = config.get("providers")
+        if not isinstance(providers, list):
+            api_config = config.get("api_config") if isinstance(config.get("api_config"), dict) else {}
+            providers = api_config.get("providers") if isinstance(api_config.get("providers"), list) else []
+        mapping: dict[str, str] = {}
+        for item in providers:
+            if not isinstance(item, dict):
+                continue
+            engine = str(item.get("engine") or item.get("type") or "").strip()
+            provider_name = str(item.get("provider") or item.get("name") or "").strip()
+            if engine and provider_name and engine not in mapping:
+                mapping[engine] = provider_name
+        return mapping
+
+    def _migrate_legacy_state(self, state: dict) -> dict:
+        """把旧 email->credential state 迁移为 channel->email->credential。"""
+        # 修改原因：旧 state 第一层 key 是邮箱，和新结构第一层渠道名冲突，不能直接复用。
+        # 修改方式：按 credential.type 查找 engine->provider 映射，找不到时放到 _unmapped。
+        # 目的：最大限度保留已有凭据，并让无法自动判断渠道的账号可被管理员看见。
+        engine_to_channel = self._engine_channel_map()
+        migrated: dict[str, dict[str, dict]] = {}
+        for key_id, cred in state.items():
+            if not isinstance(cred, dict):
+                continue
+            type_name = str(cred.get("type") or "").strip()
+            channel_id = engine_to_channel.get(type_name) or self.UNMAPPED_CHANNEL
+            channel_id = self._normalize_channel_id(channel_id)
+            migrated.setdefault(channel_id, {})[str(key_id)] = cred
+        return migrated
+
+    def _normalize_channel_id(self, channel_id: str | None) -> str:
+        """统一渠道名空值处理。"""
+        # 修改原因：所有 state 操作都以 provider name 为第一层 key，空字符串会造成难以定位的隐藏分组。
+        # 修改方式：去掉首尾空白，空值统一落入 _unmapped。
+        # 目的：迁移和异常调用都能被显式归档，避免写出空渠道名。
+        normalized = str(channel_id or "").strip()
+        return normalized or self.UNMAPPED_CHANNEL
+
+    def _get_channel_accounts(self, channel_id: str | None, create: bool = False) -> dict:
+        """获取某个渠道下的账号映射。"""
+        # 修改原因：注册、解析、刷新、quota、重命名都需要同一套渠道字典访问规则。
+        # 修改方式：集中处理渠道名规范化、缺失时是否创建、脏值是否重置。
+        # 目的：避免每个公开方法重复访问 self._state 时遗漏嵌套层级。
+        channel_key = self._normalize_channel_id(channel_id)
+        accounts = self._state.get(channel_key)
+        if isinstance(accounts, dict):
+            return accounts
+        if create:
+            accounts = {}
+            self._state[channel_key] = accounts
+            return accounts
+        return {}
+
+    async def resolve(self, channel_id: str, key_id: str) -> str | None:
+        """把指定渠道中的 key_id 解析成 access_token；不存在时返回 None。"""
+        accounts = self._get_channel_accounts(channel_id)
+        cred = accounts.get(key_id)
         if not cred:
             return None
 
@@ -85,30 +206,33 @@ class OAuthManager:
         import time
 
         if time.time() > cred.get("expires_at", 0) - 300:
-            async with self._get_lock(key_id):
-                cred = self._state.get(key_id)
+            async with self._get_lock(channel_id, key_id):
+                accounts = self._get_channel_accounts(channel_id)
+                cred = accounts.get(key_id)
                 if not cred:
                     return None
                 if self._is_refresh_circuit_open(cred):
                     return None
                 if time.time() > cred.get("expires_at", 0) - 300:
                     try:
-                        cred = await self._refresh(key_id, cred)
+                        cred = await self._refresh(channel_id, key_id, cred)
                     except Exception as e:
                         # 修改原因：刷新失败若不写回状态，下一次请求会立刻重复同样的失败刷新。
-                        # 修改方式：累加 error_count，截断保存 last_error，并尽力持久化错误状态。
+                        # 修改方式：在对应渠道下累加 error_count，截断保存 last_error，并尽力持久化错误状态。
                         # 目的：让账号进入可观测的 error 状态，并让上层 handler 跳过当前 key。
                         error_count = cred.get("error_count", 0) + 1
                         cred["error_count"] = error_count
                         cred["last_error"] = str(e)[:500]
                         cred["last_error_at"] = datetime.utcnow().isoformat() + "Z"
                         cred["status"] = "error"
-                        self._state[key_id] = cred
+                        accounts[key_id] = cred
                         try:
                             await self._persist()
                         except Exception:
                             pass
-                        logger.warning(f"OAuth refresh failed for {key_id} (attempt {error_count}): {e}")
+                        logger.warning(
+                            f"OAuth refresh failed for {channel_id}:{key_id} (attempt {error_count}): {e}"
+                        )
                         return None
         return cred.get("access_token")
 
@@ -131,8 +255,8 @@ class OAuthManager:
         except (ValueError, TypeError):
             return False
 
-    async def _refresh(self, key_id: str, cred: dict) -> dict:
-        """刷新单个 OAuth 凭据并落盘。"""
+    async def _refresh(self, channel_id: str, key_id: str, cred: dict) -> dict:
+        """刷新指定渠道下的单个 OAuth 凭据并落盘。"""
         provider = self._providers.get(cred.get("type"))
         if not provider:
             raise ValueError(f"Unknown OAuth type: {cred.get('type')}")
@@ -144,17 +268,18 @@ class OAuthManager:
         updated.setdefault("email", cred.get("email"))
 
         # 修改原因：OpenAI refresh token rotation 成功后，若落盘失败，磁盘旧 refresh_token 可能已失效。
-        # 修改方式：写入新内存状态前保存旧值，_persist 抛错时恢复旧状态或移除新增 key。
+        # 修改方式：写入新内存状态前保存旧值，_persist 抛错时恢复当前渠道下的旧状态或移除新增 key。
         # 目的：保证内存与磁盘在持久化失败时保持一致，避免运行期继续依赖未成功保存的新 token。
-        old_cred = self._state.get(key_id)
-        self._state[key_id] = updated
+        accounts = self._get_channel_accounts(channel_id, create=True)
+        old_cred = accounts.get(key_id)
+        accounts[key_id] = updated
         try:
             await self._persist()
         except Exception:
             if old_cred is not None:
-                self._state[key_id] = old_cred
+                accounts[key_id] = old_cred
             else:
-                self._state.pop(key_id, None)
+                accounts.pop(key_id, None)
             raise
         return updated
 
@@ -170,15 +295,17 @@ class OAuthManager:
 
     async def exchange_code(
         self,
+        channel_id: str,
         type_name: str,
         code: str,
         redirect_uri: str,
         code_verifier: str | None = None,
     ) -> dict:
         """调用指定 provider 交换授权码，并传入当前配置。"""
-        # 修改原因：OAuth 登录交换和 refresh 一样访问 token endpoint，也需要使用最新 token_url。
-        # 修改方式：由 manager 根据 type_name 找到 provider，并通过 _call_provider_method 注入当前 config。
-        # 目的：避免 routes.oauth 直接调用 provider 时遗漏运行时配置。
+        # 修改原因：OAuth 登录交换和 refresh 一样访问 token endpoint，也需要使用最新 token_url，同时路由要知道写入哪个渠道。
+        # 修改方式：方法签名加入 channel_id 并规范化校验，实际 token 交换仍由 provider 完成，注册由路由调用 register(channel_id, ...)。
+        # 目的：让 exchange 与后续注册的渠道上下文保持一致，避免授权成功后写入全局扁平 state。
+        self._normalize_channel_id(channel_id)
         provider = self._providers.get(type_name)
         if not provider:
             raise ValueError(f"Unknown OAuth type: {type_name}")
@@ -232,12 +359,13 @@ class OAuthManager:
             result["raw"] = cred.get("quota_raw")
         return result if result else None
 
-    async def fetch_quota(self, key_id: str) -> dict | None:
-        """获取账号额度信息。"""
-        # 修改原因：quota 查询是 provider 可选能力，OAuthManager 需要统一查找账号、provider 并注入当前配置。
-        # 修改方式：先返回被动采集缓存；缓存不存在时，再通过 provider 发起轻量主动查询并写入内存缓存。
-        # 目的：减少上游额度探测请求，同时让路由和前端不需要了解各 OAuth provider 的额度实现差异。
-        cred = self._state.get(key_id)
+    async def fetch_quota(self, channel_id: str, key_id: str) -> dict | None:
+        """获取指定渠道账号额度信息。"""
+        # 修改原因：同一 key_id 可能存在于多个渠道，quota 查询必须只读取当前渠道下的凭据。
+        # 修改方式：先从 channel_id 对应账号表查缓存；缓存不存在时，再通过 provider 主动查询并写回同渠道缓存。
+        # 目的：减少上游额度探测请求，同时避免跨渠道读取到同邮箱的错误 quota。
+        accounts = self._get_channel_accounts(channel_id)
+        cred = accounts.get(key_id)
         if not cred:
             return None
         cached = self._get_cached_quota(cred)
@@ -248,18 +376,19 @@ class OAuthManager:
             return None
         quota = await self._call_provider_method(provider.fetch_quota, cred)
         if isinstance(quota, dict):
-            self.update_quota(key_id, quota)
+            self.update_quota(channel_id, key_id, quota)
             return quota
         return None
 
-    def update_quota(self, key_id: str, quota_data: dict) -> bool:
+    def update_quota(self, channel_id: str, key_id: str, quota_data: dict) -> bool:
         """更新 OAuth 账号的 quota 内存缓存，并安排延迟落盘。"""
-        # 修改原因：Codex 响应 wrapper 会在普通请求完成时拿到最新 x-ratelimit-*，这些数据要回写到 OAuthManager state。
-        # 修改方式：只更新内存中的目标账号字段，使用 quota_raw 保存原始 header，并标记 generation 后调度 30 秒批量持久化。
-        # 目的：让被动采集的数据可被 /v1/oauth/accounts 和 /quota 读取，同时避免每次请求都写文件。
+        # 修改原因：Codex 响应 wrapper 会在普通请求完成时拿到最新 x-ratelimit-*，这些数据要回写到对应渠道的账号 state。
+        # 修改方式：按 channel_id/key_id 定位账号，只更新内存字段，使用 quota_raw 保存原始 header，并安排批量持久化。
+        # 目的：让被动采集数据不串到其他同名账号，同时避免每次请求都写文件。
         if not isinstance(quota_data, dict):
             return False
-        cred = self._state.get(key_id)
+        accounts = self._get_channel_accounts(channel_id)
+        cred = accounts.get(key_id)
         if not isinstance(cred, dict):
             return False
 
@@ -311,46 +440,78 @@ class OAuthManager:
         if self._quota_update_generation > generation:
             self._schedule_quota_persist()
 
-    async def register(self, key_id: str, type_name: str, token_data: dict):
-        """注册或覆盖一个 OAuth 账号。"""
-        # 修改原因：手动导入 refresh_token 后需要形成完整 oauth_state 条目。
-        # 修改方式：复制传入 token_data，补齐 type、状态和错误计数后持久化。
-        # 目的：避免路由层传入的原始 body 被原地修改，也让列表和解析逻辑获得统一字段。
+    async def register(self, channel_id: str, key_id: str, type_name: str, token_data: dict):
+        """注册或覆盖指定渠道下的 OAuth 账号。"""
+        # 修改原因：手动导入和 OAuth 登录都必须写入当前 provider name 下，不能再以邮箱为全局 key。
+        # 修改方式：复制传入 token_data，补齐 type、状态和错误计数后保存到 _state[channel_id][key_id]。
+        # 目的：避免同邮箱在不同渠道中冲突，也让列表和解析逻辑获得统一字段。
         saved = dict(token_data or {})
         saved["type"] = type_name
         saved["status"] = "active"
         saved["error_count"] = 0
-        self._state[key_id] = saved
+        accounts = self._get_channel_accounts(channel_id, create=True)
+        accounts[key_id] = saved
         await self._persist()
 
-    async def rename(self, old_key_id: str, new_key_id: str):
-        """重命名 OAuth 账号标识符。"""
-        # 修改原因：前端重命名 api_keys 中的 OAuth 标识符后，oauth_state.json 仍保留旧 key 会导致 access_token 解析失败。
-        # 修改方式：在内存 state 中把旧 key 的凭据迁移到新 key，同时迁移同账号刷新锁并重新持久化。
-        # 目的：让 api.yaml 中的新账号标识和 OAuth 运行时状态保持一致。
-        if old_key_id not in self._state:
+    async def rename(self, channel_id: str, old_key_id: str, new_key_id: str):
+        """重命名指定渠道内的 OAuth 账号标识符。"""
+        # 修改原因：前端重命名 OAuth 标识符时，只应影响当前渠道，不能移动其他渠道的同名邮箱。
+        # 修改方式：在 _state[channel_id] 内迁移 key，并把刷新锁从 channel:old_key 迁移到 channel:new_key。
+        # 目的：让 api.yaml 中的新账号标识和 OAuth 运行时状态在同一渠道内保持一致。
+        accounts = self._get_channel_accounts(channel_id)
+        if old_key_id not in accounts:
             raise ValueError(f"Account not found: {old_key_id}")
-        if new_key_id in self._state and new_key_id != old_key_id:
+        if new_key_id in accounts and new_key_id != old_key_id:
             raise ValueError(f"Account already exists: {new_key_id}")
-        cred = self._state.pop(old_key_id)
-        self._state[new_key_id] = cred
-        if old_key_id in self._locks:
-            self._locks[new_key_id] = self._locks.pop(old_key_id)
+        cred = accounts.pop(old_key_id)
+        accounts[new_key_id] = cred
+        old_lock_key = self._lock_key(channel_id, old_key_id)
+        new_lock_key = self._lock_key(channel_id, new_key_id)
+        if old_lock_key in self._locks:
+            self._locks[new_lock_key] = self._locks.pop(old_lock_key)
         await self._persist()
 
-    def list_accounts(self) -> dict:
-        """列出 OAuth 账号，并隐藏 token 明文。"""
-        # 修改原因：管理接口需要展示账号状态，但不能把 access_token 和 refresh_token 暴露给前端或日志。
-        # 修改方式：返回 state 的浅拷贝，并把敏感 token 字段替换为星号。
-        # 目的：降低凭据泄露风险，同时保留排查状态所需的非敏感字段。
+    def _copy_account(self, cred: dict, include_tokens: bool) -> dict:
+        """复制账号对象，并按调用场景决定是否脱敏 token。"""
+        # 修改原因：普通列表接口不能泄露 token，但导出接口必须返回 refresh_token 才能用于备份恢复。
+        # 修改方式：list_accounts 增加 include_tokens 开关；默认脱敏，导出端点显式打开。
+        # 目的：同时满足日常管理安全性和管理员显式导出凭证的需求。
+        copied = dict(cred)
+        if not include_tokens:
+            copied["access_token"] = "***"
+            copied["refresh_token"] = "***"
+        return copied
+
+    def list_accounts(self, channel_id: str | None = None, include_tokens: bool = False) -> dict:
+        """列出 OAuth 账号；默认隐藏 token 明文。"""
+        # 修改原因：账号列表需要支持“全部渠道”和“单渠道”两种形态，而前端编辑页只需要当前渠道下的扁平账号表。
+        # 修改方式：传 channel_id 时返回该渠道的 key_id->cred；不传时返回 channel_id->key_id->cred。
+        # 目的：兼容管理端全量查看，同时让新前端按 provider 查询时得到旧 UI 可直接使用的数据形状。
+        if channel_id is not None:
+            accounts = self._get_channel_accounts(channel_id)
+            return {
+                key_id: self._copy_account(cred, include_tokens)
+                for key_id, cred in accounts.items()
+                if isinstance(cred, dict)
+            }
         return {
-            k: {**v, "access_token": "***", "refresh_token": "***"}
-            for k, v in self._state.items()
+            channel: {
+                key_id: self._copy_account(cred, include_tokens)
+                for key_id, cred in accounts.items()
+                if isinstance(cred, dict)
+            }
+            for channel, accounts in self._state.items()
+            if isinstance(accounts, dict)
         }
 
-    async def remove(self, key_id: str):
-        """移除一个 OAuth 账号。"""
-        self._state.pop(key_id, None)
+    async def remove(self, channel_id: str, key_id: str):
+        """移除指定渠道下的 OAuth 账号。"""
+        # 修改原因：删除 OAuth 账号时同样需要限定渠道，避免删除其他渠道的同邮箱凭据。
+        # 修改方式：只从 _state[channel_id] 删除 key_id，并清理对应 channel:key 刷新锁。
+        # 目的：让前端删除 Key 与运行时凭据删除保持同一作用域。
+        accounts = self._get_channel_accounts(channel_id)
+        accounts.pop(key_id, None)
+        self._locks.pop(self._lock_key(channel_id, key_id), None)
         await self._persist()
 
     async def _persist(self):
@@ -387,8 +548,16 @@ class OAuthManager:
         except OSError:
             pass
 
-    def _get_lock(self, key_id: str):
-        """按账号创建刷新锁，防止并发刷新同一个 refresh_token。"""
-        if key_id not in self._locks:
-            self._locks[key_id] = asyncio.Lock()
-        return self._locks[key_id]
+    def _lock_key(self, channel_id: str | None, key_id: str) -> str:
+        """生成渠道级刷新锁 key。"""
+        # 修改原因：同邮箱可能存在于多个渠道，锁如果只按 key_id 会把不同渠道的刷新互相阻塞。
+        # 修改方式：锁 key 固定为 f"{channel_id}:{key_id}"，channel_id 先按状态访问规则规范化。
+        # 目的：保证同渠道同账号串行刷新，不同渠道账号互不影响。
+        return f"{self._normalize_channel_id(channel_id)}:{key_id}"
+
+    def _get_lock(self, channel_id: str, key_id: str):
+        """按渠道和账号创建刷新锁，防止并发刷新同一个 refresh_token。"""
+        lock_key = self._lock_key(channel_id, key_id)
+        if lock_key not in self._locks:
+            self._locks[lock_key] = asyncio.Lock()
+        return self._locks[lock_key]

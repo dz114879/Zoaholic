@@ -764,12 +764,18 @@ def _aggregate_oauth_balance_results(results: Dict[str, Dict[str, Any]]) -> Dict
 
 async def _query_oauth_channel_balance(app: Any, provider: Dict[str, Any]) -> Dict[str, Any]:
     """通过 OAuthManager 查询 OAuth 渠道账号额度。"""
-    # 修改原因：OAuth 渠道没有用户可配置的余额 endpoint，额度统一由 OAuthManager.fetch_quota 维护。
-    # 修改方式：遍历 provider.api 中的 key_id，逐个调用 fetch_quota，并把结果转换成 BalanceResult 后合并。
-    # 目的：让 /v1/channels/balance 成为普通渠道和 OAuth 渠道共同使用的后端入口。
+    # 修改原因：OAuth 渠道没有用户可配置的余额 endpoint，额度统一由 OAuthManager.fetch_quota 维护，且 state 已按 provider name 分层。
+    # 修改方式：遍历 provider.api 中的 key_id，并把 provider.provider 作为 channel_id 一起传给 fetch_quota。
+    # 目的：让 /v1/channels/balance 成为普通渠道和 OAuth 渠道共同使用的后端入口，同时避免同邮箱跨渠道串读。
+    channel_id = str(provider.get("provider") or "").strip()
     key_ids = _normalize_oauth_balance_key_ids(provider.get("api"))
     if not key_ids:
         return _aggregate_oauth_balance_results({})
+    if not channel_id:
+        return _aggregate_oauth_balance_results({
+            key_id: _oauth_quota_to_balance_result(None, "未配置 OAuth 渠道名")
+            for key_id in key_ids
+        })
 
     oauth_manager = getattr(getattr(app, "state", None), "oauth_manager", None)
     fetch_quota = getattr(oauth_manager, "fetch_quota", None)
@@ -781,7 +787,7 @@ async def _query_oauth_channel_balance(app: Any, provider: Dict[str, Any]) -> Di
 
     async def fetch_one(key_id: str) -> tuple[str, Dict[str, Any]]:
         try:
-            quota = await fetch_quota(key_id)
+            quota = await fetch_quota(channel_id, key_id)
             return key_id, _oauth_quota_to_balance_result(quota)
         except Exception as exc:
             logger.warning(f"OAuth balance query failed for {key_id}: {exc}")
@@ -820,6 +826,10 @@ async def query_channel_balance(
 
     # 构建 provider 配置
     provider = {
+        # 修改原因：OAuthManager.fetch_quota 新增 channel_id，余额查询路由需要保留前端传入的 provider name。
+        # 修改方式：在内部 provider 配置中加入 provider 字段，普通渠道不会使用该字段。
+        # 目的：让 OAuth 余额查询能按渠道名读取 oauth_state.json。
+        "provider": provider_config.get("provider") or provider_config.get("name") or "",
         "base_url": provider_config.get("base_url", ""),
         "api": provider_config.get("api_key") or provider_config.get("api") or "",
         "engine": engine,

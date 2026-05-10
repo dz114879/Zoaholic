@@ -101,11 +101,11 @@ def _parse_ratelimit_headers(headers) -> dict | None:
     return result if result else None
 
 
-def _get_quota_key_id_from_context() -> str | None:
-    """从当前请求上下文读取配置中的 OAuth key_id。"""
-    # 修改原因：OpenAI adapter 的响应函数签名没有 provider 或 key_id 参数，wrapper 只能通过请求上下文找回原始账号标识。
-    # 修改方式：复用 handler 已写入的 _used_api_key；若将来存在更明确的 _oauth_key_id，则优先读取它。
-    # 目的：被动采集额度时更新 oauth_state 的账号缓存，而不是误把 access_token 当作状态键。
+def _get_quota_context_from_request() -> tuple[str, str] | None:
+    """从当前请求上下文读取 OAuth 渠道名和原始 key_id。"""
+    # 修改原因：oauth_state.json 已按 provider name 分层，quota 回写只知道 key_id 会写错同邮箱的其他渠道。
+    # 修改方式：优先读取 handler 写入的 _oauth_channel_id，再读取 provider_id/provider；key_id 仍兼容 _oauth_key_id 和 _used_api_key。
+    # 目的：不把 access_token 当作账号 key，也不把 quota 写入错误渠道。
     try:
         from core.middleware import request_info
 
@@ -114,24 +114,28 @@ def _get_quota_key_id_from_context() -> str | None:
         return None
     if not isinstance(current_info, dict):
         return None
+    channel_id = current_info.get("_oauth_channel_id") or current_info.get("provider_id") or current_info.get("provider")
     key_id = current_info.get("_oauth_key_id") or current_info.get("_used_api_key")
-    return str(key_id) if key_id else None
+    if not channel_id or not key_id:
+        return None
+    return str(channel_id), str(key_id)
 
 
 def _store_quota_from_headers(headers) -> None:
     """把响应头中的 quota 数据写入 OAuthManager 内存缓存。"""
     # 修改原因：Codex 普通请求会自然带回 x-ratelimit-*，无需每次打开管理页都主动消耗一次请求额度。
-    # 修改方式：wrapper 捕获响应头后解析 quota，并调用 OAuthManager.update_quota 只写内存、延迟落盘。
-    # 目的：实现被动额度采集，同时避免每次请求同步写磁盘。
+    # 修改方式：wrapper 捕获响应头后解析 quota，并从请求上下文取 channel_id/key_id 调用 OAuthManager.update_quota。
+    # 目的：实现被动额度采集，同时避免每次请求同步写磁盘或写错同名账号渠道。
     quota = _parse_ratelimit_headers(headers)
     if not quota or _oauth_manager is None:
         return
-    key_id = _get_quota_key_id_from_context()
-    if not key_id:
+    quota_context = _get_quota_context_from_request()
+    if not quota_context:
         return
+    channel_id, key_id = quota_context
     updater = getattr(_oauth_manager, "update_quota", None)
     if callable(updater):
-        updater(key_id, quota)
+        updater(channel_id, key_id, quota)
 
 
 class _QuotaCapturingStreamContext:

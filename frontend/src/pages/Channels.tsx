@@ -9,7 +9,7 @@ import {
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Files, Play,
   Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical, ChevronUp, ChevronDown,
-  ClipboardPaste, LogIn
+  ClipboardPaste, LogIn, Download
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -628,7 +628,7 @@ export default function Channels() {
   // 修改原因：manual OAuth 模式需要在弹窗登录后接收用户复制的 localhost 回调完整 URL。
   // 修改方式：保存当前 Key 行下标、state、用户粘贴的 URL 和交换中的提交状态。
   // 目的：替代旧的跨窗口 location 轮询和 prompt 降级，避免 COOP 或跨域策略导致登录不可用。
-  const [oauthManualState, setOauthManualState] = useState<{ idx: number; state: string } | null>(null);
+  const [oauthManualState, setOauthManualState] = useState<{ idx: number; state: string; provider: string } | null>(null);
   const [manualUrl, setManualUrl] = useState('');
   const [exchanging, setExchanging] = useState(false);
   // 修改原因：OAuth 导入和手动回调弹窗通过 document.body portal 渲染，仍会被编辑抽屉的 Radix Dialog 焦点锁拉回。
@@ -841,11 +841,16 @@ export default function Channels() {
   }, [isModalOpen]);
 
   const refreshOAuthAccounts = useCallback(async () => {
-    // 修改原因：OAuth 账号列表既要在打开编辑面板时加载，也要在浏览器登录成功后刷新。
-    // 修改方式：把 /v1/oauth/accounts 请求封装为 useCallback 函数，成功时写入 oauthAccounts，失败时清空。
-    // 目的：避免登录回调和 useEffect 各自维护一份拉取逻辑，降低账号状态不同步风险。
+    // 修改原因：OAuth 账号列表既要在打开编辑面板时加载，也要在浏览器登录成功后刷新，且后端 state 已按 provider name 分层。
+    // 修改方式：把 /v1/oauth/accounts?provider=当前渠道名 请求封装为 useCallback 函数，成功时写入 oauthAccounts，失败时清空。
+    // 目的：避免加载其他渠道的同邮箱账号，降低账号状态不同步和跨渠道误展示风险。
+    const providerName = (formData?.provider || '').trim();
+    if (!providerName) {
+      setOauthAccounts({});
+      return;
+    }
     try {
-      const res = await apiFetch('/v1/oauth/accounts', { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/v1/oauth/accounts?provider=${encodeURIComponent(providerName)}`, { headers: { Authorization: `Bearer ${token}` } });
       if (!res.ok) {
         setOauthAccounts({});
         return;
@@ -855,7 +860,7 @@ export default function Channels() {
     } catch {
       setOauthAccounts({});
     }
-  }, [token]);
+  }, [token, formData?.provider]);
 
   // ── 打开 OAuth 编辑面板时同步账号状态 ──
   useEffect(() => {
@@ -874,6 +879,8 @@ export default function Channels() {
     // 修改方式：对已连接且尚无 quota 的账号逐个调用 /quota，并用 _quota_loading 或 _quota_unavailable 避免重复请求。
     // 目的：让 Key 行打开后异步显示双弧配额，同时不造成无限渲染循环。
     if (!isModalOpen || !isOAuthEngine) return;
+    const providerName = (formData?.provider || '').trim();
+    if (!providerName) return;
     const targets = Object.entries(oauthAccounts).filter(([, account]) => (
       account?.status === 'active'
       && account.quota_5h == null
@@ -885,7 +892,7 @@ export default function Channels() {
 
     targets.forEach(([keyId]) => {
       setOauthAccounts(prev => prev[keyId] ? { ...prev, [keyId]: { ...prev[keyId], _quota_loading: true } } : prev);
-      apiFetch(`/v1/oauth/accounts/${encodeURIComponent(keyId)}/quota`, { headers: { Authorization: `Bearer ${token}` } })
+      apiFetch(`/v1/oauth/accounts/${encodeURIComponent(keyId)}/quota?provider=${encodeURIComponent(providerName)}`, { headers: { Authorization: `Bearer ${token}` } })
         .then(async res => (res.ok ? await res.json() : null))
         .then(quota => {
           setOauthAccounts(prev => {
@@ -910,7 +917,7 @@ export default function Channels() {
           });
         });
     });
-  }, [isModalOpen, isOAuthEngine, oauthAccounts, token]);
+  }, [isModalOpen, isOAuthEngine, oauthAccounts, token, formData?.provider]);
 
   const openModal = async (provider: any = null, index: number | null = null) => {
     setOriginalIndex(index);
@@ -1149,6 +1156,10 @@ export default function Channels() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
             body: JSON.stringify({
+              // 修改原因：OAuth 余额查询后端需要 provider name 作为 channel_id 定位分层 oauth_state。
+              // 修改方式：余额请求随当前表单渠道名一起提交，普通渠道会忽略该字段。
+              // 目的：避免同邮箱账号在不同 OAuth 渠道之间串读 quota。
+              provider: formData.provider,
               engine: formData.engine,
               base_url: formData.base_url,
               api_key: keyObj.key,
@@ -1217,13 +1228,14 @@ export default function Channels() {
     const oldValue = (oauthKeyFocusSnapshotRef.current[idx] || '').trim();
     delete oauthKeyFocusSnapshotRef.current[idx];
     const nextValue = newValue.trim();
-    if (!isOAuthEngine || !oldValue || !nextValue || oldValue === nextValue || !oauthAccounts[oldValue]) return;
+    const providerName = (formData?.provider || '').trim();
+    if (!isOAuthEngine || !providerName || !oldValue || !nextValue || oldValue === nextValue || !oauthAccounts[oldValue]) return;
 
     try {
       const res = await apiFetch(`/v1/oauth/accounts/${encodeURIComponent(oldValue)}/rename`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ new_key_id: nextValue }),
+        body: JSON.stringify({ provider: providerName, new_key_id: nextValue }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -1259,10 +1271,18 @@ export default function Channels() {
     setImporting(true);
     try {
       const keyId = `account_${Date.now()}`;
+      const providerName = formData.provider.trim();
+      if (!providerName) {
+        toastError('渠道名为空，无法导入 OAuth 凭证');
+        return;
+      }
       const res = await apiFetch('/v1/oauth/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ key_id: keyId, type: formData.engine, refresh_token: importToken.trim() }),
+        // 修改原因：后端 OAuth 导入已按 provider name 分层保存，body 必须携带当前渠道名。
+        // 修改方式：在原 key_id/type/refresh_token 外增加 provider 字段。
+        // 目的：导入同邮箱账号时只写入当前 OAuth 渠道。
+        body: JSON.stringify({ provider: providerName, key_id: keyId, type: formData.engine, refresh_token: importToken.trim() }),
       });
       if (res.ok) {
         const data = await res.json();
@@ -1284,8 +1304,13 @@ export default function Channels() {
     // 修改方式：authorize 成功后读取 mode；manual 显示粘贴弹窗，auto 监听 callback 成功页的 postMessage。
     // 目的：同时支持 Codex 固定 localhost 回调和 Antigravity/Gemini CLI 等可自定义回调的 OAuth provider。
     if (!formData) return;
+    const providerName = formData.provider.trim();
+    if (!providerName) {
+      toastError('渠道名为空，无法发起 OAuth 登录');
+      return;
+    }
     try {
-      const res = await apiFetch(`/v1/oauth/authorize?type=${encodeURIComponent(formData.engine)}&origin=${encodeURIComponent(window.location.origin)}`, {
+      const res = await apiFetch(`/v1/oauth/authorize?type=${encodeURIComponent(formData.engine)}&provider=${encodeURIComponent(providerName)}&origin=${encodeURIComponent(window.location.origin)}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
@@ -1304,7 +1329,7 @@ export default function Channels() {
         // 修改原因：manual 模式的 provider 会跳转到 localhost 失败页，前端无法依赖跨窗口读取地址栏。
         // 修改方式：打开授权窗口后记录本次 state，并显示独立粘贴弹窗让用户提交完整回调 URL。
         // 目的：让 Codex 这类固定 localhost 回调的 OAuth 登录稳定完成 token 交换。
-        setOauthManualState({ idx, state });
+        setOauthManualState({ idx, state, provider: providerName });
         setManualUrl('');
         return;
       }
@@ -1315,6 +1340,7 @@ export default function Channels() {
         // 目的：避免其他窗口消息误触发当前 Key 行更新。
         if (event.data?.type !== 'oauth_callback_success') return;
         if (event.data?.state && event.data.state !== state) return;
+        if (event.data?.provider && event.data.provider !== providerName) return;
         window.removeEventListener('message', handler);
         const keyId = event.data.key_id;
         if (keyId) {
@@ -1359,7 +1385,10 @@ export default function Channels() {
       const res = await apiFetch('/v1/oauth/exchange', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ code, state: oauthManualState.state }),
+        // 修改原因：manual exchange 发生在 authorize 之后，后端需要 provider 验证 state 属于当前渠道。
+        // 修改方式：oauthManualState 保存发起登录时的 provider，并随 code/state 一起提交。
+        // 目的：避免用户粘贴其他渠道的回调 URL 后写入错误 OAuth state 分组。
+        body: JSON.stringify({ provider: oauthManualState.provider, code, state: oauthManualState.state }),
       });
       if (res.ok) {
         const data = await res.json();
@@ -1385,8 +1414,34 @@ export default function Channels() {
     updateFormData('api_keys', newKeys);
   };
 
-  const deleteKey = (idx: number) => {
+  const deleteKey = async (idx: number) => {
     if (!formData) return;
+    const keyValue = (formData.api_keys[idx]?.key || '').trim();
+    const providerName = formData.provider.trim();
+    if (isOAuthEngine && keyValue && providerName && oauthAccounts[keyValue]) {
+      try {
+        // 修改原因：OAuth Key 删除不只要移出 api.yaml 表单，还要清理当前渠道下的 oauth_state 凭据。
+        // 修改方式：删除表单行前调用 DELETE /v1/oauth/accounts/{key}?provider=当前渠道名，失败则保留表单行。
+        // 目的：避免保存渠道后残留无用 refresh_token，也避免删除其他渠道同邮箱凭据。
+        const res = await apiFetch(`/v1/oauth/accounts/${encodeURIComponent(keyValue)}?provider=${encodeURIComponent(providerName)}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          toastError(fmtErr(err, res.status), 'OAuth 账号删除失败');
+          return;
+        }
+        setOauthAccounts(prev => {
+          const next = { ...prev };
+          delete next[keyValue];
+          return next;
+        });
+      } catch (err: any) {
+        toastError(err?.message || '网络错误', 'OAuth 账号删除失败');
+        return;
+      }
+    }
     updateFormData('api_keys', formData.api_keys.filter((_, i) => i !== idx));
   };
 
@@ -1412,6 +1467,41 @@ export default function Channels() {
     if (!activeKeys.length) return;
     navigator.clipboard.writeText(activeKeys.join('\n'));
     toastSuccess('已复制所有有效密钥');
+  };
+
+  const exportOAuthCredentials = async () => {
+    if (!formData) return;
+    const providerName = formData.provider.trim();
+    if (!providerName) {
+      toastError('渠道名为空，无法导出 OAuth 凭证');
+      return;
+    }
+    try {
+      // 修改原因：OAuth 凭据导出是显式备份操作，后端要求 provider query 来限定导出范围。
+      // 修改方式：调用 /v1/oauth/export?provider=当前渠道名，拿到 JSON 后生成本地下载文件。
+      // 目的：让管理员可迁移指定渠道的 refresh_token，同时不把其他渠道凭据混入导出文件。
+      const res = await apiFetch(`/v1/oauth/export?provider=${encodeURIComponent(providerName)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '导出失败');
+        return;
+      }
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `oauth-${providerName.replace(/[^a-zA-Z0-9._-]+/g, '_')}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toastSuccess('OAuth 凭证导出已开始');
+    } catch (err: any) {
+      toastError(err?.message || '网络错误', '导出失败');
+    }
   };
 
   const clearAllKeys = () => {
@@ -4242,6 +4332,20 @@ export default function Channels() {
                     })}
                     {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥</div>}
                   </div>
+                  {isOAuthEngine && (
+                    <div className="mt-2 flex justify-end">
+                      {/* 修改原因：OAuth 凭据需要一个管理员显式导出入口，用于迁移或备份当前渠道。 */}
+                      {/* 修改方式：在 OAuth Key 列表底部增加小按钮，点击后下载 /v1/oauth/export 返回的 JSON。 */}
+                      {/* 目的：避免在普通账号列表中暴露 refresh_token，同时保留受控导出能力。 */}
+                      <button
+                        type="button"
+                        onClick={exportOAuthCredentials}
+                        className="text-xs text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 flex items-center gap-1"
+                      >
+                        <Download className="w-3 h-3" /> 导出全部凭证
+                      </button>
+                    </div>
+                  )}
                 </section>}
 
                 {/* 3. 模型配置 */}

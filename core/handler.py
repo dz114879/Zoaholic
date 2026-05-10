@@ -52,14 +52,14 @@ def set_debug_mode(debug: bool):
     is_debug = debug
 
 
-async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str]) -> Optional[str]:
-    """把 OAuth key_id 解析成 access_token，静态 key 原样返回。"""
-    # 修改原因：api.yaml 中的 OAuth 账号只保存 key_id，不能把 access_token 放进 provider.api。
-    # 修改方式：若 app.state.oauth_manager 存在且能解析该 key_id，则返回 access_token，否则返回原 key。
-    # 目的：保持静态 key 向后兼容，并让日志、冷却、统计继续使用原始 key_id。
-    if not api_key or app is None or not hasattr(app, "state") or not hasattr(app.state, "oauth_manager"):
+async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str], channel_id: Optional[str] = None) -> Optional[str]:
+    """把指定渠道下的 OAuth key_id 解析成 access_token，静态 key 原样返回。"""
+    # 修改原因：oauth_state.json 已按 provider name 分层，同一个 key_id 可能在多个渠道中存在不同凭据。
+    # 修改方式：解析时要求调用方传入当前 provider['provider']，只在对应渠道下查找 key_id。
+    # 目的：保持静态 key 向后兼容，同时避免 OAuth access_token 被跨渠道误解析。
+    if not api_key or not channel_id or app is None or not hasattr(app, "state") or not hasattr(app.state, "oauth_manager"):
         return api_key
-    resolved = await app.state.oauth_manager.resolve(api_key)
+    resolved = await app.state.oauth_manager.resolve(channel_id, api_key)
     if resolved is not None:
         return resolved
     return api_key
@@ -203,6 +203,7 @@ async def process_request(
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     
+    channel_id = f"{provider['provider']}"
     if force_api_key:
         api_key = force_api_key
     elif is_local_api_key(provider['provider']):
@@ -217,14 +218,17 @@ async def process_request(
     # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
     current_info_early = request_info_getter()
     current_info_early["_used_api_key"] = original_api_key
-    api_key = await _resolve_oauth_api_key(app, api_key)
+    # 修改原因：OAuth 凭据现在按 provider name 分层，响应 wrapper 的被动 quota 采集也需要知道当前渠道。
+    # 修改方式：在请求早期写入 _oauth_channel_id，并把同一 channel_id 传给 OAuthManager.resolve。
+    # 目的：让 access_token 解析和 quota 回写都只作用于当前渠道。
+    current_info_early["_oauth_channel_id"] = channel_id
+    api_key = await _resolve_oauth_api_key(app, api_key, channel_id=channel_id)
 
     engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
 
     if stream_override is not None:
         request.stream = stream_override
 
-    channel_id = f"{provider['provider']}"
     # 记录 provider 活跃度（内存级，O(1)）
     try:
         from routes.stats import record_provider_activity
@@ -641,6 +645,7 @@ async def process_request_passthrough(
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
 
+    channel_id = f"{provider['provider']}"
     if is_local_api_key(provider["provider"]):
         api_key = provider["provider"]
     elif provider.get("api"):
@@ -653,7 +658,11 @@ async def process_request_passthrough(
     # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
     current_info_early = request_info_getter()
     current_info_early["_used_api_key"] = original_api_key
-    api_key = await _resolve_oauth_api_key(app, api_key)
+    # 修改原因：透传路径同样可能命中 OAuth 渠道，且 Codex 被动 quota 采集发生在响应读取阶段。
+    # 修改方式：在透传请求早期保存 _oauth_channel_id，并按当前 provider name 解析 OAuth key_id。
+    # 目的：避免透传请求从其他渠道读取同名账号凭据。
+    current_info_early["_oauth_channel_id"] = channel_id
+    api_key = await _resolve_oauth_api_key(app, api_key, channel_id=channel_id)
 
     engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
     if stream_override is not None:
@@ -728,7 +737,6 @@ async def process_request_passthrough(
         pass
 
     current_info = request_info_getter()
-    channel_id = f"{provider['provider']}"
     current_info["dialect_id"] = passthrough_ctx.dialect_id
 
     if current_info.get("raw_data_expires_at"):
