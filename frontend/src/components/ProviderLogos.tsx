@@ -14,10 +14,10 @@ export const ProviderLogo = ({ name, engine, baseUrl }: { name: string; engine?:
   // 修改方式：在组件顶层用 React.useId 生成实例级后缀，并清理掉不适合 SVG 片段引用的字符。
   // 目的：确保每个 Bedrock 图标的 path 只引用同一个 SVG 实例内的 linearGradient。
   const bedrockGradientId = `bedrock-grad-${React.useId().replace(/[^A-Za-z0-9_-]/g, '')}`;
+  const codexGradId = `codex-grad-${React.useId().replace(/[^A-Za-z0-9_-]/g, '')}`;
 
   // Codex (OpenAI OAuth)
   if (eName === 'codex' || lName.includes('codex')) {
-    const codexGradId = `codex-grad-${React.useId().replace(/[^A-Za-z0-9_-]/g, '')}`;
     return (
       <IconWrapper bgClass="bg-indigo-500/10 dark:bg-indigo-500/20" textClass="">
         <svg viewBox="0 0 24 24" className="w-5 h-5" xmlns="http://www.w3.org/2000/svg">
