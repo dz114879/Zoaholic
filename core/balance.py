@@ -164,6 +164,29 @@ def resolve_balance_endpoint(base_url: str, endpoint: str) -> str:
         return f"{clean_base}/{endpoint}"
 
 
+
+# base_url 域名 → 模板自动匹配（用户没配 balance 时生效）
+_URL_TEMPLATE_MAP: list[tuple[str, str]] = [
+    ("deepseek.com", "deepseek"),
+    ("deepseek.ai", "deepseek"),
+    ("moonshot.cn", "kimi"),
+    ("kimi.com", "kimi-plan"),
+    ("siliconflow.cn", "siliconflow"),
+    ("siliconcloud.cn", "siliconflow"),
+    ("openrouter.ai", "openrouter"),
+]
+
+
+def _auto_detect_template(base_url: str) -> Optional[str]:
+    """根据 base_url 域名自动匹配余额查询模板。"""
+    if not base_url:
+        return None
+    url_lower = base_url.lower()
+    for domain, template_name in _URL_TEMPLATE_MAP:
+        if domain in url_lower:
+            return template_name
+    return None
+
 def build_balance_config(provider: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """从 provider 配置中解析余额查询配置。
 
@@ -176,6 +199,11 @@ def build_balance_config(provider: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     balance_cfg = prefs.get("balance")
     if not balance_cfg or not isinstance(balance_cfg, dict):
+        # 用户没配 balance → 尝试根据 base_url 自动匹配模板
+        auto_template = _auto_detect_template(provider.get("base_url", ""))
+        if auto_template and auto_template in BALANCE_TEMPLATES:
+            import copy
+            return copy.deepcopy(BALANCE_TEMPLATES[auto_template])
         return None
 
     # 加载模板作为基础
