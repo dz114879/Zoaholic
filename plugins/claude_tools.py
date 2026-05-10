@@ -137,7 +137,7 @@ def is_claude_engine(engine: str) -> bool:
     if not isinstance(engine, str):
         return False
 
-    claude_engines = {"claude", "anthropic", "vertex-claude", "aws"}
+    claude_engines = {"claude", "anthropic", "vertex-claude", "aws", "claude-code"}
     return engine.lower() in claude_engines
 
 
