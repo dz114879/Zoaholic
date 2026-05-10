@@ -418,20 +418,25 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         payload.pop("tool_choice", None)
 
     if "think" in request.model.lower():
-        payload["thinking"] = {
-            "budget_tokens": 4096,
-            "type": "enabled"
-        }
+        # Claude 3.x 用 enabled + budget_tokens，4.x+ 用 adaptive + effort
+        if "claude-3" in original_model.lower():
+            payload["thinking"] = {
+                "budget_tokens": 4096,
+                "type": "enabled"
+            }
+            if request.model.split("-")[-1].isdigit():
+                think_tokens = int(request.model.split("-")[-1])
+                if think_tokens < max_tokens:
+                    payload["thinking"] = {
+                        "budget_tokens": think_tokens,
+                        "type": "enabled"
+                    }
+        else:
+            payload["thinking"] = {"type": "adaptive"}
+            payload.setdefault("output_config", {})["effort"] = "max"
         payload["temperature"] = 1
         payload.pop("top_p", None)
         payload.pop("top_k", None)
-        if request.model.split("-")[-1].isdigit():
-            think_tokens = int(request.model.split("-")[-1])
-            if think_tokens < max_tokens:
-                payload["thinking"] = {
-                    "budget_tokens": think_tokens,
-                    "type": "enabled"
-                }
 
     if request.thinking:
         thinking_config = {}
