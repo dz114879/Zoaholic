@@ -4114,7 +4114,7 @@ export default function Channels() {
                       <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
                     </div>
                   </div>
-                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1" onClick={e => { if (e.target === e.currentTarget) setFocusedKeyIdx(null); }}>
                     {formData.api_keys.map((keyObj, idx) => {
                       const providerName = formData.provider;
                       const rtDisabled = runtimeKeyStatus[providerName]?.auto_disabled || [];
