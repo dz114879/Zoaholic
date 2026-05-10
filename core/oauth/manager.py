@@ -382,18 +382,16 @@ class OAuthManager:
             result["extra_usage_utilization"] = cred.get("extra_usage_utilization")
         return result if result else None
 
-    async def fetch_quota(self, channel_id: str, key_id: str) -> dict | None:
-        """获取指定渠道账号额度信息。"""
-        # 修改原因：同一 key_id 可能存在于多个渠道，quota 查询必须只读取当前渠道下的凭据。
-        # 修改方式：先从 channel_id 对应账号表查缓存；缓存不存在时，再通过 provider 主动查询并写回同渠道缓存。
-        # 目的：减少上游额度探测请求，同时避免跨渠道读取到同邮箱的错误 quota。
+    async def fetch_quota(self, channel_id: str, key_id: str, force: bool = False) -> dict | None:
+        """获取指定渠道账号额度信息。force=True 时跳过缓存强制查上游。"""
         accounts = self._get_channel_accounts(channel_id)
         cred = accounts.get(key_id)
         if not cred:
             return None
-        cached = self._get_cached_quota(cred)
-        if cached:
-            return cached
+        if not force:
+            cached = self._get_cached_quota(cred)
+            if cached:
+                return cached
         provider = self._providers.get(cred.get("type"))
         if not provider or not hasattr(provider, "fetch_quota"):
             return None

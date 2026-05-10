@@ -796,7 +796,7 @@ async def _query_oauth_channel_balance(app: Any, provider: Dict[str, Any]) -> Di
 
     async def fetch_one(key_id: str) -> tuple[str, Dict[str, Any]]:
         try:
-            quota = await fetch_quota(channel_id, key_id)
+            quota = await fetch_quota(channel_id, key_id, force=True)
             return key_id, _oauth_quota_to_balance_result(quota)
         except Exception as exc:
             logger.warning(f"OAuth balance query failed for {key_id}: {exc}")
