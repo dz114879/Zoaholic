@@ -282,7 +282,7 @@ function serializeChannelPreferences(preferences: Record<string, any>): Record<s
 // ── 余额类型 ──
 interface BalanceResult {
   supported: boolean;
-  value_type?: 'amount' | 'percent';
+  value_type?: 'amount' | 'percent' | 'quota';
   total?: number | null;
   used?: number | null;
   available?: number | null;
@@ -308,9 +308,8 @@ interface OAuthQuota {
 function getBalancePercent(b: BalanceResult): number | null {
   if (!b.supported || b.error) return null;
   if (b.value_type === 'percent' && b.percent != null) return b.percent;
+  if (b.value_type === 'quota' && b.available != null) return Math.min(b.available, 100);
   if (b.total != null && b.total > 0 && b.available != null) return (b.available / b.total) * 100;
-  // 纯额度模式：以 100 为基准，≥100 就是满绿
-  if (b.available != null) return Math.min(b.available, 100);
   return null;
 }
 
@@ -5246,6 +5245,7 @@ export default function Channels() {
                                   >
                                     <option value="amount">数额（total / used / available）</option>
                                     <option value="percent">百分比（percent）</option>
+                                    <option value="quota">纯额度（以 100 为基准显示颜色）</option>
                                   </select>
                                 </div>
                                 <div>

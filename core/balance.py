@@ -56,7 +56,7 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "mapping": {
             "available": "balance_infos.0.total_balance",
             "currency": "balance_infos.0.currency",
-            "value_type": "'amount'",
+            "value_type": "'quota'",
         },
     },
     "kimi-plan": {
@@ -368,6 +368,10 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
         if raw_percent is not None:
             multiplier = _to_float(balance_cfg.get("percent_multiplier")) or 1
             result["percent"] = raw_percent * multiplier
+    elif value_type == "quota":
+        # 纯额度模式：只有 available，以 100 为基准算百分比色彩
+        result["available"] = _to_float(extract_value(raw_data, mapping.get("available")))
+        result["currency"] = extract_value(raw_data, mapping.get("currency"))
     else:
         result["total"] = _to_float(extract_value(raw_data, mapping.get("total")))
         result["used"] = _to_float(extract_value(raw_data, mapping.get("used")))
