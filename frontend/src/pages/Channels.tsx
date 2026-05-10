@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useCallback, useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
@@ -45,6 +45,99 @@ function DeferredInput({ value, onCommit, ...props }: Omit<React.InputHTMLAttrib
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { if (ref.current !== document.activeElement) setLocal(value); }, [value]);
   return <input ref={ref} {...props} type="text" value={local} onChange={e => setLocal(e.target.value)} onBlur={() => onCommit(local)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); onCommit(local); (e.target as HTMLInputElement).blur(); } }} />;
+}
+
+// 修改原因：Key 备注遮罩原先使用固定 30% 宽度，短备注会浪费输入空间，长备注又会显示不全。
+// 修改方式：把备注覆盖层和 Key 输入层封装到独立组件中，用 ref 与 useLayoutEffect 测量真实渲染宽度，并直接写入 DOM mask 样式，避免通过 state 触发重绘闪烁。
+// 目的：让 Key 输入内容的透明区域随备注文字宽度变化，同时保留右侧标签渐隐和无备注时的旧 60% 标签遮罩。
+function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?: string; hasTag: boolean; isFocused: boolean; children: React.ReactNode }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const keyInputMaskRef = useRef<HTMLDivElement | null>(null);
+  const labelSpanRef = useRef<HTMLSpanElement | null>(null);
+
+  const setMaskImage = useCallback((el: HTMLElement, mask: string) => {
+    el.style.maskImage = mask;
+    el.style.setProperty('-webkit-mask-image', mask);
+  }, []);
+
+  const clearMaskImage = useCallback((el: HTMLElement) => {
+    el.style.maskImage = '';
+    el.style.removeProperty('-webkit-mask-image');
+  }, []);
+
+  const applyMasks = useCallback(() => {
+    const keyInputMaskEl = keyInputMaskRef.current;
+    if (!keyInputMaskEl) return;
+
+    if (isFocused) {
+      clearMaskImage(keyInputMaskEl);
+      if (labelSpanRef.current) clearMaskImage(labelSpanRef.current);
+      return;
+    }
+
+    const labelSpanEl = labelSpanRef.current;
+    const containerEl = containerRef.current;
+    if (label && labelSpanEl && containerEl && containerEl.clientWidth > 0) {
+      const labelWidth = labelSpanEl.scrollWidth;
+      const containerWidth = containerEl.clientWidth;
+      const labelPct = Math.min(85, (labelWidth / containerWidth) * 100 + 5);
+      const keyMask = hasTag
+        ? `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black ${Math.max(60, labelPct)}%, transparent 100%)`
+        : `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black 100%)`;
+      const labelMask = `linear-gradient(to right, black 0%, black ${labelPct - 5}%, transparent ${labelPct + 5}%)`;
+
+      setMaskImage(keyInputMaskEl, keyMask);
+      setMaskImage(labelSpanEl, labelMask);
+      return;
+    }
+
+    if (labelSpanEl) clearMaskImage(labelSpanEl);
+    if (hasTag) {
+      setMaskImage(keyInputMaskEl, 'linear-gradient(to right, black 0%, black 60%, transparent 100%)');
+    } else {
+      clearMaskImage(keyInputMaskEl);
+    }
+  }, [clearMaskImage, hasTag, isFocused, label, setMaskImage]);
+
+  useLayoutEffect(() => {
+    applyMasks();
+
+    const containerEl = containerRef.current;
+    if (!containerEl || typeof ResizeObserver === 'undefined') return;
+
+    const resizeObserver = new ResizeObserver(() => applyMasks());
+    resizeObserver.observe(containerEl);
+    if (labelSpanRef.current) resizeObserver.observe(labelSpanRef.current);
+
+    return () => resizeObserver.disconnect();
+  }, [applyMasks]);
+
+  const bindLabelSpan = useCallback((el: HTMLSpanElement | null) => {
+    labelSpanRef.current = el;
+    applyMasks();
+  }, [applyMasks]);
+
+  const bindKeyInputMask = useCallback((el: HTMLDivElement | null) => {
+    keyInputMaskRef.current = el;
+    applyMasks();
+  }, [applyMasks]);
+
+  return (
+    <div ref={containerRef} className="flex-1 min-w-0 relative z-[2]">
+      {label && !isFocused && (
+        <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none">
+          <span
+            ref={bindLabelSpan}
+            className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap"
+          >
+            {label}
+          </span>
+        </div>
+      )}
+
+      <div ref={bindKeyInputMask}>{children}</div>
+    </div>
+  );
 }
 
 // ========== Types ==========
@@ -4078,40 +4171,21 @@ export default function Channels() {
                           )}
                           <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
 
-                          <div className="flex-1 min-w-0 relative z-[2]">
-                            {/* 修改原因：Key 备注原先字号更小且不在输入框内部，导致备注与 Key 文本高度、基线和色相区分都不稳定。
-                                修改方式：把备注移动为输入框内的绝对覆盖层，并让备注与 input 同用 text-sm、leading-5、font-mono，同时改用琥珀色系和右侧透明渐变。
-                                目的：让备注与 Key 文本保持同高同基线，并通过暖色和渐变遮罩自然区分备注与底层 Key。 */}
-                            {keyObj.label && !isFocused && (
-                              <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none">
-                                <span className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap"
-                                  style={{ maskImage: 'linear-gradient(to right, black 0%, black 75%, transparent 95%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 75%, transparent 95%)' }}
-                                >
-                                  {keyObj.label}
-                                </span>
-                              </div>
-                            )}
-
-                            <div style={(() => {
-                              if (isFocused) return undefined;
-                              const hasLabel = !!keyObj.label;
-                              if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 40%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 40%, black 60%, transparent 100%)' };
-                              if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 45%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 45%, black 100%)' };
-                              if (hasTag) return { maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' };
-                              return undefined;
-                            })()}>
-                              <input
-                                type="text"
-                                value={keyObj.key}
-                                onChange={e => updateKey(idx, e.target.value)}
-                                onPaste={e => handleKeyPaste(e, idx)}
-                                onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
-                                onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
-                                placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
-                                className={`w-full bg-transparent border-none text-sm leading-5 font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
-                              />
-                            </div>
-                          </div>
+                          {/* 修改原因：Key 备注遮罩需要按备注真实渲染宽度计算，不能继续使用固定 30% 宽度。
+                              修改方式：把备注覆盖层和输入框交给 KeyLabelOverlay 统一处理，由组件测量 label 后直接写入两个 mask。
+                              目的：短备注少占输入空间，长备注尽量完整显示，并保持右侧标签渐隐逻辑。 */}
+                          <KeyLabelOverlay label={keyObj.label} hasTag={hasTag} isFocused={isFocused}>
+                            <input
+                              type="text"
+                              value={keyObj.key}
+                              onChange={e => updateKey(idx, e.target.value)}
+                              onPaste={e => handleKeyPaste(e, idx)}
+                              onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
+                              onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
+                              placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
+                              className={`w-full bg-transparent border-none text-sm leading-5 font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
+                            />
+                          </KeyLabelOverlay>
                           {isOAuthEngine && !keyObj.key && (
                             <>
                               {/* 修改原因：OAuth 新增空行需要把账号导入和后续浏览器登录入口放在输入框右侧。 */}
