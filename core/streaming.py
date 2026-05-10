@@ -111,7 +111,6 @@ class LoggingStreamingResponse(Response):
                     and self.current_info.get("completion_tokens", 0) == 0
                     and self.current_info.get("success")
                     and self.app
-                    and not self.current_info.get("dialect_id")  # 透传请求不解析 usage，跳过误判
                 ):
                     # 标记为 "假200" — 流建立但无有效输出
                     self.current_info["status_code"] = 502
@@ -292,6 +291,19 @@ class LoggingStreamingResponse(Response):
                 self.current_info["response_body"] = await asyncio.to_thread(truncate_for_logging, response_body)
             except Exception as e:
                 logger.error(f"Error saving response body: {str(e)}")
+
+        # 非 SSE 响应（如 Gemini 非流式透传）的 usage 提取：
+        # _try_parse_line 只能解析 SSE 格式（按行 data: {json}），
+        # 纯 JSON 响应按行切分后每行都不是完整 JSON，导致 usage 漏采。
+        # 流结束后如果 completion_tokens 仍为 0，尝试把完整响应体当 JSON 解析。
+        if self.current_info.get("completion_tokens", 0) == 0 and response_chunks:
+            try:
+                full_body = b"".join(response_chunks).decode("utf-8", errors="replace")
+                full_resp = json.loads(full_body)
+                if isinstance(full_resp, dict):
+                    self._try_extract_usage(full_resp)
+            except Exception:
+                pass
 
     async def close(self) -> None:
         if not self._closed:
