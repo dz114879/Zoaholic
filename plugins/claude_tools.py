@@ -62,8 +62,10 @@ SUPPORTED_SUFFIXES = {
 # 默认的 thinking budget tokens
 DEFAULT_THINKING_BUDGET = 16384
 
-# thinking 后缀的正则（支持 -thinking 和 -thinking-N 格式）
-THINKING_PATTERN = re.compile(r"-thinking(?:-(\d+))?$", re.IGNORECASE)
+# thinking 后缀正则（支持 -thinking / -thinking-N / -thinking-{effort} 格式）
+# effort 级别: max, xhigh, high, medium, low
+THINKING_PATTERN = re.compile(r"-thinking(?:-(\d+|max|xhigh|high|medium|low))?$", re.IGNORECASE)
+_VALID_EFFORTS = {"max", "xhigh", "high", "medium", "low"}
 
 
 def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
@@ -95,8 +97,13 @@ def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
         thinking_match = THINKING_PATTERN.search(remaining)
         if thinking_match:
             enabled_features.add("thinking")
-            if thinking_match.group(1):
-                thinking_budget = int(thinking_match.group(1))
+            param = thinking_match.group(1)
+            if param and param.lower() in _VALID_EFFORTS:
+                # effort 级别名 — 存负数作为标记，apply 时识别
+                thinking_budget = -1  # 哨兵值，表示用 effort 名
+                enabled_features.add(f"effort:{param.lower()}")
+            elif param:
+                thinking_budget = int(param)
             else:
                 thinking_budget = DEFAULT_THINKING_BUDGET
             # 移除 thinking 后缀
@@ -159,8 +166,13 @@ def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int, model: st
     if not _needs_legacy_thinking(model):
         # Claude 4.x+ 统一用 adaptive + effort
         payload["thinking"] = {"type": "adaptive"}
-        # 默认 max effort，用户可通过 -thinking-N 后缀微调
+        # 从 features 里找 effort 级别，没有则默认 max
         effort = "max"
+        features = payload.pop("_thinking_features", None) or set()
+        for f in features:
+            if f.startswith("effort:"):
+                effort = f.split(":", 1)[1]
+                break
         payload.setdefault("output_config", {})["effort"] = effort
         logger.debug(f"[claude_tools] Applied adaptive thinking: effort={effort}")
     else:
@@ -303,6 +315,7 @@ async def claude_tools_request_interceptor(
 
     # 应用 thinking 配置（尊重用户 overrides —— payload 里已有 thinking 则跳过）
     if "thinking" in features and thinking_budget and "thinking" not in payload:
+        payload["_thinking_features"] = features  # 传 effort 级别给 apply_thinking_config
         apply_thinking_config(payload, thinking_budget, model=base_model)
 
     # 应用工具配置
