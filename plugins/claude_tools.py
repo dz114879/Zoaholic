@@ -134,33 +134,53 @@ def is_claude_engine(engine: str) -> bool:
     return engine.lower() in claude_engines
 
 
-def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int) -> None:
+# Opus 4.7+ 不支持 type: enabled，必须用 adaptive + effort
+_ADAPTIVE_ONLY_MODELS = {"claude-opus-4-7", "claude-mythos-preview"}
+
+
+def _needs_adaptive(model: str) -> bool:
+    """判断模型是否只支持 adaptive thinking"""
+    model_lower = model.lower() if model else ""
+    return any(m in model_lower for m in _ADAPTIVE_ONLY_MODELS)
+
+
+def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int, model: str = "") -> None:
     """
     应用 thinking 配置到 payload
 
-    Claude 原生 thinking 格式：
-    {
-        "thinking": {
-            "type": "enabled",
-            "budget_tokens": 10240
-        }
-    }
+    Opus 4.7+: thinking.type = "adaptive" + output_config.effort
+    其他模型: thinking.type = "enabled" + budget_tokens
 
     Args:
         payload: 请求 payload
         budget_tokens: thinking budget tokens
+        model: 模型名，用于判断用哪种格式
     """
-    payload["thinking"] = {
-        "type": "enabled",
-        "budget_tokens": budget_tokens
-    }
+    if _needs_adaptive(model):
+        payload["thinking"] = {"type": "adaptive"}
+        if budget_tokens >= 100000:
+            effort = "max"
+        elif budget_tokens >= 50000:
+            effort = "xhigh"
+        elif budget_tokens >= 16384:
+            effort = "high"
+        elif budget_tokens >= 8000:
+            effort = "medium"
+        else:
+            effort = "low"
+        payload.setdefault("output_config", {})["effort"] = effort
+        logger.debug(f"[claude_tools] Applied adaptive thinking: effort={effort} (from budget={budget_tokens})")
+    else:
+        payload["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": budget_tokens
+        }
+        logger.debug(f"[claude_tools] Applied thinking config: budget_tokens={budget_tokens}")
 
     # thinking 模式要求 temperature=1，且不能有 top_p/top_k
     payload["temperature"] = 1
     payload.pop("top_p", None)
     payload.pop("top_k", None)
-
-    logger.debug(f"[claude_tools] Applied thinking config: budget_tokens={budget_tokens}")
 
 
 def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
@@ -290,7 +310,7 @@ async def claude_tools_request_interceptor(
 
     # 应用 thinking 配置
     if "thinking" in features and thinking_budget:
-        apply_thinking_config(payload, thinking_budget)
+        apply_thinking_config(payload, thinking_budget, model=base_model)
 
     # 应用工具配置
     for feature in features:
