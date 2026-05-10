@@ -4189,40 +4189,30 @@ export default function Channels() {
                         className="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 dark:hover:text-emerald-300 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
                         title={isOAuthEngine ? '查询所有 OAuth 账号的额度' : (formData.preferences?.balance ? '查询所有 Key 的余额' : '未配置余额查询（在高级设置中配置 preferences.balance）')}
                       >
-                        <Wallet className={`w-3 h-3 ${balanceLoading ? 'animate-pulse' : ''}`} /> {balanceLoading ? '查询中...' : '余额'}
-                      </button>
-                      {/* 余额汇总 */}
-                      {!balanceLoading && (() => {
-                        if (isOAuthEngine) {
-                          // OAuth: 汇总 extra_usage 剩余
-                          const accts = Object.values(oauthAccounts).filter((a: any) => a?.extra_usage_enabled);
-                          if (accts.length === 0) return null;
-                          const totalLimit = accts.reduce((s: number, a: any) => s + (a.extra_usage_limit ?? 0), 0);
-                          const totalUsed = accts.reduce((s: number, a: any) => s + (a.extra_usage_used ?? 0), 0);
-                          if (totalLimit <= 0) return null;
-                          const remaining = totalLimit - totalUsed;
-                          const pct = remaining / totalLimit * 100;
-                          const color = pct >= 50 ? 'text-emerald-600 dark:text-emerald-400' : pct >= 20 ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400';
-                          return <span className={`text-xs font-mono ${color}`} title={`总额 $${totalLimit.toFixed(0)} / 已用 $${totalUsed.toFixed(1)}`}>${remaining.toFixed(1)}</span>;
-                        } else {
-                          // 普通渠道: 汇总 available
-                          const vals = Object.values(balanceResults).filter((b: any) => b?.supported && !b?.error);
-                          if (vals.length === 0) return null;
-                          const hasAmount = vals.some((b: any) => b.available != null);
-                          if (!hasAmount) {
-                            // percent 类型 — 算平均
-                            const pcts = vals.map((b: any) => getBalancePercent(b)).filter((p): p is number => p != null);
-                            if (pcts.length === 0) return null;
-                            const avg = pcts.reduce((s, p) => s + p, 0) / pcts.length;
-                            const color = avg >= 50 ? 'text-emerald-600 dark:text-emerald-400' : avg >= 20 ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400';
-                            return <span className={`text-xs font-mono ${color}`} title={`${pcts.length} 个 Key 平均余量`}>{avg.toFixed(0)}%</span>;
+                        <Wallet className={`w-3 h-3 ${balanceLoading ? 'animate-pulse' : ''}`} /> {balanceLoading ? '查询中...' : (() => {
+                          if (isOAuthEngine) {
+                            const accts = Object.values(oauthAccounts).filter((a: any) => a?.extra_usage_enabled);
+                            if (accts.length > 0) {
+                              const totalLimit = accts.reduce((s: number, a: any) => s + (a.extra_usage_limit ?? 0), 0);
+                              const totalUsed = accts.reduce((s: number, a: any) => s + (a.extra_usage_used ?? 0), 0);
+                              if (totalLimit > 0) { const r = totalLimit - totalUsed; return <span title={`总额 $${totalLimit.toFixed(0)} / 已用 $${totalUsed.toFixed(1)}`}>余额 <span className="font-mono">${r.toFixed(1)}</span></span>; }
+                            }
+                          } else {
+                            const vals = Object.values(balanceResults).filter((b: any) => b?.supported && !b?.error);
+                            if (vals.length > 0) {
+                              const hasAmount = vals.some((b: any) => b.available != null);
+                              if (!hasAmount) {
+                                const pcts = vals.map((b: any) => getBalancePercent(b)).filter((p): p is number => p != null);
+                                if (pcts.length > 0) { const avg = pcts.reduce((s, p) => s + p, 0) / pcts.length; return <span title={`${pcts.length} 个 Key 平均`}>余额 <span className="font-mono">{avg.toFixed(0)}%</span></span>; }
+                              } else {
+                                const total = vals.reduce((s: number, b: any) => s + (b.available ?? 0), 0);
+                                return <span title={`${vals.length} 个 Key 合计`}>余额 <span className="font-mono">{total.toFixed(2)}</span></span>;
+                              }
+                            }
                           }
-                          const total = vals.reduce((s: number, b: any) => s + (b.available ?? 0), 0);
-                          const currency = (vals[0] as any)?.currency || '';
-                          const color = 'text-emerald-600 dark:text-emerald-400';
-                          return <span className={`text-xs font-mono ${color}`} title={`${vals.length} 个 Key 余额合计`}>{currency ? currency + ' ' : ''}{total.toFixed(2)}</span>;
-                        }
-                      })()}
+                          return '余额';
+                        })()}
+                      </button>
                       <button
                         onClick={() => openKeyTestDialog(null)}
                         disabled={formData.api_keys.length === 0}
