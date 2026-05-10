@@ -4077,16 +4077,18 @@ export default function Channels() {
                                  style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
                           )}
                           <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
-                          {/* Key Label 渐变叠层 */}
-                          {keyObj.label && !isFocused && (
-                            <span
-                              className="absolute left-8 top-0 bottom-0 flex items-center text-[11px] font-medium text-muted-foreground/60 pointer-events-none z-[1] select-none whitespace-nowrap"
-                              style={{ maskImage: 'linear-gradient(to right, black 0%, black 50%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 50%, transparent 100%)' }}
-                            >
-                              {keyObj.label}
-                            </span>
-                          )}
+
                           <div className="flex-1 min-w-0 relative z-[2]" style={hasTag && !isFocused ? { WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' } : undefined}>
+                            {keyObj.label && !isFocused && (
+                              <div className="absolute inset-0 flex items-center pointer-events-none z-[3] select-none overflow-hidden">
+                                <span
+                                  className="text-[11px] font-medium text-foreground/40 whitespace-nowrap pl-0"
+                                  style={{ maskImage: 'linear-gradient(to right, black 0%, black 40%, transparent 80%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 40%, transparent 80%)' }}
+                                >
+                                  {keyObj.label}
+                                </span>
+                              </div>
+                            )}
                             <input
                               type="text"
                               value={keyObj.key}
