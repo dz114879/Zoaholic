@@ -4093,7 +4093,7 @@ export default function Channels() {
                               onChange={e => updateKey(idx, e.target.value)}
                               onPaste={e => handleKeyPaste(e, idx)}
                               onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
-                              onBlur={e => isOAuthEngine ? handleOAuthKeyBlur(idx, e.currentTarget.value) : setFocusedKeyIdx(null)}
+                              onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
                               placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
                               className={`w-full bg-transparent border-none text-sm font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
                             />
@@ -4134,7 +4134,7 @@ export default function Channels() {
                                 newKeys[idx] = { ...newKeys[idx], label: e.target.value || undefined };
                                 setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
                               }}
-                              onFocus={e => e.stopPropagation()}
+                              onFocus={() => setFocusedKeyIdx(idx)}
                               placeholder="备注"
                               className="w-16 sm:w-20 bg-transparent border-none text-[11px] text-muted-foreground outline-none placeholder:text-muted-foreground/30 relative z-[2]"
                             />
