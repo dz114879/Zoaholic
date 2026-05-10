@@ -79,6 +79,11 @@ class OAuthManager:
             await self._persist()
         else:
             self._state = self._normalize_nested_state(loaded_state)
+        # 启动时扫描 recovery 文件 — 上次进程崩溃时可能留下未落盘的新 refresh_token
+        recovered = self._apply_recovery_files()
+        if recovered:
+            logger.info(f"Applied {recovered} OAuth recovery file(s), persisting...")
+            await self._persist()
 
     def _looks_like_credential(self, value: dict) -> bool:
         """判断 dict 是否像单个 credential，而不是渠道下的账号映射。"""
@@ -284,20 +289,28 @@ class OAuthManager:
         updated.setdefault("type", cred.get("type"))
         updated.setdefault("email", cred.get("email"))
 
-        # 修改原因：OpenAI refresh token rotation 成功后，若落盘失败，磁盘旧 refresh_token 可能已失效。
-        # 修改方式：写入新内存状态前保存旧值，_persist 抛错时恢复当前渠道下的旧状态或移除新增 key。
-        # 目的：保证内存与磁盘在持久化失败时保持一致，避免运行期继续依赖未成功保存的新 token。
+        # Refresh token rotation 安全落盘：WAL (Write-Ahead Log) 策略
+        # 问题：rotation 后旧 rt 服务端已作废，如果 persist 失败回滚到旧 rt = 永久锁死
+        #       但只留内存不落盘，进程崩了新 rt 也丢 = 同样锁死
+        # 方案：先写 recovery 小文件（只存新 rt），再做完整 persist。
+        #       就算完整 persist 炸了/进程崩了，重启时 recovery 文件还在。
         accounts = self._get_channel_accounts(channel_id, create=True)
-        old_cred = accounts.get(key_id)
+        # Step 1: WAL — 先把最关键的新 refresh_token 写到 recovery 文件
+        self._write_rt_recovery(channel_id, key_id, updated)
+        # Step 2: 更新内存（不回滚，因为新凭据是唯一有效的）
         accounts[key_id] = updated
+        # Step 3: 完整 persist
         try:
             await self._persist()
+            # 成功后删除 recovery 文件
+            self._remove_rt_recovery(channel_id, key_id)
         except Exception:
-            if old_cred is not None:
-                accounts[key_id] = old_cred
-            else:
-                accounts.pop(key_id, None)
-            raise
+            # persist 失败，但内存保留新凭据（运行期间可用）
+            # recovery 文件也在磁盘上（重启时可恢复）
+            logger.error(
+                f"OAuth persist failed for {channel_id}:{key_id}, "
+                f"new credentials kept in memory + recovery file"
+            )
         return updated
 
     async def refresh_provider(self, type_name: str, credential: dict) -> dict:
@@ -550,11 +563,89 @@ class OAuthManager:
         self._locks.pop(self._lock_key(channel_id, key_id), None)
         await self._persist()
 
+    # ==================== Recovery (WAL) helpers ====================
+
+    def _recovery_dir(self) -> str:
+        d = os.path.join(os.path.dirname(self._state_path) or ".", "oauth_recovery")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _recovery_path(self, channel_id: str, key_id: str) -> str:
+        safe = f"{channel_id}__{key_id}".replace("/", "_").replace("\\", "_")
+        return os.path.join(self._recovery_dir(), f"{safe}.json")
+
+    def _write_rt_recovery(self, channel_id: str, key_id: str, cred: dict) -> None:
+        """WAL: 将新凭据的关键字段先落盘到 recovery 小文件。"""
+        path = self._recovery_path(channel_id, key_id)
+        payload = {
+            "channel_id": channel_id,
+            "key_id": key_id,
+            "refresh_token": cred.get("refresh_token"),
+            "access_token": cred.get("access_token"),
+            "expires_at": cred.get("expires_at"),
+            "type": cred.get("type"),
+            "email": cred.get("email"),
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(f"Failed to write rt recovery for {channel_id}:{key_id}: {e}")
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    def _remove_rt_recovery(self, channel_id: str, key_id: str) -> None:
+        """persist 成功后删除 recovery 文件。"""
+        try:
+            os.unlink(self._recovery_path(channel_id, key_id))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to remove rt recovery for {channel_id}:{key_id}: {e}")
+
+    def _apply_recovery_files(self) -> int:
+        """启动时扫描 recovery 目录，将未落盘的新凭据合并回 state。"""
+        recovery_dir = self._recovery_dir()
+        count = 0
+        for fname in os.listdir(recovery_dir):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(recovery_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    rec = json.load(f)
+                ch_id = rec.get("channel_id")
+                k_id = rec.get("key_id")
+                rt = rec.get("refresh_token")
+                if not (ch_id and k_id and rt):
+                    continue
+                accounts = self._get_channel_accounts(ch_id)
+                existing = accounts.get(k_id)
+                if existing:
+                    # 只用 recovery 的 rt/at 覆盖，保留其他字段
+                    existing["refresh_token"] = rt
+                    if rec.get("access_token"):
+                        existing["access_token"] = rec["access_token"]
+                    if rec.get("expires_at"):
+                        existing["expires_at"] = rec["expires_at"]
+                    logger.info(f"Recovered credentials from WAL: {ch_id}:{k_id}")
+                    count += 1
+                os.unlink(fpath)
+            except Exception as e:
+                logger.warning(f"Failed to apply recovery file {fname}: {e}")
+        return count
+
+    # ==================== Persist ====================
+
     async def _persist(self):
         """原子写 oauth_state.json，避免阻塞事件循环。"""
-        # 修改原因：refresh token rotation 后直接 open("w") 写正式文件，进程崩溃可能截断 oauth_state.json。
-        # 修改方式：把 JSON 序列化、临时文件写入、fsync 和 os.replace 放在线程中执行，事件循环只等待结果。
-        # 目的：确保刷新后的凭据要么完整替换旧文件，要么保留旧文件，不产生半写入状态。
         await asyncio.to_thread(self._write_state_atomic)
 
     def _write_state_atomic(self) -> None:
