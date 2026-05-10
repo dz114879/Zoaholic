@@ -4080,11 +4080,11 @@ export default function Channels() {
 
                           <div className="flex-1 min-w-0 relative z-[2]" style={hasTag && !isFocused ? { WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' } : undefined}>
                             {keyObj.label && !isFocused && (
-                              <div className="absolute inset-0 flex items-center pointer-events-none z-[3] select-none overflow-hidden">
-                                <span
-                                  className="text-[11px] font-medium text-foreground/40 whitespace-nowrap pl-0"
-                                  style={{ maskImage: 'linear-gradient(to right, black 0%, black 40%, transparent 80%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 40%, transparent 80%)' }}
-                                >
+                              <div
+                                className="absolute inset-y-0 left-0 flex items-center pointer-events-none z-[3] select-none pl-1 pr-8"
+                                style={{ background: 'linear-gradient(to right, var(--color-muted) 0%, var(--color-muted) 40%, transparent 100%)' }}
+                              >
+                                <span className="text-[11px] font-medium text-muted-foreground whitespace-nowrap">
                                   {keyObj.label}
                                 </span>
                               </div>
