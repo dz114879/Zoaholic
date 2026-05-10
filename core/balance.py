@@ -59,6 +59,35 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "value_type": "'amount'",
         },
     },
+    "kimi-plan": {
+        "endpoint": "https://api.kimi.com/coding/v1/usages",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "total": "usage.limit",
+            "used": "usage.used",
+            "available": "usage.remaining",
+            "value_type": "'amount'",
+        },
+    },
+    "kimi": {
+        "endpoint": "https://api.moonshot.cn/v1/users/me/balance",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "percent": "data.available_balance",
+            "value_type": "'percent'",
+        },
+    },
+    "siliconflow": {
+        "endpoint": "https://api.siliconflow.cn/v1/user/info",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "percent": "data.balance",
+            "value_type": "'percent'",
+        },
+    },
 }
 
 
