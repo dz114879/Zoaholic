@@ -126,19 +126,24 @@ def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
 
 def is_claude_engine(engine: str) -> bool:
     """
-    检查是否为 Claude 引擎
-
-    Args:
-        engine: 引擎类型
-
-    Returns:
-        是否为 Claude 引擎
+    检查是否为 Claude 引擎。
+    通过渠道注册表的 type_name 动态判断，不再硬编码白名单。
     """
     if not isinstance(engine, str):
         return False
-
-    claude_engines = {"claude", "anthropic", "vertex-claude", "aws", "claude-code"}
-    return engine.lower() in claude_engines
+    engine_lower = engine.lower()
+    # 直接匹配
+    if engine_lower in ("claude", "anthropic"):
+        return True
+    # 查注册表：type_name 含 "claude" 即视为 Claude 系
+    try:
+        from core.channels.registry import get_channel
+        ch = get_channel(engine_lower)
+        if ch and "claude" in ch.type_name.lower():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _needs_legacy_thinking(model: str) -> bool:
