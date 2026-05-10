@@ -82,8 +82,8 @@ function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?: strin
       const containerWidth = containerEl.clientWidth;
       const labelPct = Math.min(95, (labelWidth / containerWidth) * 100 + 5);
       const keyMask = hasTag
-        ? `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black ${Math.max(60, labelPct)}%, transparent 100%)`
-        : `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black 100%)`;
+        ? `linear-gradient(to right, transparent 0%, transparent ${labelPct - 5}%, black ${labelPct + 15}%, black ${Math.max(65, labelPct + 15)}%, transparent 100%)`
+        : `linear-gradient(to right, transparent 0%, transparent ${labelPct - 5}%, black ${labelPct + 15}%, black 100%)`;
       setMaskImage(keyInputMaskEl, keyMask);
       // label 不加 mask — 尽量完整显示，超出容器时靠 overflow-hidden 自然截断
       clearMaskImage(labelSpanEl);
