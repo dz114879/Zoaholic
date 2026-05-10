@@ -80,14 +80,13 @@ function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?: strin
     if (label && labelSpanEl && containerEl && containerEl.clientWidth > 0) {
       const labelWidth = labelSpanEl.scrollWidth;
       const containerWidth = containerEl.clientWidth;
-      const labelPct = Math.min(85, (labelWidth / containerWidth) * 100 + 5);
+      const labelPct = Math.min(95, (labelWidth / containerWidth) * 100 + 5);
       const keyMask = hasTag
         ? `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black ${Math.max(60, labelPct)}%, transparent 100%)`
         : `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black 100%)`;
-      const labelMask = `linear-gradient(to right, black 0%, black ${labelPct + 5}%, transparent ${labelPct + 20}%)`;
-
       setMaskImage(keyInputMaskEl, keyMask);
-      setMaskImage(labelSpanEl, labelMask);
+      // label 不加 mask — 尽量完整显示，超出容器时靠 overflow-hidden 自然截断
+      clearMaskImage(labelSpanEl);
       return;
     }
 
@@ -125,7 +124,7 @@ function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?: strin
   return (
     <div ref={containerRef} className="flex-1 min-w-0 relative z-[2]">
       {label && !isFocused && (
-        <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none">
+        <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none overflow-hidden">
           <span
             ref={bindLabelSpan}
             className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap"
