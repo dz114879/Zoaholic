@@ -4084,8 +4084,8 @@ export default function Channels() {
                           <div className="flex-1 min-w-0 relative z-[2]" style={(() => {
                             if (isFocused) return undefined;
                             const hasLabel = !!keyObj.label;
-                            if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, black 30%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, black 30%, black 60%, transparent 100%)' };
-                            if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, black 30%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, black 30%, black 100%)' };
+                            if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 55%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 55%, transparent 100%)' };
+                            if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 100%)' };
                             if (hasTag) return { maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' };
                             return undefined;
                           })()}>
