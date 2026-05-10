@@ -4085,7 +4085,7 @@ export default function Channels() {
                             {keyObj.label && !isFocused && (
                               <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none">
                                 <span className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap"
-                                  style={{ maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 85%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 85%)' }}
+                                  style={{ maskImage: 'linear-gradient(to right, black 0%, black 75%, transparent 95%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 75%, transparent 95%)' }}
                                 >
                                   {keyObj.label}
                                 </span>
@@ -4095,8 +4095,8 @@ export default function Channels() {
                             <div style={(() => {
                               if (isFocused) return undefined;
                               const hasLabel = !!keyObj.label;
-                              if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 65%, black 70%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 65%, black 70%, transparent 100%)' };
-                              if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 70%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 70%, black 100%)' };
+                              if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 40%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 40%, black 60%, transparent 100%)' };
+                              if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 45%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 45%, black 100%)' };
                               if (hasTag) return { maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' };
                               return undefined;
                             })()}>
