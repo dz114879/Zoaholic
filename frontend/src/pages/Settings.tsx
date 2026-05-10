@@ -341,16 +341,7 @@ export default function Settings() {
           </div>
           <div className="p-6 space-y-6">
             <div className="grid grid-cols-2 gap-6">
-              <div>
-                <label className="text-sm font-medium text-foreground mb-1.5 block">最大重试次数</label>
-                <input
-                  type="number" min="1" max="100"
-                  value={preferences.max_retry_count ?? 10}
-                  onChange={e => updatePreference('max_retry_count', parseInt(e.target.value))}
-                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
-                />
-                <p className="text-xs text-muted-foreground mt-1">多渠道场景下的最大重试次数上限（1-100）</p>
-              </div>
+              {/* max_retry_count 已废弃 — 重试终止靠 key_rules 冷却 + is_all_rate_limited 兜底 */}
               <div>
                 <label className="text-sm font-medium text-foreground mb-1.5 block">渠道冷却时间 (秒)</label>
                 <input

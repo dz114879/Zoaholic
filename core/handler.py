@@ -1119,15 +1119,14 @@ class ModelRequestHandler:
 
         index = 0
         # 获取配置的最大重试次数上限，默认为 10
-        max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=0)
-        if max_retry_limit < 0:
-            max_retry_limit = 0
+        # [已废弃] max_retry_count 机制已移除，重试终止完全靠 is_all_rate_limited 兜底
+        # max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=0)
 
         # 计算最大尝试次数（包含首轮 + 自动重试）。
         # 修复：
-        # - 单 provider 分支此前未受 max_retry_limit 约束，且使用 get_items_count 会把禁用 key 也算进去，
+        # - 使用 get_enabled_items_count 排除禁用 key。
         #   容易在“只有 1 个可用 key，但配置里堆了大量禁用 key”时触发 1000+ 次重试。
-        # - 统一按“启用的 key 数量”计算，并在所有分支上应用 max_retry_limit。
+        # - 统一按“启用的 key 数量”计算。
         def _provider_key_slots(p: Dict[str, Any]) -> int:
             """返回该 provider 可用于重试的 key 数量（至少为 1）。
 
@@ -1148,7 +1147,7 @@ class ModelRequestHandler:
 
             设计目标：
             - 保持原有语义：总尝试次数 ≈ num_matching_providers + retry_count
-            - retry_count 受 max_retry_limit 约束
+            不设人为上限，终止靠 is_all_rate_limited 兜底
             - 仅按“启用的 key 数量”估算，避免禁用 key 造成 retry_count 虚高
             """
             n = len(providers)
@@ -1159,11 +1158,11 @@ class ModelRequestHandler:
                 slots = _provider_key_slots(providers[0])
                 # 单 provider：至少允许 1 次重试；若有多 key，可覆盖更多 key
                 base = slots if slots > 1 else 1
-                return base if max_retry_limit == 0 else min(base, max_retry_limit)
+                return base
 
             total_slots = sum(_provider_key_slots(p) for p in providers)
             tmp_retry_count = total_slots * 2
-            return tmp_retry_count if max_retry_limit == 0 else min(tmp_retry_count, max_retry_limit)
+            return tmp_retry_count
 
         retry_count = _calc_retry_count(matching_providers)
         max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
