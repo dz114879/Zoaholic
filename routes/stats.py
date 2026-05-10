@@ -511,7 +511,7 @@ async def get_stats(
             [start_time],
         )
         model_rows = await d1_client.query_all(
-            "SELECT model, COUNT(*) AS count FROM request_stats "
+            "SELECT model, COUNT(*) AS count FROM channel_stats "
             "WHERE timestamp >= ? GROUP BY model ORDER BY count DESC",
             [start_time],
         )
@@ -599,9 +599,9 @@ async def get_stats(
 
             # 3. 每个模型在所有渠道总的请求次数
             model_stats_rs = await session.execute(
-                select(RequestStat.model, func.count().label('count'))
-                .where(RequestStat.timestamp >= start_time)
-                .group_by(RequestStat.model)
+                select(ChannelStat.model, func.count().label('count'))
+                .where(ChannelStat.timestamp >= start_time)
+                .group_by(ChannelStat.model)
                 .order_by(desc('count'))
             )
             model_stats = [{"model": stat.model, "count": int(stat.count or 0)} for stat in model_stats_rs.fetchall()]
