@@ -394,9 +394,12 @@ class ClaudeCodeProvider(OAuthProvider):
         usage_url = "https://api.anthropic.com/api/oauth/usage"
         if config and isinstance(config, dict):
             base = config.get("base_url", "") or ""
-            if base and "anthropic" not in base.lower().split("/")[-1]:
-                # base_url 是反代（如 workers.dev/api.anthropic.com）→ 拼 usage 路径
-                usage_url = base.rstrip("/").rstrip("#") + "/api/oauth/usage"
+            if base:
+                from urllib.parse import urlparse
+                host = urlparse(base).netloc.lower()
+                if host and "anthropic.com" not in host:
+                    # base_url 的域名不是 anthropic → 是反代 → 拼 usage 路径
+                    usage_url = base.rstrip("/").rstrip("#") + "/api/oauth/usage"
 
         headers = {
             "Authorization": f"Bearer {access_token}",
