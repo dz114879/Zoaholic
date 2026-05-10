@@ -159,18 +159,10 @@ def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int, model: st
     if not _needs_legacy_thinking(model):
         # Claude 4.x+ 统一用 adaptive + effort
         payload["thinking"] = {"type": "adaptive"}
-        if budget_tokens >= 100000:
-            effort = "max"
-        elif budget_tokens >= 50000:
-            effort = "xhigh"
-        elif budget_tokens >= 16384:
-            effort = "high"
-        elif budget_tokens >= 8000:
-            effort = "medium"
-        else:
-            effort = "low"
+        # 默认 max effort，用户可通过 -thinking-N 后缀微调
+        effort = "max"
         payload.setdefault("output_config", {})["effort"] = effort
-        logger.debug(f"[claude_tools] Applied adaptive thinking: effort={effort} (from budget={budget_tokens})")
+        logger.debug(f"[claude_tools] Applied adaptive thinking: effort={effort}")
     else:
         payload["thinking"] = {
             "type": "enabled",
