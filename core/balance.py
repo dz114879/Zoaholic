@@ -7,7 +7,7 @@
 
 配置示例（provider.preferences.balance）:
     template: "new-api"          # 可选，使用预置模板
-    endpoint: "/api/status"      # 余额接口地址（绝对 URL 或相对路径）
+    endpoint: "/api/usage/token"  # 余额接口地址（绝对 URL 或相对路径）
     method: "GET"                # 请求方法，默认 GET
     auth: "bearer"               # 认证方式：bearer / header / none
     mapping:                     # 字段提取映射（dot notation）
@@ -29,7 +29,7 @@ from .json_utils import json_loads
 
 BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "new-api": {
-        "endpoint": "/api/status",
+        "endpoint": "/api/usage/token",
         "method": "GET",
         "auth": "bearer",
         "mapping": {
