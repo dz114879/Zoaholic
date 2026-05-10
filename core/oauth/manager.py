@@ -374,6 +374,12 @@ class OAuthManager:
             result["quota_7d"] = cred.get("quota_7d")
         if isinstance(cred.get("quota_raw"), dict):
             result["raw"] = cred.get("quota_raw")
+        # extra_usage 字段（如 Claude Code 额外消费额度）
+        if cred.get("extra_usage_enabled"):
+            result["extra_usage_enabled"] = True
+            result["extra_usage_monthly_limit"] = cred.get("extra_usage_monthly_limit")
+            result["extra_usage_used"] = cred.get("extra_usage_used")
+            result["extra_usage_utilization"] = cred.get("extra_usage_utilization")
         return result if result else None
 
     async def fetch_quota(self, channel_id: str, key_id: str) -> dict | None:
@@ -420,6 +426,11 @@ class OAuthManager:
         if isinstance(quota_data.get("raw"), dict) and cred.get("quota_raw") != quota_data.get("raw"):
             cred["quota_raw"] = dict(quota_data["raw"])
             changed = True
+        # extra_usage 字段
+        for field in ("extra_usage_enabled", "extra_usage_monthly_limit", "extra_usage_used", "extra_usage_utilization"):
+            if field in quota_data and cred.get(field) != quota_data.get(field):
+                cred[field] = quota_data.get(field)
+                changed = True
 
         if not changed:
             return False
