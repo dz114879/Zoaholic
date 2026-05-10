@@ -97,6 +97,13 @@ export default function Logs() {
   // 修改方式：使用 useRef 保存当前 AbortController，每次请求前 abort 上一次请求。
   // 目的：只允许最新请求更新日志列表，避免搜索结果回退。
   const abortControllerRef = useRef<AbortController | null>(null);
+  // 修改原因：列表接口为性能不再返回请求体、响应体和头信息，展开日志时需要单独保存完整详情。
+  // 修改方式：按日志 ID 缓存 /v1/logs/{id} 的返回，并为每条详情维护加载和错误状态。
+  // 目的：列表页保持轻量，用户展开某一条日志时才按需读取大字段。
+  const [logDetails, setLogDetails] = useState<Record<number, LogEntry>>({});
+  const [detailLoadingIds, setDetailLoadingIds] = useState<Set<number>>(new Set());
+  const [detailErrorById, setDetailErrorById] = useState<Record<number, string>>({});
+  const detailAbortControllersRef = useRef<Map<number, AbortController>>(new Map());
 
   // Accordion State
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
@@ -188,13 +195,66 @@ export default function Logs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page]);
 
+  const fetchLogDetail = async (id: number) => {
+    if (!token || logDetails[id] || detailLoadingIds.has(id)) return;
+
+    // 修改原因：展开详情会触发单条日志请求，用户可能快速折叠、切换或离开页面。
+    // 修改方式：为每个日志详情请求创建独立 AbortController，并按日志 ID 清理加载状态。
+    // 目的：避免无效详情请求更新界面，同时保持列表请求的取消逻辑不受影响。
+    const previousController = detailAbortControllersRef.current.get(id);
+    if (previousController) previousController.abort();
+
+    const controller = new AbortController();
+    detailAbortControllersRef.current.set(id, controller);
+    setDetailLoadingIds(prev => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    setDetailErrorById(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    try {
+      const res = await apiFetch(`/v1/logs/${id}`, {
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (controller.signal.aborted || detailAbortControllersRef.current.get(id) !== controller) return;
+      setLogDetails(prev => ({ ...prev, [id]: data }));
+    } catch (err) {
+      const errorName = typeof err === 'object' && err !== null && 'name' in err ? String(err.name) : '';
+      if (errorName === 'AbortError') return;
+      console.error('Failed to fetch log detail:', err);
+      setDetailErrorById(prev => ({ ...prev, [id]: '详情加载失败' }));
+    } finally {
+      if (detailAbortControllersRef.current.get(id) === controller) {
+        detailAbortControllersRef.current.delete(id);
+        setDetailLoadingIds(prev => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    }
+  };
+
   const toggleExpand = (id: number) => {
+    const willExpand = !expandedIds.has(id);
     setExpandedIds(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
+    if (willExpand) {
+      void fetchLogDetail(id);
+    }
   };
 
   useEffect(() => {
@@ -235,6 +295,11 @@ export default function Logs() {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
+      // 修改原因：详情请求独立于列表请求，组件卸载时也需要取消，避免卸载后继续更新状态。
+      // 修改方式：遍历当前按日志 ID 保存的 AbortController 并清空 Map。
+      // 目的：防止详情懒加载在页面切换后留下悬空请求。
+      detailAbortControllersRef.current.forEach(controller => controller.abort());
+      detailAbortControllersRef.current.clear();
     };
   }, []);
 
@@ -410,6 +475,12 @@ export default function Logs() {
   const LogAccordionItem = ({ log }: { log: LogEntry }) => {
     const isExpanded = expandedIds.has(log.id);
     const speedInfo = calculateSpeed(log);
+    // 修改原因：列表行不再携带 body/header 大字段，展开区域必须优先使用单条详情接口返回的数据。
+    // 修改方式：按日志 ID 从详情缓存中取完整记录，加载完成前仍用列表行显示基础信息。
+    // 目的：保持展开布局不变，同时把大字段读取延后到用户真正展开时。
+    const detailLog = logDetails[log.id] || log;
+    const isDetailLoading = detailLoadingIds.has(log.id);
+    const detailError = detailErrorById[log.id];
     // 缓存字段统一转成数字，目的是避免旧日志缺字段时影响列表和展开详情渲染。
     const cachedTokens = log.cached_tokens || 0;
     const cacheCreationTokens = log.cache_creation_tokens || 0;
@@ -503,38 +574,50 @@ export default function Logs() {
         {isExpanded && (
           <div className="border-t border-border bg-muted/30 p-4 space-y-4">
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 text-sm">
-              <InfoItem label="日志 ID" value={String(log.id)} mono />
-              <InfoItem label="完整时间" value={formatFullTimestamp(log.timestamp)} />
-              <InfoItem label="Endpoint" value={log.endpoint || '-'} mono />
-              <InfoItem label="客户端 IP" value={log.client_ip || '-'} mono />
-              <InfoItem label="Provider ID" value={log.provider_id || '-'} />
-              {log.raw_data_expires_at && <InfoItem label="数据过期" value={formatFullTimestamp(log.raw_data_expires_at)} />}
+              <InfoItem label="日志 ID" value={String(detailLog.id)} mono />
+              <InfoItem label="完整时间" value={formatFullTimestamp(detailLog.timestamp)} />
+              <InfoItem label="Endpoint" value={detailLog.endpoint || '-'} mono />
+              <InfoItem label="客户端 IP" value={detailLog.client_ip || '-'} mono />
+              <InfoItem label="Provider ID" value={detailLog.provider_id || '-'} />
+              {detailLog.raw_data_expires_at && <InfoItem label="数据过期" value={formatFullTimestamp(detailLog.raw_data_expires_at)} />}
             </div>
 
-            {log.retry_path && (
+            {detailLog.retry_path && (
               <div className="space-y-1">
                 <div className="text-xs font-medium text-muted-foreground flex items-center gap-1">
                   <RotateCcw className="w-3.5 h-3.5" /> 重试路径
                 </div>
-                <RetryPathView retryPathJson={log.retry_path} />
+                <RetryPathView retryPathJson={detailLog.retry_path} />
               </div>
             )}
-            <div className="space-y-2">
-              {/* 按数据流方向分组：请求链路（用户→上游）、响应链路（上游→用户） */}
-              <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
-                <div className="text-xs font-medium text-muted-foreground tracking-wide">请求 →</div>
-                <JsonAccordion title="客户端请求头" data={log.request_headers} icon={<FileText className="w-4 h-4" />} />
-                <JsonAccordion title="客户端请求体" data={log.request_body} icon={<Eye className="w-4 h-4" />} />
-                <JsonAccordion title="上游请求头" data={log.upstream_request_headers} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="上游请求体" data={log.upstream_request_body} icon={<Server className="w-4 h-4" />} />
+            {isDetailLoading && (
+              <div className="rounded-lg border border-border bg-background/60 p-3 text-sm text-muted-foreground">
+                正在加载日志详情...
               </div>
-              <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
-                <div className="text-xs font-medium text-muted-foreground tracking-wide">← 响应</div>
-                <JsonAccordion title="上游响应头" data={log.upstream_response_headers} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="上游响应体" data={log.upstream_response_body} icon={<Server className="w-4 h-4" />} />
-                <JsonAccordion title="客户端响应体" data={log.response_body} icon={<EyeOff className="w-4 h-4" />} />
+            )}
+            {detailError && !isDetailLoading && (
+              <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-600 dark:text-red-400">
+                {detailError}
               </div>
-            </div>
+            )}
+            {!isDetailLoading && !detailError && (
+              <div className="space-y-2">
+                {/* 按数据流方向分组：请求链路（用户→上游）、响应链路（上游→用户） */}
+                <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
+                  <div className="text-xs font-medium text-muted-foreground tracking-wide">请求 →</div>
+                  <JsonAccordion title="客户端请求头" data={detailLog.request_headers} icon={<FileText className="w-4 h-4" />} />
+                  <JsonAccordion title="客户端请求体" data={detailLog.request_body} icon={<Eye className="w-4 h-4" />} />
+                  <JsonAccordion title="上游请求头" data={detailLog.upstream_request_headers} icon={<Server className="w-4 h-4" />} />
+                  <JsonAccordion title="上游请求体" data={detailLog.upstream_request_body} icon={<Server className="w-4 h-4" />} />
+                </div>
+                <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
+                  <div className="text-xs font-medium text-muted-foreground tracking-wide">← 响应</div>
+                  <JsonAccordion title="上游响应头" data={detailLog.upstream_response_headers} icon={<Server className="w-4 h-4" />} />
+                  <JsonAccordion title="上游响应体" data={detailLog.upstream_response_body} icon={<Server className="w-4 h-4" />} />
+                  <JsonAccordion title="客户端响应体" data={detailLog.response_body} icon={<EyeOff className="w-4 h-4" />} />
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

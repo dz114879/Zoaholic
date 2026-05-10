@@ -3,7 +3,7 @@ Stats 统计和使用量路由
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -236,6 +236,27 @@ class LogsCleanupResponse(BaseModel):
     message: str
 
 
+# 修改原因：日志列表接口不能再 SELECT *，否则会把请求体、响应体和头信息等大 TEXT 字段全部读入内存。
+# 修改方式：用 ORM 表结构生成完整列集合，再显式排除只应在详情页读取的原始数据字段。
+# 目的：保证新增列默认会进入列表字段，而高成本原始字段始终只由 /v1/logs/{id} 单条详情接口读取。
+LOG_LIST_EXCLUDED_FIELD_NAMES = (
+    "request_headers",
+    "request_body",
+    "upstream_request_headers",
+    "upstream_request_body",
+    "upstream_response_headers",
+    "upstream_response_body",
+    "response_body",
+)
+LOG_DETAIL_FIELD_NAMES = tuple(column.key for column in RequestStat.__table__.columns)
+LOG_LIST_COLUMN_NAMES = tuple(
+    column_name
+    for column_name in LOG_DETAIL_FIELD_NAMES
+    if column_name not in LOG_LIST_EXCLUDED_FIELD_NAMES
+)
+LOG_LIST_SQL_COLUMN_CLAUSE = ", ".join(LOG_LIST_COLUMN_NAMES)
+
+
 # ============ Helper Functions ============
 
 
@@ -268,6 +289,107 @@ def parse_datetime_input(dt_input: str) -> datetime:
                 f"Invalid datetime format: {dt_input}. "
                 "Use ISO 8601 (YYYY-MM-DDTHH:MM:SSZ) or Unix timestamp."
             )
+
+
+# 修改原因：D1 分支使用手写 SQL，过去 SELECT * 和独立 COUNT 会重复扫描并读取大字段。
+# 修改方式：把轻量列清单拼成显式 SELECT，并在同一个查询中用窗口函数返回 total。
+# 目的：让测试和运行时代码共用同一个 SQL 构造入口，避免列表接口退回 SELECT *。
+def _build_d1_logs_list_sql() -> str:
+    return f"SELECT COUNT(*) OVER() AS total, {LOG_LIST_SQL_COLUMN_CLAUSE} FROM request_stats WHERE 1=1"
+
+
+# 修改原因：SQLite/PostgreSQL/MySQL 分支同样需要显式列，不能通过 ORM 实体隐式 SELECT *。
+# 修改方式：按字段名生成 SQLAlchemy 列对象，列表查询使用轻量列，详情查询使用完整列。
+# 目的：保持 D1 和 SQLAlchemy 两条数据库路径的日志字段策略一致。
+def _log_list_sa_columns() -> List[Any]:
+    return [getattr(RequestStat, column_name) for column_name in LOG_LIST_COLUMN_NAMES]
+
+
+def _log_detail_sa_columns() -> List[Any]:
+    return [getattr(RequestStat, column_name) for column_name in LOG_DETAIL_FIELD_NAMES]
+
+
+# 修改原因：列表查询和详情查询现在分别返回字典式行数据，需要统一转成 LogEntry。
+# 修改方式：集中处理时间解析、API key 掩码、过期原始数据隐藏以及数值类型转换。
+# 目的：减少 D1 与 SQLAlchemy 分支重复逻辑，并确保列表不返回大字段、详情才返回完整原始字段。
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_api_key_prefix(raw_api_key: str) -> str:
+    if raw_api_key and len(raw_api_key) > 11:
+        return f"{raw_api_key[:7]}...{raw_api_key[-4:]}"
+    return raw_api_key
+
+
+def _log_raw_field(row: Mapping[str, Any], field_name: str, *, include_raw_fields: bool, raw_data_expired: bool) -> Optional[str]:
+    if not include_raw_fields or raw_data_expired:
+        return None
+    value = row.get(field_name)
+    return str(value) if value is not None else None
+
+
+def _log_entry_from_mapping(
+    row: Mapping[str, Any],
+    *,
+    include_raw_fields: bool,
+    now: Optional[datetime] = None,
+) -> LogEntry:
+    now = now or datetime.now(timezone.utc)
+    timestamp = parse_d1_datetime(row.get("timestamp")) or now
+    raw_expires_at = parse_d1_datetime(row.get("raw_data_expires_at"))
+    raw_data_expired = raw_expires_at is not None and raw_expires_at < now
+    raw_api_key = row.get("api_key") or ""
+
+    return LogEntry(
+        id=int(row.get("id") or 0),
+        timestamp=timestamp,
+        endpoint=row.get("endpoint"),
+        client_ip=row.get("client_ip"),
+        provider=row.get("provider"),
+        model=row.get("model"),
+        api_key_prefix=_build_api_key_prefix(str(raw_api_key)),
+        process_time=_to_optional_float(row.get("process_time")),
+        first_response_time=_to_optional_float(row.get("first_response_time")),
+        prompt_tokens=int(row.get("prompt_tokens") or 0),
+        completion_tokens=int(row.get("completion_tokens") or 0),
+        total_tokens=int(row.get("total_tokens") or 0),
+        cached_tokens=int(row.get("cached_tokens") or 0),
+        cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
+        success=_bool_from_db(row.get("success")),
+        status_code=_to_optional_int(row.get("status_code")),
+        prompt_price=_to_optional_float(row.get("prompt_price")),
+        completion_price=_to_optional_float(row.get("completion_price")),
+        is_flagged=_bool_from_db(row.get("is_flagged")),
+        provider_id=row.get("provider_id"),
+        provider_key_index=_to_optional_int(row.get("provider_key_index")),
+        api_key_name=row.get("api_key_name"),
+        api_key_group=row.get("api_key_group"),
+        retry_count=_to_optional_int(row.get("retry_count")),
+        retry_path=row.get("retry_path") if not raw_data_expired else None,
+        request_headers=_log_raw_field(row, "request_headers", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        request_body=_log_raw_field(row, "request_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_request_headers=_log_raw_field(row, "upstream_request_headers", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_request_body=_log_raw_field(row, "upstream_request_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_response_headers=_log_raw_field(row, "upstream_response_headers", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_response_body=_log_raw_field(row, "upstream_response_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        response_body=_log_raw_field(row, "response_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        raw_data_expires_at=raw_expires_at,
+    )
 
 
 def _build_cleanup_time_filters(payload: LogsCleanupRequest) -> tuple[Optional[datetime], Optional[datetime], Optional[datetime], Dict[str, Any]]:
@@ -1343,8 +1465,10 @@ async def get_logs(
         if d1_client is None:
             return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
 
-        sql = "SELECT * FROM request_stats WHERE 1=1"
-        count_sql = "SELECT COUNT(*) AS total FROM request_stats WHERE 1=1"
+        # 修改原因：D1/SQLite 列表分支原来 SELECT * 并额外 COUNT，会读取大字段且重复扫描。
+        # 修改方式：使用轻量列清单和 COUNT(*) OVER()，total 随当前页数据一起返回。
+        # 目的：让 /v1/logs 列表只承担摘要查询，展开详情再访问 /v1/logs/{id} 拉取完整行。
+        sql = _build_d1_logs_list_sql()
         params: list[Any] = []
 
         if start_time:
@@ -1353,8 +1477,7 @@ async def get_logs(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid start_time: {e}")
             sql += " AND timestamp >= ?"
-            count_sql += " AND timestamp >= ?"
-            params.append(start_dt)
+            params.append(format_d1_datetime(start_dt))
 
         if end_time:
             try:
@@ -1362,99 +1485,42 @@ async def get_logs(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}")
             sql += " AND timestamp <= ?"
-            count_sql += " AND timestamp <= ?"
-            params.append(end_dt)
+            params.append(format_d1_datetime(end_dt))
 
         if provider:
             like_value = f"%{provider}%"
             sql += " AND (provider_id LIKE ? OR provider LIKE ?)"
-            count_sql += " AND (provider_id LIKE ? OR provider LIKE ?)"
             params.extend([like_value, like_value])
 
         if api_key:
             like_value = f"%{api_key}%"
             sql += " AND (api_key_name LIKE ? OR api_key_group LIKE ? OR api_key LIKE ?)"
-            count_sql += " AND (api_key_name LIKE ? OR api_key_group LIKE ? OR api_key LIKE ?)"
             params.extend([like_value, like_value, like_value])
 
         if model:
             like_value = f"%{model}%"
             sql += " AND model LIKE ?"
-            count_sql += " AND model LIKE ?"
             params.append(like_value)
 
         if success is not None:
             success_value = 1 if success else 0
             sql += " AND success = ?"
-            count_sql += " AND success = ?"
             params.append(success_value)
 
-        total = int(await d1_client.query_value(count_sql, params, column="total", default=0) or 0)
-        if total == 0:
-            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
-
-        total_pages = (total + page_size - 1) // page_size
-        if page > total_pages:
-            page = total_pages
         offset = (page - 1) * page_size
-
         sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         rows = await d1_client.query_all(sql, [*params, page_size, offset])
 
-        items: List[LogEntry] = []
+        if not rows:
+            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
+        total = int(rows[0].get("total") or 0)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 0
         now = datetime.now(timezone.utc)
-        for row in rows:
-            raw_api_key = row.get("api_key") or ""
-            if raw_api_key and len(raw_api_key) > 11:
-                api_key_prefix = f"{raw_api_key[:7]}...{raw_api_key[-4:]}"
-            else:
-                api_key_prefix = raw_api_key
-
-            ts = parse_d1_datetime(row.get("timestamp")) or datetime.now(timezone.utc)
-            raw_expires_at = parse_d1_datetime(row.get("raw_data_expires_at"))
-            raw_data_expired = raw_expires_at is not None and raw_expires_at < now
-
-            items.append(
-                LogEntry(
-                    id=int(row.get("id") or 0),
-                    timestamp=ts,
-                    endpoint=row.get("endpoint"),
-                    client_ip=row.get("client_ip"),
-                    provider=row.get("provider"),
-                    model=row.get("model"),
-                    api_key_prefix=api_key_prefix,
-                    process_time=float(row.get("process_time")) if row.get("process_time") is not None else None,
-                    first_response_time=float(row.get("first_response_time")) if row.get("first_response_time") is not None else None,
-                    prompt_tokens=int(row.get("prompt_tokens") or 0),
-                    completion_tokens=int(row.get("completion_tokens") or 0),
-                    total_tokens=int(row.get("total_tokens") or 0),
-                    # D1 旧表可能尚无缓存列，使用 get 默认 0 保持兼容。
-                    cached_tokens=int(row.get("cached_tokens") or 0),
-                    cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
-                    success=_bool_from_db(row.get("success")),
-                    status_code=int(row.get("status_code")) if row.get("status_code") is not None else None,
-                    prompt_price=float(row.get("prompt_price")) if row.get("prompt_price") is not None else None,
-                    completion_price=float(row.get("completion_price")) if row.get("completion_price") is not None else None,
-                    is_flagged=_bool_from_db(row.get("is_flagged")),
-                    provider_id=row.get("provider_id"),
-                    provider_key_index=int(row.get("provider_key_index")) if row.get("provider_key_index") is not None else None,
-                    api_key_name=row.get("api_key_name"),
-                    api_key_group=row.get("api_key_group"),
-                    retry_count=int(row.get("retry_count")) if row.get("retry_count") is not None else None,
-                    retry_path=row.get("retry_path") if not raw_data_expired else None,
-                    request_headers=row.get("request_headers") if not raw_data_expired else None,
-                    request_body=row.get("request_body") if not raw_data_expired else None,
-                    # 修改原因：D1 查询使用字典行，必须把新增头字段传入 LogEntry。
-                    # 修改方式：按原始数据过期规则读取上下游头字段。
-                    # 目的：保证未过期日志能在前端展示上游请求头和上游响应头。
-                    upstream_request_headers=row.get("upstream_request_headers") if not raw_data_expired else None,
-                    upstream_request_body=row.get("upstream_request_body") if not raw_data_expired else None,
-                    upstream_response_headers=row.get("upstream_response_headers") if not raw_data_expired else None,
-                    upstream_response_body=row.get("upstream_response_body") if not raw_data_expired else None,
-                    response_body=row.get("response_body") if not raw_data_expired else None,
-                    raw_data_expires_at=raw_expires_at,
-                )
-            )
+        items = [
+            _log_entry_from_mapping(row, include_raw_fields=False, now=now)
+            for row in rows
+        ]
 
         return LogsPage(
             items=items,
@@ -1467,7 +1533,7 @@ async def get_logs(
     async with async_session_scope() as session:
         # 构建基础查询条件
         conditions = []
-        
+
         # 时间筛选
         if start_time:
             try:
@@ -1475,14 +1541,14 @@ async def get_logs(
                 conditions.append(RequestStat.timestamp >= start_dt)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid start_time: {e}")
-        
+
         if end_time:
             try:
                 end_dt = parse_datetime_input(end_time)
                 conditions.append(RequestStat.timestamp <= end_dt)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}")
-        
+
         # 模糊搜索：渠道（兼容 provider_id 与 provider 字段）
         if provider:
             conditions.append(
@@ -1491,7 +1557,7 @@ async def get_logs(
                     RequestStat.provider.ilike(f"%{provider}%")
                 )
             )
-        
+
         # 模糊搜索：令牌（API key 名称或分组，及原始 api_key）
         if api_key:
             conditions.append(
@@ -1501,108 +1567,40 @@ async def get_logs(
                     RequestStat.api_key.ilike(f"%{api_key}%")
                 )
             )
-        
+
         # 模型名模糊匹配
         if model:
             conditions.append(RequestStat.model.ilike(f"%{model}%"))
-        
+
         # 成功/失败筛选
         if success is not None:
             conditions.append(RequestStat.success == success)
-        
-        # 统计总数
-        count_query = select(func.count(RequestStat.id)).where(*conditions)
-        result = await session.execute(count_query)
-        total = result.scalar() or 0
-
-        if total == 0:
-            return LogsPage(
-                items=[],
-                total=0,
-                page=page,
-                page_size=page_size,
-                total_pages=0,
-            )
-
-        total_pages = (total + page_size - 1) // page_size
-        if page > total_pages:
-            page = total_pages
 
         offset = (page - 1) * page_size
 
+        # 修改原因：SQLAlchemy 分支原来先 COUNT 再 SELECT RequestStat，既双查又隐式 SELECT *。
+        # 修改方式：显式选择轻量列，并用 COUNT(*) OVER() 把 total 附加到每一行结果。
+        # 目的：减少大库日志列表查询的磁盘读取和重复扫描，完整 body 字段只由详情接口读取。
         query = (
-            select(RequestStat)
+            select(func.count().over().label("total"), *_log_list_sa_columns())
             .where(*conditions)
             .order_by(RequestStat.timestamp.desc())
             .offset(offset)
             .limit(page_size)
         )
         rows_result = await session.execute(query)
-        rows = rows_result.scalars().all()
+        rows = rows_result.mappings().all()
 
-    items: List[LogEntry] = []
+    if not rows:
+        return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
+    total = int(rows[0].get("total") or 0)
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
     now = datetime.now(timezone.utc)
-    
-    for row in rows:
-        api_key = row.api_key or ""
-        if api_key and len(api_key) > 11:
-            prefix = api_key[:7]
-            suffix = api_key[-4:]
-            api_key_prefix = f"{prefix}...{suffix}"
-        else:
-            api_key_prefix = api_key
-
-        # 检查原始数据是否过期
-        raw_data_expired = False
-        if row.raw_data_expires_at:
-            # 确保时区一致性：如果数据库时间没有时区信息，将其视为UTC
-            expires_at = row.raw_data_expires_at
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            raw_data_expired = expires_at < now
-
-        items.append(
-            LogEntry(
-                id=row.id,
-                timestamp=row.timestamp,
-                endpoint=row.endpoint,
-                client_ip=row.client_ip,
-                provider=row.provider,
-                model=row.model,
-                api_key_prefix=api_key_prefix,
-                process_time=row.process_time,
-                first_response_time=row.first_response_time,
-                prompt_tokens=row.prompt_tokens,
-                completion_tokens=row.completion_tokens,
-                total_tokens=row.total_tokens,
-                # SQLAlchemy 分支直接读取 ORM 字段，旧数据为空时前端按 0 展示。
-                cached_tokens=getattr(row, 'cached_tokens', 0) or 0,
-                cache_creation_tokens=getattr(row, 'cache_creation_tokens', 0) or 0,
-                success=row.success if hasattr(row, 'success') else False,
-                status_code=row.status_code if hasattr(row, 'status_code') else None,
-                prompt_price=getattr(row, 'prompt_price', None),
-                completion_price=getattr(row, 'completion_price', None),
-                is_flagged=row.is_flagged,
-                # 扩展日志字段
-                provider_id=row.provider_id,
-                provider_key_index=row.provider_key_index,
-                api_key_name=row.api_key_name,
-                api_key_group=row.api_key_group,
-                retry_count=row.retry_count,
-                retry_path=row.retry_path if not raw_data_expired else None,
-                request_headers=row.request_headers if not raw_data_expired else None,
-                request_body=row.request_body if not raw_data_expired else None,
-                # 修改原因：SQLAlchemy 查询分支也需要返回新增头字段，不能只在 D1 分支处理。
-                # 修改方式：用 getattr 兼容旧 ORM 对象，并沿用原始数据过期隐藏逻辑。
-                # 目的：保证 SQLite、PostgreSQL 和 MySQL 模式下前端日志详情字段完整。
-                upstream_request_headers=getattr(row, 'upstream_request_headers', None) if not raw_data_expired else None,
-                upstream_request_body=getattr(row, 'upstream_request_body', None) if not raw_data_expired else None,
-                upstream_response_headers=getattr(row, 'upstream_response_headers', None) if not raw_data_expired else None,
-                upstream_response_body=getattr(row, 'upstream_response_body', None) if not raw_data_expired else None,
-                response_body=row.response_body if not raw_data_expired else None,
-                raw_data_expires_at=row.raw_data_expires_at,
-            )
-        )
+    items = [
+        _log_entry_from_mapping(row, include_raw_fields=False, now=now)
+        for row in rows
+    ]
 
     return LogsPage(
         items=items,
@@ -1611,6 +1609,51 @@ async def get_logs(
         page_size=page_size,
         total_pages=total_pages,
     )
+
+
+@router.get("/v1/logs/{log_id}", response_model=LogEntry, dependencies=[Depends(rate_limit_dependency)])
+async def get_log_detail(
+    request: Request,
+    log_id: int,
+    token: str = Depends(verify_admin_api_key),
+):
+    """
+    获取单条请求日志完整详情，仅管理员可访问。
+    """
+    if DISABLE_DATABASE:
+        raise HTTPException(status_code=503, detail="Database is disabled.")
+
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        from db import d1_client
+        if d1_client is None:
+            raise HTTPException(status_code=404, detail="Log not found.")
+
+        # 修改原因：列表接口已经排除原始大字段，展开详情时才需要读取完整日志行。
+        # 修改方式：单条详情端点按 id 执行 SELECT *，只对用户展开的那一条日志读取 body 和 headers。
+        # 目的：把高成本大字段读取从列表分页路径移到按需详情路径。
+        rows = await d1_client.query_all(
+            "SELECT * FROM request_stats WHERE id = ? LIMIT 1",
+            [log_id],
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Log not found.")
+        return _log_entry_from_mapping(rows[0], include_raw_fields=True)
+
+    async with async_session_scope() as session:
+        # 修改原因：SQLAlchemy 详情接口需要返回完整字段，但仍限定为单个主键，避免列表查询拉取大字段。
+        # 修改方式：显式选择 request_stats 的全部列并按 id 限制一行。
+        # 目的：保持详情展示能力不变，同时让列表接口维持轻量查询。
+        query = (
+            select(*_log_detail_sa_columns())
+            .where(RequestStat.id == log_id)
+            .limit(1)
+        )
+        result = await session.execute(query)
+        row = result.mappings().one_or_none()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Log not found.")
+    return _log_entry_from_mapping(row, include_raw_fields=True)
 
 
 # ==================== 后台日志 & 出站请求日志 ====================

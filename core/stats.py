@@ -31,6 +31,13 @@ SQLITE_RETRY_DELAY = 0.5  # 初始重试延迟（秒）
 
 # Prompt Caching 新增列需要在各数据库的简易迁移中显式带 DEFAULT 0，避免旧表新增列后出现 NULL。
 PROMPT_CACHE_STAT_COLUMNS = {"cached_tokens", "cache_creation_tokens"}
+# 修改原因：日志列表按 timestamp 倒序分页，并常带 provider/model 筛选，单列索引无法充分覆盖这个访问路径。
+# 修改方式：集中维护复合索引 SQL，D1 初始化和 SQLite 启动迁移共用同一个定义。
+# 目的：减少日志列表排序和过滤的扫描成本，配合列表轻量列查询提升 /v1/logs 性能。
+REQUEST_STATS_TS_PROVIDER_MODEL_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_request_stats_ts_provider_model "
+    "ON request_stats(timestamp DESC, provider, model)"
+)
 # 修改原因：D1 的 CREATE TABLE IF NOT EXISTS 不会给旧表补列，而新增上游响应头后 D1 写入会包含该列。
 # 修改方式：为 D1 启动迁移单独维护新增的文本日志列集合。
 # 目的：确保旧 D1 表在服务启动时补齐 upstream_response_headers，避免插入日志时报缺列。
@@ -237,6 +244,7 @@ async def _create_tables_d1():
         "CREATE INDEX IF NOT EXISTS idx_request_stats_success ON request_stats(success)",
         "CREATE INDEX IF NOT EXISTS idx_request_stats_status_code ON request_stats(status_code)",
         "CREATE INDEX IF NOT EXISTS idx_request_stats_timestamp ON request_stats(timestamp)",
+        REQUEST_STATS_TS_PROVIDER_MODEL_INDEX_SQL,
         "CREATE INDEX IF NOT EXISTS idx_channel_stats_provider ON channel_stats(provider)",
         "CREATE INDEX IF NOT EXISTS idx_channel_stats_model ON channel_stats(model)",
         "CREATE INDEX IF NOT EXISTS idx_channel_stats_provider_api_key ON channel_stats(provider_api_key)",
@@ -322,6 +330,12 @@ async def create_tables():
                             )
 
             await conn.run_sync(check_and_add_columns)
+
+            if db_type == "sqlite":
+                # 修改原因：SQLAlchemy 模型历史上只创建单列索引，旧 SQLite 库不会自动拥有本次新增复合索引。
+                # 修改方式：启动迁移阶段执行 CREATE INDEX IF NOT EXISTS，与 D1 初始化列表保持一致。
+                # 目的：让新部署和重启后的 SQLite 实例自动获得日志列表查询所需索引。
+                await conn.execute(text(REQUEST_STATS_TS_PROVIDER_MODEL_INDEX_SQL))
 
             # MySQL 专属：将 body 列从 TEXT (64KB) 升级到 MEDIUMTEXT (16MB)
             # v1.4.1 起默认保存请求/响应体，截断上限 100KB 超出 TEXT 容量
