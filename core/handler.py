@@ -1119,9 +1119,9 @@ class ModelRequestHandler:
 
         index = 0
         # 获取配置的最大重试次数上限，默认为 10
-        max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=10)
-        if max_retry_limit < 1:
-            max_retry_limit = 1
+        max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=0)
+        if max_retry_limit < 0:
+            max_retry_limit = 0
 
         # 计算最大尝试次数（包含首轮 + 自动重试）。
         # 修复：
@@ -1159,14 +1159,14 @@ class ModelRequestHandler:
                 slots = _provider_key_slots(providers[0])
                 # 单 provider：至少允许 1 次重试；若有多 key，可覆盖更多 key
                 base = slots if slots > 1 else 1
-                return min(base, max_retry_limit)
+                return base if max_retry_limit == 0 else min(base, max_retry_limit)
 
             total_slots = sum(_provider_key_slots(p) for p in providers)
             tmp_retry_count = total_slots * 2
-            return min(tmp_retry_count, max_retry_limit)
+            return tmp_retry_count if max_retry_limit == 0 else min(tmp_retry_count, max_retry_limit)
 
         retry_count = _calc_retry_count(matching_providers)
-        max_attempts = num_matching_providers + retry_count
+        max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
 
         # 初始化重试路径记录
         retry_path: List[Dict[str, Any]] = []
@@ -1446,7 +1446,7 @@ class ModelRequestHandler:
                     num_matching_providers = len(matching_providers)
                     # provider 列表发生变化（或重新排序）时，重算最大尝试次数
                     retry_count = _calc_retry_count(matching_providers)
-                    max_attempts = num_matching_providers + retry_count
+                    max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
                     if num_matching_providers != last_num_matching_providers:
                         index = 0
                 # 当 key 被冷却但渠道仍有可用 key 时：不做 exclude_model，也不回退 index。
