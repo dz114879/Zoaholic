@@ -4077,29 +4077,40 @@ export default function Channels() {
                                  style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
                           )}
                           <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
-                          {keyObj.label && !isFocused && (
-                            <span className="text-[11px] font-medium text-muted-foreground absolute left-8 z-[3] pointer-events-none select-none whitespace-nowrap">{keyObj.label}</span>
-                          )}
 
-                          <div className="flex-1 min-w-0 relative z-[2]" style={(() => {
-                            if (isFocused) return undefined;
-                            const hasLabel = !!keyObj.label;
-                            if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 55%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 55%, transparent 100%)' };
-                            if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, black 50%, black 100%)' };
-                            if (hasTag) return { maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' };
-                            return undefined;
-                          })()}>
+                          <div className="flex-1 min-w-0 relative z-[2]">
+                            {/* 修改原因：Key 备注原先字号更小且不在输入框内部，导致备注与 Key 文本高度、基线和色相区分都不稳定。
+                                修改方式：把备注移动为输入框内的绝对覆盖层，并让备注与 input 同用 text-sm、leading-5、font-mono，同时改用琥珀色系和右侧透明渐变。
+                                目的：让备注与 Key 文本保持同高同基线，并通过暖色和渐变遮罩自然区分备注与底层 Key。 */}
+                            {keyObj.label && !isFocused && (
+                              <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none">
+                                <span className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap"
+                                  style={{ maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 85%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 85%)' }}
+                                >
+                                  {keyObj.label}
+                                </span>
+                              </div>
+                            )}
 
-                            <input
-                              type="text"
-                              value={keyObj.key}
-                              onChange={e => updateKey(idx, e.target.value)}
-                              onPaste={e => handleKeyPaste(e, idx)}
-                              onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
-                              onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
-                              placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
-                              className={`w-full bg-transparent border-none text-sm font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
-                            />
+                            <div style={(() => {
+                              if (isFocused) return undefined;
+                              const hasLabel = !!keyObj.label;
+                              if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 65%, black 70%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 65%, black 70%, transparent 100%)' };
+                              if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 70%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 55%, black 70%, black 100%)' };
+                              if (hasTag) return { maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' };
+                              return undefined;
+                            })()}>
+                              <input
+                                type="text"
+                                value={keyObj.key}
+                                onChange={e => updateKey(idx, e.target.value)}
+                                onPaste={e => handleKeyPaste(e, idx)}
+                                onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
+                                onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
+                                placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
+                                className={`w-full bg-transparent border-none text-sm leading-5 font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
+                              />
+                            </div>
                           </div>
                           {isOAuthEngine && !keyObj.key && (
                             <>
