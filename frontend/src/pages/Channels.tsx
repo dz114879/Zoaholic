@@ -669,7 +669,7 @@ export default function Channels() {
   // 修改原因：渠道列表顶部需要一个统一的虚拟路由手风琴，而不是每个虚拟模型各自占一行。
   // 修改方式：新增独立展开状态，桌面表格和移动端卡片共用它控制子行或子卡片显示。
   // 目的：让虚拟模型置顶收纳，同时保留测试、启用、编辑和删除入口。
-  const [isVirtualRoutesAccordionOpen, setIsVirtualRoutesAccordionOpen] = useState(false);
+  const [isVirtualRoutesAccordionOpen, setIsVirtualRoutesAccordionOpen] = useState(true);
 
   const [isFetchModelsOpen, setIsFetchModelsOpen] = useState(false);
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
@@ -3265,20 +3265,13 @@ export default function Channels() {
               <td className="px-4 py-3 align-top">
                 <div className="font-medium text-purple-700 dark:text-purple-300 break-words">{p.provider}</div>
               </td>
-              <td className="px-4 py-3 align-top">
-                <span className="inline-flex items-center gap-1 w-fit bg-purple-500/10 text-purple-700 dark:text-purple-300 px-1.5 py-0.5 rounded text-xs">
-                  <Link2 className="w-3 h-3" /> 虚拟路由
-                </span>
-              </td>
-              <td className="px-4 py-3 text-center align-top">
-                <span className="text-xs font-mono text-muted-foreground">{Array.isArray(p.chain) ? p.chain.length : 0} 节点</span>
-              </td>
-              <td className="px-4 py-3 align-top">
-                <span className="block text-xs text-foreground font-mono truncate max-w-[280px] cursor-help" title={chainSummary}>{chainSummary}</span>
-              </td>
-              <td className="px-4 py-3 text-center align-top"><span className="text-muted-foreground/50">—</span></td>
-              <td className="px-4 py-3 text-center align-top">
-                <span className="font-mono text-sm text-purple-700 dark:text-purple-300">∞</span>
+              <td className="px-4 py-3 align-top" colSpan={5}>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="inline-flex items-center gap-1 w-fit bg-purple-500/10 text-purple-700 dark:text-purple-300 px-1.5 py-0.5 rounded text-xs flex-shrink-0">
+                    <Link2 className="w-3 h-3" /> {Array.isArray(p.chain) ? p.chain.length : 0} 节点
+                  </span>
+                  <span className="text-xs text-foreground font-mono truncate cursor-help" title={chainSummary}>{chainSummary}</span>
+                </div>
               </td>
               <td className="px-4 py-3 text-right align-top">
                 <div className="flex items-center justify-end gap-1">
