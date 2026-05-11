@@ -661,7 +661,7 @@ export default function Channels() {
   // 修改原因：虚拟模型抽屉左栏在大屏下长期占用过多横向空间。
   // 修改方式：新增左栏折叠状态，并默认折叠为窄侧边条。
   // 目的：打开抽屉时优先保证右侧链条编辑区空间充足，按需再展开渠道列表。
-  const [isVirtualProviderPanelCollapsed, setIsVirtualProviderPanelCollapsed] = useState(true);
+  const [isVirtualProviderPanelCollapsed, setIsVirtualProviderPanelCollapsed] = useState(false);
   // 修改原因：移动端渠道面板需要默认折叠，但又不能复用桌面端窄侧栏的折叠形态。
   // 修改方式：新增独立的移动端展开状态，只控制小屏顶部渠道面板的展开和收起。
   // 目的：手机上先显示链条编辑区，同时允许用户按需查看完整渠道列表。
@@ -3145,13 +3145,10 @@ export default function Channels() {
                 >
                   <ProviderLogo name={providerName} engine={provider?.engine} baseUrl={provider?.base_url || formData?.base_url} />
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5 min-w-0">
+                    <div className="flex items-center gap-1 min-w-0">
                       <span className="text-xs font-medium text-foreground truncate">{providerName}</span>
-                      {isSubChannel && <span className="text-[10px] px-1 py-0.5 rounded bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex-shrink-0">子</span>}
-                      <span className="text-[10px] px-1 py-0.5 rounded bg-muted text-muted-foreground font-mono flex-shrink-0">{provider?.engine || 'openai'}</span>
-                    </div>
-                    <div className="text-[10px] text-muted-foreground mt-0.5 truncate">
-                      {isSubChannel && parentProviderName ? `${parentProviderName} · ` : ''}权重 {weight} · {modelOptions.length} 模型
+                      {isSubChannel && <span className="text-[10px] px-1 rounded bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex-shrink-0">子</span>}
+                      <span className="text-[10px] text-muted-foreground font-mono flex-shrink-0 ml-auto">{modelOptions.length}</span>
                     </div>
                   </div>
                   <span className="text-[10px] text-muted-foreground flex-shrink-0">{isExpanded ? '收起' : '模型'}</span>
