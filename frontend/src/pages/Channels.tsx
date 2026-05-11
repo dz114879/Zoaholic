@@ -3150,6 +3150,7 @@ export default function Channels() {
                       {isSubChannel && <span className="text-[10px] px-1 rounded bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex-shrink-0">子</span>}
                       <span className="text-[10px] text-muted-foreground font-mono flex-shrink-0 ml-auto">{modelOptions.length}</span>
                     </div>
+                    {provider?.remark && <div className="text-[10px] text-muted-foreground truncate mt-0.5">{provider.remark}</div>}
                   </div>
                   <span className="text-[10px] text-muted-foreground flex-shrink-0">{isExpanded ? '收起' : '模型'}</span>
                 </button>
