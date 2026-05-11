@@ -282,6 +282,12 @@ class OAuthManager:
         provider = self._providers.get(cred.get("type"))
         if not provider:
             raise ValueError(f"Unknown OAuth type: {cred.get('type')}")
+        # 磁盘可写性预检 — rotation 后旧 rt 作废，如果连 recovery 都写不下去，宁可不刷新
+        if not self._disk_writable_check():
+            raise IOError(
+                f"Disk not writable, skipping refresh for {channel_id}:{key_id} "
+                f"to protect current refresh_token"
+            )
         updated = await self._call_provider_method(provider.refresh_token, cred)
         updated["last_refresh"] = datetime.utcnow().isoformat() + "Z"
         updated["status"] = "active"
@@ -562,6 +568,26 @@ class OAuthManager:
         accounts.pop(key_id, None)
         self._locks.pop(self._lock_key(channel_id, key_id), None)
         await self._persist()
+
+    # ==================== Disk pre-check ====================
+
+    def _disk_writable_check(self) -> bool:
+        """刷新前预检磁盘可写性。写 1 字节 tmp 文件后立即删除。
+        失败说明磁盘满或权限异常，此时不应发起 refresh（rotation 会作废旧 rt）。"""
+        try:
+            dir_path = os.path.dirname(self._state_path) or "."
+            os.makedirs(dir_path, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=dir_path, suffix=".probe")
+            try:
+                os.write(fd, b"x")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+                os.unlink(tmp)
+            return True
+        except Exception as e:
+            logger.error(f"Disk writable check failed: {e}")
+            return False
 
     # ==================== Recovery (WAL) helpers ====================
 
