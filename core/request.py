@@ -129,7 +129,17 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
             def _deep_merge(target, override):
                 if isinstance(target, dict) and isinstance(override, dict):
                     for _k, _v in override.items():
-                        if isinstance(_v, dict) and isinstance(target.get(_k), dict):
+                        # "+" 前缀表示追加而非覆写（仅对 list 生效）
+                        if _k.startswith("+"):
+                            real_key = _k[1:]
+                            existing = target.get(real_key)
+                            if isinstance(existing, list) and isinstance(_v, list):
+                                existing.extend(_v)
+                            elif isinstance(_v, list):
+                                target[real_key] = list(_v)
+                            else:
+                                target[real_key] = _v
+                        elif isinstance(_v, dict) and isinstance(target.get(_k), dict):
                             _deep_merge(target[_k], _v)
                         else:
                             target[_k] = _v
