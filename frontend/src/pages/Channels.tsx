@@ -5073,7 +5073,9 @@ export default function Channels() {
                         placeholder='{"all": {"temperature": 0.1}}'
                         className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
                       />
-                      <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        失焦时自动格式化。key 为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">all</code> 或 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">*</code> 全局生效，模型名精确匹配。dict 递归合并，数组整体覆写，key 加 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+</code> 前缀追加数组（如 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+tools</code>）。值为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">null</code> 删除该字段。
+                      </p>
                     </div>
 
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
