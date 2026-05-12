@@ -558,7 +558,7 @@ function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus
         <div className="flex-1 min-w-0 relative z-[2]">
           <input
             type="text" value={keyObj.key || ''} readOnly placeholder="sk-..."
-            onFocus={onFocus} onBlur={onBlur}
+            onFocus={onFocus} onBlur={e => { if (!wrapperRef.current?.contains(e.relatedTarget as Node)) onBlur(); }}
             className={`w-full bg-transparent border-none text-sm font-mono outline-none ${focused ? 'text-foreground' : 'text-red-400 dark:text-red-300 line-through decoration-red-500/40'}`}
           />
           {/* 倒计时叠加 */}
