@@ -852,7 +852,7 @@ export default function Channels() {
     // 修改原因：OAuth 编辑面板已有专门的账号列表 quota 拉取逻辑，不能再要求 preferences.balance。
     // 修改方式：自动余额查询只保留给普通渠道，OAuth 余额由账号列表和手动余额按钮触发。
     // 目的：避免打开 OAuth 面板时因为缺少普通余额配置产生无效请求。
-    if (isModalOpen && !isOAuthEngine && formData?.preferences?.balance && formData.base_url && formData.api_keys.some(k => k.key.trim() && !k.disabled)) {
+    if (isModalOpen && !isOAuthEngine && formData?.base_url && formData?.api_keys?.some(k => k.key.trim() && !k.disabled)) {
       queryAllBalances(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1155,7 +1155,7 @@ export default function Channels() {
     // 目的：让 Codex 等 OAuth 渠道的余额按钮可以点击并刷新 quota。
     if (!formData || (!isOAuthEngine && !formData.base_url)) return;
     const balanceCfg = formData.preferences?.balance;
-    if (!isOAuthEngine && !balanceCfg) { if (!silent) toastWarning('该渠道未配置余额查询（preferences.balance）'); return; }
+    // balanceCfg 为空时后端会尝试根据 base_url 自动匹配模板，不再前端拦截
 
     const activeKeys = formData.api_keys.filter(k => k.key.trim() && !k.disabled);
     if (activeKeys.length === 0) { if (!silent) toastError('没有可用的 Key'); return; }
