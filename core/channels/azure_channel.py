@@ -2,9 +2,14 @@
 Azure OpenAI 渠道适配器
 
 负责处理 Azure OpenAI API 的请求构建和响应流解析
+
+API Key 格式支持：
+- 纯 key: "sk-xxxxxxxx" — 需要手动配 base_url
+- resource:key: "myresource:sk-xxxxxxxx" — 自动拼 base_url
+  反代也支持: base_url 配 "https://workers.dev/{resource}.openai.azure.com"
+  {resource} 会被替换成冒号前的部分
 """
 
-import json
 import asyncio
 import urllib.parse
 from datetime import datetime
@@ -28,6 +33,9 @@ from ..usage import extract_cache_usage
 # Azure OpenAI 格式化函数
 # ============================================================
 
+DEFAULT_BASE_URL = "https://{resource}.openai.azure.com"
+
+
 def format_text_message(text: str) -> dict:
     """格式化文本消息为 Azure OpenAI 格式"""
     return {"type": "text", "text": text}
@@ -44,37 +52,81 @@ async def format_image_message(image_url: str) -> dict:
     }
 
 
-def build_azure_endpoint(base_url, deployment_id, api_version="2025-01-01-preview"):
-    """构建 Azure OpenAI 端点 URL"""
-    # 移除base_url末尾的斜杠(如果有)
+def _parse_resource_key(api_key: str, base_url: str):
+    """解析 resource:key 格式，返回 (实际 api_key, 最终 base_url)。
+
+    支持三种场景：
+    1. 纯 key（无冒号）→ base_url 不变
+    2. resource:key → base_url 里的 {resource} 占位符被替换
+    3. resource:key + 反代 base_url → 同样替换 {resource}
+    """
+    api_key_str = str(api_key or "")
+    if ":" not in api_key_str:
+        return api_key_str, base_url
+
+    resource, real_key = api_key_str.split(":", 1)
+    resource = resource.strip()
+    real_key = real_key.strip()
+
+    if not resource or not real_key:
+        return api_key_str, base_url
+
+    # 替换 base_url 中的 {resource} 占位符
+    if "{resource}" in base_url:
+        resolved_url = base_url.replace("{resource}", resource)
+    else:
+        # base_url 没有占位符，可能是直接写了完整 URL，不做替换
+        resolved_url = base_url
+
+    return real_key, resolved_url
+
+
+def build_azure_endpoint(base_url, deployment_id, api_version=None):
+    """构建 Azure OpenAI 端点 URL。
+
+    优先使用 v1 API 路径（不需要 api-version 参数）。
+    如果用户配了 api_version，回退到旧路径格式。
+    """
     base_url = base_url.rstrip('/')
-    final_url = base_url
 
-    if "models/chat/completions" not in final_url:
-        # 构建路径
+    # 如果 URL 已经包含完整路径（如用户用 # 锁定），直接返回
+    if "models/chat/completions" in base_url or base_url.endswith("#"):
+        return base_url.rstrip("#")
+
+    if api_version:
+        # 旧路径：/openai/deployments/{id}/chat/completions?api-version=xxx
         path = f"/openai/deployments/{deployment_id}/chat/completions"
-        # 使用urljoin拼接base_url和path
-        final_url = urllib.parse.urljoin(base_url, path)
-
-    if "?api-version=" not in final_url:
-        # 添加api-version查询参数
-        final_url = f"{final_url}?api-version={api_version}"
-
-    return final_url
+        final_url = urllib.parse.urljoin(base_url + "/", path.lstrip("/"))
+        if "?api-version=" not in final_url:
+            final_url = f"{final_url}?api-version={api_version}"
+        return final_url
+    else:
+        # v1 新路径：/openai/v1/chat/completions（不需要 api-version）
+        # deployment 通过 payload 里的 model 字段传递
+        path = "/openai/v1/chat/completions"
+        return urllib.parse.urljoin(base_url + "/", path.lstrip("/"))
 
 
 async def get_azure_payload(request, engine, provider, api_key=None):
     """构建 Azure OpenAI API 的请求 payload"""
-    headers = {
-        'Content-Type': 'application/json',
-    }
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
-    headers['api-key'] = f"{api_key}"
+
+    # 解析 resource:key 格式
+    real_key, resolved_url = _parse_resource_key(api_key, provider.get('base_url', DEFAULT_BASE_URL))
+
+    # 读取用户配置的 api_version（如果有）
+    api_version = safe_get(provider, "preferences", "api_version", default=None)
+
+    headers = {
+        'Content-Type': 'application/json',
+        'api-key': real_key,
+    }
 
     url = build_azure_endpoint(
-        base_url=provider['base_url'],
+        base_url=resolved_url,
         deployment_id=original_model,
+        api_version=api_version,
     )
 
     messages = []
@@ -257,19 +309,61 @@ async def fetch_azure_response_stream(client, url, headers, payload, model, time
     yield "data: [DONE]" + end_of_line
 
 
+async def fetch_azure_models(client, provider):
+    """获取 Azure OpenAI 的模型列表（数据平面 API）。
+
+    使用 GET {endpoint}/openai/models 端点，api-key 认证。
+    返回该 Azure 资源下所有可用模型。
+    """
+    raw_base_url = provider.get('base_url', DEFAULT_BASE_URL)
+    api_key = provider.get('api')
+    if isinstance(api_key, list):
+        api_key = api_key[0] if api_key else None
+
+    # 解析 resource:key
+    real_key, resolved_url = _parse_resource_key(api_key, raw_base_url)
+
+    # {resource} 还在说明没有 resource:key 格式也没手动填 base_url
+    if "{resource}" in resolved_url:
+        raise ValueError("Azure 渠道需要配置 resource:key 格式的 API Key 或手动指定 base_url")
+
+    resolved_url = resolved_url.rstrip('/')
+    # 数据平面模型列表端点
+    models_url = f"{resolved_url}/openai/models?api-version=2024-10-21"
+
+    headers = {
+        'Content-Type': 'application/json',
+        'api-key': real_key,
+    }
+
+    response = await client.get(models_url, headers=headers)
+    response.raise_for_status()
+
+    data = response.json()
+    models = []
+    if isinstance(data, dict) and 'data' in data:
+        for m in data['data']:
+            if isinstance(m, dict) and m.get('id'):
+                models.append(m['id'])
+    elif isinstance(data, list):
+        models = [m.get('id') if isinstance(m, dict) else m for m in data]
+
+    return models
+
+
 def register():
     """注册 Azure 渠道到注册中心"""
     from .registry import register_channel
-    
+
     register_channel(
         id="azure",
-        type_name="azure",
-        default_base_url="https://{resource}.openai.azure.com",
+        type_name="openai-responses",
+        default_base_url=DEFAULT_BASE_URL,
         auth_header="api-key: {api_key}",
         description="Azure OpenAI Service",
         request_adapter=get_azure_payload,
         response_adapter=fetch_azure_response,
         stream_adapter=fetch_azure_response_stream,
-        models_adapter=None,
+        models_adapter=fetch_azure_models,
         source="builtin",
     )
