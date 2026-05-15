@@ -285,6 +285,30 @@ providers:
 
 在前端渠道编辑界面中，可以通过"插件拦截器"部分配置要启用的插件。
 
+#### 全局拦截器（无条件执行）
+
+注册拦截器时不设置 `plugin_name` 参数，则该拦截器为**全局拦截器**，对所有请求无条件执行，不受渠道的 `enabled_plugins` 控制。
+
+```python
+# 插件拦截器：受 enabled_plugins 控制
+register_request_interceptor(
+    interceptor_id="my_request_interceptor",
+    callback=my_request_interceptor,
+    priority=100,
+    plugin_name="my_plugin",  # 有 plugin_name → 需要渠道启用才执行
+)
+
+# 全局拦截器：无条件执行
+register_request_interceptor(
+    interceptor_id="my_global_interceptor",
+    callback=my_global_interceptor,
+    priority=3,
+    # 不设置 plugin_name → 所有请求都会经过
+)
+```
+
+适用场景：渠道内置的全局逻辑（如 AWS 的 SigV4 签名、Bedrock `cache_control` 清除等），通常在渠道的 `register()` 函数中注册，并在回调内通过 `engine` 参数判断是否为目标引擎。
+
 #### 拦截器管理 API
 
 ```python

@@ -853,6 +853,7 @@ async def get_model_trend(
     hours: Optional[int] = Query(default=24, ge=1, le=8760),
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    granularity: Optional[str] = Query(default=None, regex='^(hour|day)$'),
 ):
     """
     获取筛选模型的时间趋势数据，用于折线图展示。
@@ -868,14 +869,23 @@ async def get_model_trend(
     provider_list = [p.strip() for p in provider.split(',') if p.strip()] if provider else []
     model_list = [m.strip() for m in model.split(',') if m.strip()] if model else []
 
+    # 自动选择聚合粒度：>48h 用天，否则用小时
+    if not granularity:
+        span_hours = (end_dt - start_dt).total_seconds() / 3600
+        granularity = 'day' if span_hours > 48 else 'hour'
+
     if (DB_TYPE or "sqlite").lower() == "d1":
         from db import d1_client
-        # D1/SQLite 使用 strftime 聚合。D1 存储的是字符串，通常格式为 'YYYY-MM-DD HH:MM:SS'
-        # 我们将其截断到小时 'YYYY-MM-DD HH'
-        time_group = "strftime('%Y-%m-%d %H:00:00', timestamp)"
+        if granularity == 'day':
+            time_group = "strftime('%Y-%m-%d', timestamp)"
+        else:
+            time_group = "strftime('%Y-%m-%d %H:00:00', timestamp)"
         sql = f"""
             SELECT {time_group} AS hour, model, COUNT(*) AS count,
-            SUM(COALESCE(total_tokens, 0)) AS tokens
+            SUM(COALESCE(total_tokens, 0)) AS tokens,
+            SUM(COALESCE(prompt_tokens, 0)) AS prompt_tokens,
+            SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
+            SUM(COALESCE(cached_tokens, 0)) AS cached_tokens
             FROM request_stats WHERE timestamp >= ? AND timestamp <= ?
         """
         params = [format_d1_datetime(start_dt), format_d1_datetime(end_dt)]
@@ -894,20 +904,25 @@ async def get_model_trend(
         async with async_session_scope() as session:
             # PostgreSQL/MySQL 等数据库使用不同的日期截断函数
             if (DB_TYPE or "").lower() == "postgres":
-                time_group = func.date_trunc('hour', RequestStat.timestamp)
+                time_group = func.date_trunc(granularity, RequestStat.timestamp)
                 order_expr = time_group
             elif (DB_TYPE or "").lower() == "mysql":
-                time_group = func.date_format(RequestStat.timestamp, '%Y-%m-%d %H:00:00')
+                fmt = '%Y-%m-%d' if granularity == 'day' else '%Y-%m-%d %H:00:00'
+                time_group = func.date_format(RequestStat.timestamp, fmt)
                 order_expr = time_group
             else: # SQLite fallback
-                time_group = func.strftime('%Y-%m-%d %H:00:00', RequestStat.timestamp)
+                fmt = '%Y-%m-%d' if granularity == 'day' else '%Y-%m-%d %H:00:00'
+                time_group = func.strftime(fmt, RequestStat.timestamp)
                 order_expr = time_group
 
             query = select(
                 time_group.label('hour'),
                 RequestStat.model,
                 func.count().label('count'),
-                func.sum(func.coalesce(RequestStat.total_tokens, 0)).label('tokens')
+                func.sum(func.coalesce(RequestStat.total_tokens, 0)).label('tokens'),
+                func.sum(func.coalesce(RequestStat.prompt_tokens, 0)).label('prompt_tokens'),
+                func.sum(func.coalesce(RequestStat.completion_tokens, 0)).label('completion_tokens'),
+                func.sum(func.coalesce(RequestStat.cached_tokens, 0)).label('cached_tokens')
             ).where(RequestStat.timestamp >= start_dt, RequestStat.timestamp <= end_dt)
 
             if provider_list:
@@ -922,7 +937,9 @@ async def get_model_trend(
             query = query.group_by(time_group, RequestStat.model).order_by(order_expr)
             result = await session.execute(query)
             data = [
-                {"hour": str(row.hour), "model": row.model, "count": int(row.count), "tokens": int(row.tokens or 0)}
+                {"hour": str(row.hour), "model": row.model, "count": int(row.count), "tokens": int(row.tokens or 0),
+                 "prompt_tokens": int(row.prompt_tokens or 0), "completion_tokens": int(row.completion_tokens or 0),
+                 "cached_tokens": int(row.cached_tokens or 0)}
                 for row in result.fetchall()
             ]
 
@@ -943,10 +960,23 @@ async def get_model_trend(
     chart_data = sorted(chart_dict.values(), key=lambda x: x['hour'])
     tokens_chart_data = sorted(tokens_chart_dict.values(), key=lambda x: x['hour'])
 
+    # token 细分数据（按小时聚合，不按模型分）
+    token_breakdown: dict = {}
+    for item in data:
+        h = item['hour']
+        if h not in token_breakdown:
+            token_breakdown[h] = {"hour": h, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+        token_breakdown[h]["prompt_tokens"] += item.get("prompt_tokens", 0) or 0
+        token_breakdown[h]["completion_tokens"] += item.get("completion_tokens", 0) or 0
+        token_breakdown[h]["cached_tokens"] += item.get("cached_tokens", 0) or 0
+    token_breakdown_data = sorted(token_breakdown.values(), key=lambda x: x['hour'])
+
     return JSONResponse(content={
         "data": chart_data,
         "tokens_data": tokens_chart_data,
+        "token_breakdown": token_breakdown_data,
         "models": sorted(list(models_seen)),
+        "granularity": granularity,
         "start_datetime": start_dt.isoformat(),
         "end_datetime": end_dt.isoformat(),
     })

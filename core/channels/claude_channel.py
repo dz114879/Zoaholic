@@ -197,6 +197,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
     messages = []
     system_prompt = None
     tool_id = None
+    is_deepseek = "deepseek" in original_model.lower()
     for msg in request.messages:
         tool_call_id = None
         tool_calls = None
@@ -265,11 +266,15 @@ async def get_claude_payload(request, engine, provider, api_key=None):
             tool_id = tool_calls[0].id if tool_calls else None or tool_id
             tool_call_id = msg.tool_call_id
 
+        # DeepSeek Claude 端点豁免：回传 reasoning_content 为 thinking block（不带 signature）
+        thinking_blocks = []
+        if is_deepseek and msg.role == "assistant":
+            reasoning = getattr(msg, "reasoning_content", None) or (msg.model_extra or {}).get("reasoning_content")
+            if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                thinking_blocks.append({"type": "thinking", "thinking": reasoning})
+
         if tool_calls:
             tool_calls_list = []
-            # 修改原因：工具调用历史必须完整转发，否则后续 tool_result 会找不到对应 tool_use。
-            # 修改方式：不再按模式截断，直接遍历请求中的全部 tool_calls。
-            # 目的：保持 Claude 历史消息中的 tool_use 与 tool_result 成对。
             for tool_call in tool_calls:
                 tool_calls_list.append({
                     "type": "tool_use",
@@ -277,7 +282,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                     "name": tool_call.function.name,
                     "input": json_loads(tool_call.function.arguments),
                 })
-            messages.append({"role": msg.role, "content": tool_calls_list})
+            messages.append({"role": msg.role, "content": thinking_blocks + tool_calls_list})
         elif tool_call_id:
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
@@ -303,6 +308,12 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                     item if isinstance(item, dict) else {"type": "text", "text": str(item)}
                     for item in content
                 ]
+            if thinking_blocks:
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}] if content else []
+                elif not isinstance(content, list):
+                    content = []
+                content = thinking_blocks + content
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
             if system_prompt is None:

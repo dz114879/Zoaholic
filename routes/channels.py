@@ -24,6 +24,372 @@ router = APIRouter()
 is_debug = env_bool("DEBUG", False)
 
 
+TEST_PROVIDER_RUNTIME_FIELDS = {
+    "api",
+    "api_keys",
+    "sub_channels",
+    "_is_sub_channel",
+    "_parent_provider",
+    "_model_dict_cache",
+    "_virtual_route_provider",
+    "_virtual_priority",
+    "_virtual_route_test",
+}
+
+
+def _normalize_key_item(item: Any) -> Optional[str]:
+    """把渠道测试收到的单个 Key 配置归一化为字符串。"""
+    # 修改原因：渠道测试入口需要兼容旧字符串、新对象和带标签单键 dict 三种 Key 配置。
+    # 修改方式：把可用 Key 统一转换成字符串，并保留前导 ! 作为禁用标记。
+    # 目的：让后续 Key 选择逻辑只处理一种数据形态，避免主路由继续堆积格式判断。
+    if isinstance(item, str):
+        key = item.strip()
+        return key or None
+    if isinstance(item, dict):
+        key = item.get("key")
+        if isinstance(key, str) and key.strip():
+            key = key.strip()
+            if item.get("disabled") and not key.startswith("!"):
+                key = f"!{key}"
+            return key
+        if len(item) == 1:
+            raw_key = next(iter(item.keys()))
+            key = str(raw_key).strip()
+            return key or None
+    return None
+
+
+def _collect_key_candidates(raw_keys: Any) -> list[str]:
+    """从字符串、dict 或列表形式的 Key 配置中收集候选 Key。"""
+    # 修改原因：前端不同入口可能提交 api、api_keys、api_key 等不同形态。
+    # 修改方式：把非列表包装成单元素列表，再复用 _normalize_key_item 逐项解析。
+    # 目的：保证单渠道测试和逐 Key 测试都能使用相同的候选 Key 选择规则。
+    if raw_keys is None:
+        return []
+    items = raw_keys if isinstance(raw_keys, list) else [raw_keys]
+    results: list[str] = []
+    for item in items:
+        normalized = _normalize_key_item(item)
+        if normalized:
+            results.append(normalized)
+    return results
+
+
+def _get_test_model_name(test_config: Dict[str, Any]) -> str:
+    """读取测试请求模型名，优先使用内部已解析模型名。"""
+    # 修改原因：model_prefix 渠道可能需要把前端传入的无前缀模型名解析为带前缀的外部模型名。
+    # 修改方式：provider 构建阶段可写入 _resolved_test_model，请求构建阶段优先读取它。
+    # 目的：在不改变公开请求体格式的前提下，让拆分后的 provider 构建和 request 构建共享解析结果。
+    model = (
+        test_config.get("_resolved_test_model")
+        or test_config.get("model")
+        or test_config.get("model_alias")
+        or test_config.get("upstream_model")
+        or ""
+    )
+    model = str(model).strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model 是必填项")
+    return model
+
+
+def _get_upstream_model_hint(test_config: Dict[str, Any]) -> Optional[str]:
+    """读取前端传入的上游模型提示。"""
+    # 修改原因：测试弹窗会同时传别名 model 和 upstream_model，别名缺失时要用它补全映射。
+    # 修改方式：集中清洗 upstream_model 字段，空字符串统一视为 None。
+    # 目的：让 provider 模型映射补全逻辑不再散落在主路由中。
+    upstream_model_hint = test_config.get("upstream_model")
+    return str(upstream_model_hint).strip() if upstream_model_hint else None
+
+
+def _get_test_timeout(test_config: Dict[str, Any]) -> int:
+    """读取渠道测试超时时间。"""
+    # 修改原因：前端传入的 timeout 需要在 routes/channels.py 侧转为 handler 的 override_timeout。
+    # 修改方式：保留原有默认值 30，并把非法值回退为默认值、最小值限制为 1。
+    # 目的：不修改 handler.py 的前提下，让测试接口继续尊重前端超时设置。
+    timeout = test_config.get("timeout", 30)
+    try:
+        return max(1, int(timeout))
+    except Exception:
+        return 30
+
+
+def _is_virtual_route_test(test_config: Dict[str, Any]) -> bool:
+    """判断当前请求是否为虚拟路由测试。"""
+    # 修改原因：虚拟路由测试标记可能在请求体顶层，也可能在前端构造的 provider_snapshot 中。
+    # 修改方式：在清洗 provider_snapshot 之前单独读取这两个位置。
+    # 目的：后续清理 _virtual_route_test 运行时字段时，不破坏已有虚拟路由测试入口。
+    provider_snapshot = test_config.get("provider_snapshot")
+    return bool(
+        test_config.get("virtual_route_test")
+        or (isinstance(provider_snapshot, dict) and provider_snapshot.get("_virtual_route_test"))
+    )
+
+
+def _clean_test_provider_snapshot(provider_snapshot: Any) -> Dict[str, Any]:
+    """深拷贝并清理测试用 provider snapshot。"""
+    # 修改原因：前端快照可能包含运行时字段，直接交给 handler 会影响 Key 轮换、虚拟路由和子渠道语义。
+    # 修改方式：进入 provider 构建的第一步就深拷贝快照，并剥离 api、api_keys、sub_channels 及内部运行时字段。
+    # 目的：构造一个只用于本次测试的干净 provider，避免污染正式请求链路。
+    provider = copy.deepcopy(provider_snapshot) if isinstance(provider_snapshot, dict) else {}
+    if not isinstance(provider, dict):
+        return {}
+    for field in TEST_PROVIDER_RUNTIME_FIELDS:
+        provider.pop(field, None)
+    return provider
+
+
+def _select_test_api_key(test_config: Dict[str, Any], provider_snapshot: Any) -> Optional[str]:
+    """选择本次单渠道测试使用的 API Key。"""
+    # 修改原因：测试 provider 必须剥离原始 Key 池，但 request_model 仍需要一个明确的 force_api_key。
+    # 修改方式：先读取显式 api_key/api，再从原始 snapshot 的 api/api_keys 收集候选，优先选择未禁用 Key。
+    # 目的：保留旧格式兼容性，同时避免 handler 根据完整 Key 池误算重试次数。
+    explicit_api_key = test_config.get("api_key") or test_config.get("api")
+    if isinstance(explicit_api_key, str) and explicit_api_key.strip():
+        selected_api_key = explicit_api_key.strip()
+        return selected_api_key[1:] if selected_api_key.startswith("!") else selected_api_key
+
+    candidates: list[str] = []
+    if not isinstance(explicit_api_key, str):
+        candidates.extend(_collect_key_candidates(explicit_api_key))
+    if isinstance(provider_snapshot, dict):
+        candidates.extend(_collect_key_candidates(provider_snapshot.get("api")))
+        candidates.extend(_collect_key_candidates(provider_snapshot.get("api_keys")))
+    candidates.extend(_collect_key_candidates(test_config.get("api_keys")))
+
+    for key in candidates:
+        if not key.startswith("!"):
+            return key
+    if candidates:
+        first = candidates[0]
+        return first[1:] if first.startswith("!") else first
+    return None
+
+
+def _build_test_provider(test_config: Dict[str, Any], app: Any) -> tuple[Dict[str, Any], Optional[str], str]:
+    """从测试配置构建干净 provider、选中的 Key 和 engine。"""
+    # 修改原因：原 test_channel 同时负责 snapshot 清洗、engine 推断、base_url、模型映射和 Key 选择，难以维护。
+    # 修改方式：把单渠道测试 provider 的构建集中到一个模块级函数，返回 handler 所需的最小输入。
+    # 目的：让主路由只做调度，同时保留别名、model_prefix、upstream_model_hint 和默认 base_url 行为。
+    from core.utils import get_model_dict
+
+    _ = app
+    provider_snapshot = test_config.get("provider_snapshot")
+    provider = _clean_test_provider_snapshot(provider_snapshot)
+    selected_api_key = _select_test_api_key(test_config, provider_snapshot)
+
+    engine = (
+        test_config.get("engine")
+        or provider.get("engine")
+        or test_config.get("type")
+        or "openai"
+    )
+    engine = str(engine).strip() if engine is not None else "openai"
+
+    model = _get_test_model_name(test_config)
+    upstream_model_hint = _get_upstream_model_hint(test_config)
+
+    channel = get_channel(engine)
+    if not channel:
+        raise HTTPException(status_code=404, detail=f"Channel type '{engine}' not found")
+
+    provider["provider"] = provider.get("provider") or f"test_{engine or 'channel'}"
+    provider["engine"] = engine
+
+    base_url = test_config.get("base_url") or provider.get("base_url", "")
+    base_url = str(base_url).strip() if base_url else ""
+    if not base_url:
+        if channel.default_base_url:
+            base_url = channel.default_base_url
+            logger.info(f"Using default base_url for channel '{engine}': {base_url}")
+        else:
+            raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"https://{base_url}"
+        logger.info(f"Auto-prefixed base_url: {base_url}")
+    provider["base_url"] = base_url.rstrip('/')
+
+    if selected_api_key:
+        provider["api"] = selected_api_key
+
+    provider_models = provider.get("model")
+    if not isinstance(provider_models, list):
+        fallback_models = provider.get("models")
+        provider_models = copy.deepcopy(fallback_models) if isinstance(fallback_models, list) else []
+
+    if not provider_models:
+        if upstream_model_hint and upstream_model_hint != model:
+            provider_models = [{upstream_model_hint: model}]
+        else:
+            provider_models = [model]
+
+    provider["model"] = provider_models
+    provider.pop("models", None)
+
+    model_dict = get_model_dict(provider)
+    prefix = str(provider.get('model_prefix') or '').strip()
+    resolved_model = model
+
+    if resolved_model not in model_dict:
+        prefixed_model = f"{prefix}{model}" if prefix else None
+        if prefixed_model and prefixed_model in model_dict:
+            resolved_model = prefixed_model
+        else:
+            if upstream_model_hint and upstream_model_hint != model:
+                provider["model"].append({upstream_model_hint: model})
+            else:
+                provider["model"].append(model)
+            model_dict = get_model_dict(provider)
+            if prefixed_model and prefixed_model in model_dict:
+                resolved_model = prefixed_model
+
+    provider["_model_dict_cache"] = model_dict
+    test_config["_resolved_test_model"] = resolved_model
+
+    if resolved_model not in model_dict:
+        raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
+
+    return provider, selected_api_key, engine
+
+
+def _build_test_request(test_config: Dict[str, Any]):
+    """从测试配置构建 RequestModel。"""
+    # 修改原因：测试请求的 prompt、stream、max_tokens、temperature 默认值原本散在主路由中。
+    # 修改方式：集中读取和类型转换，并复用 _get_test_model_name 取得最终请求模型名。
+    # 目的：保持 API 请求格式不变，同时让主路由不再承担请求对象细节。
+    from core.models import RequestModel
+
+    model = _get_test_model_name(test_config)
+    prompt = test_config.get("prompt") or "Hi"
+    messages = [{"role": "user", "content": str(prompt)}]
+
+    stream = bool(test_config.get("stream", False))
+
+    max_tokens = test_config.get("max_tokens", 16)
+    try:
+        max_tokens = int(max_tokens) if max_tokens is not None else 16
+    except Exception:
+        max_tokens = 16
+
+    temperature = test_config.get("temperature", 0.5)
+    try:
+        temperature = float(temperature) if temperature is not None else 0.5
+    except Exception:
+        temperature = 0.5
+
+    return RequestModel(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        stream=stream,
+        temperature=temperature,
+    )
+
+
+def _resolve_virtual_test(test_config: Dict[str, Any], app: Any) -> list[Dict[str, Any]]:
+    """解析虚拟路由测试候选 provider。"""
+    # 修改原因：虚拟路由测试必须经过 preferences.virtual_models 的 chain 展开，不能走单 provider 直连。
+    # 修改方式：把虚拟模型解析分支单独封装，主路由只接收展开后的 providers。
+    # 目的：保留虚拟模型 fallback 链条，并让 override_auto_retry=True 只作用于虚拟路由测试。
+    from core.virtual_routing import resolve_virtual_model
+
+    model = _get_test_model_name(test_config)
+    test_config["_resolved_test_model"] = model
+    providers = resolve_virtual_model(model, app.state.config, 0, app)
+    if providers is None:
+        raise HTTPException(status_code=400, detail=f"model '{model}' 不是已配置的虚拟模型")
+    if not providers:
+        raise HTTPException(status_code=400, detail=f"虚拟模型 '{model}' 没有可用的路由链条")
+    return providers
+
+
+def _strip_gateway_prefix(msg: str) -> str:
+    """剥离测试响应中由网关包装出来的错误前缀。"""
+    # 修改原因：前端需要看到上游真实错误，而不是 Zoaholic 内部包装文本。
+    # 修改方式：保留原有两种前缀规则，并在响应提取阶段统一调用。
+    # 目的：让普通 body 和 body_iterator 错误都使用相同格式化结果。
+    if not msg:
+        return msg
+    prefix = "Error: Current provider response failed: "
+    if msg.startswith(prefix):
+        return msg[len(prefix):]
+    if msg.startswith("All ") and " error: " in msg:
+        return msg.split(" error: ", 1)[1]
+    return msg
+
+
+async def _read_test_response_preview(response: Any, limit: int = 800) -> str:
+    """读取测试响应预览文本。"""
+    # 修改原因：request_model 可能返回已经有 body 的响应，也可能返回 StreamingResponse 的 body_iterator。
+    # 修改方式：优先读取 body，缺失时最多消费 limit 长度的 body_iterator。
+    # 目的：保留原测试接口的 response_preview 和错误解析能力。
+    preview = ""
+    if hasattr(response, "body"):
+        try:
+            body = response.body
+            if isinstance(body, bytes):
+                preview = body.decode("utf-8", errors="ignore")[:limit]
+            else:
+                preview = str(body)[:limit]
+        except Exception:
+            pass
+    elif hasattr(response, "body_iterator"):
+        chunks = []
+        total = 0
+        try:
+            async for chunk in response.body_iterator:
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode("utf-8", errors="ignore")
+                else:
+                    chunk = str(chunk)
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > limit:
+                    break
+        except Exception:
+            pass
+        preview = "".join(chunks)[:limit]
+    return preview
+
+
+async def _extract_test_result(response: Any, start_time: float) -> Dict[str, Any]:
+    """从 handler 响应中提取渠道测试结果。"""
+    # 修改原因：响应预览、JSON 错误解析和认证失败判断原本占据主路由大量代码。
+    # 修改方式：把 body/body_iterator 读取、错误前缀剥离和标准字段组装集中到这里。
+    # 目的：保持前端响应结构完全不变，同时让 test_channel 成为薄调度层。
+    latency_ms = int((time() - start_time) * 1000)
+    status_code = response.status_code
+    preview = await _read_test_response_preview(response)
+
+    success = 200 <= status_code < 300
+    auth_failed = status_code in (401, 403)
+
+    error_detail = None
+    if not success and preview:
+        try:
+            resp_json = json.loads(preview)
+            if isinstance(resp_json, dict):
+                err_obj = resp_json.get("error")
+                if isinstance(err_obj, dict):
+                    error_detail = _strip_gateway_prefix(err_obj.get("message") or str(err_obj))
+                elif err_obj:
+                    error_detail = _strip_gateway_prefix(str(err_obj))
+                elif resp_json.get("detail"):
+                    error_detail = _strip_gateway_prefix(str(resp_json["detail"]))
+        except (json.JSONDecodeError, ValueError):
+            error_detail = _strip_gateway_prefix(preview)
+
+    return {
+        "success": success,
+        "latency_ms": latency_ms,
+        "message": "测试成功" if success else f"HTTP {status_code}",
+        "error": error_detail,
+        "upstream_status_code": status_code,
+        "auth_failed": auth_failed,
+        "response_preview": preview if success else None,
+    }
+
+
 @router.get("/v1/channels", dependencies=[Depends(rate_limit_dependency)])
 async def get_channels(token: str = Depends(verify_admin_api_key)):
     """
@@ -231,198 +597,22 @@ async def test_channel(
         "api_key": "sk-xxx"
     }
     """
-    from core.models import RequestModel
-    from core.utils import get_model_dict
-
-    def _normalize_key_item(item: Any) -> Optional[str]:
-        if isinstance(item, str):
-            key = item.strip()
-            return key or None
-        if isinstance(item, dict):
-            # 支持 {"key": "sk-xxx", "disabled": true} 格式
-            key = item.get("key")
-            if isinstance(key, str) and key.strip():
-                key = key.strip()
-                if item.get("disabled") and not key.startswith("!"):
-                    key = f"!{key}"
-                return key
-            # 支持 {"sk-xxx": "label"} 单键 dict 格式
-            if len(item) == 1:
-                raw_key = next(iter(item.keys()))
-                key = str(raw_key).strip()
-                return key or None
-        return None
-
-    def _collect_key_candidates(raw_keys: Any) -> list[str]:
-        if raw_keys is None:
-            return []
-        items = raw_keys if isinstance(raw_keys, list) else [raw_keys]
-        results: list[str] = []
-        for item in items:
-            normalized = _normalize_key_item(item)
-            if normalized:
-                results.append(normalized)
-        return results
-    
     app = get_app()
+    timeout = _get_test_timeout(test_config)
+    virtual_route_test = _is_virtual_route_test(test_config)
 
-    provider_snapshot = test_config.get("provider_snapshot")
-    provider = copy.deepcopy(provider_snapshot) if isinstance(provider_snapshot, dict) else {}
-    if not isinstance(provider, dict):
-        provider = {}
-
-    engine = (
-        test_config.get("engine")
-        or provider.get("engine")
-        or test_config.get("type")
-        or "openai"
-    )
-    engine = str(engine).strip() if engine is not None else "openai"
-
-    model = (
-        test_config.get("model")
-        or test_config.get("model_alias")
-        or test_config.get("upstream_model")
-        or ""
-    )
-    model = str(model).strip()
-
-    upstream_model_hint = test_config.get("upstream_model")
-    upstream_model_hint = str(upstream_model_hint).strip() if upstream_model_hint else None
-
-    if not model:
-        raise HTTPException(status_code=400, detail="model 是必填项")
-
-    timeout = test_config.get("timeout", 30)
-    try:
-        timeout = max(1, int(timeout))
-    except Exception:
-        timeout = 30
-
-    # 修改原因：虚拟路由测试不能按单个 provider_snapshot 直连测试，否则不会经过 preferences.virtual_models 的 chain 解析。
-    # 修改方式：当前端传 virtual_route_test 或 _virtual_route_test 标记时，直接用后端当前配置解析虚拟模型候选 provider。
-    # 目的：ChannelTestDialog 中选择虚拟模型名测试时，能走与正式请求相同的虚拟路由链条。
-    virtual_route_test = bool(test_config.get("virtual_route_test") or provider.get("_virtual_route_test"))
+    # 修改原因：普通单渠道测试和虚拟路由测试需要不同的 provider 来源。
+    # 修改方式：虚拟路由测试走 resolve_virtual_model 展开链条；普通测试只构建一个干净 provider。
+    # 目的：主函数只保留调度语义，不再混合 provider 构造细节。
     selected_api_key = None
-    override_providers = None
-
     if virtual_route_test:
-        from core.virtual_routing import resolve_virtual_model
-
-        override_providers = resolve_virtual_model(model, app.state.config, 0, app)
-        if override_providers is None:
-            raise HTTPException(status_code=400, detail=f"model '{model}' 不是已配置的虚拟模型")
-        if not override_providers:
-            raise HTTPException(status_code=400, detail=f"虚拟模型 '{model}' 没有可用的路由链条")
+        override_providers = _resolve_virtual_test(test_config, app)
     else:
-        channel = get_channel(engine)
-        if not channel:
-            raise HTTPException(status_code=404, detail=f"Channel type '{engine}' not found")
-
-        provider["provider"] = provider.get("provider") or f"test_{engine or 'channel'}"
-        provider["engine"] = engine
-
-        base_url = test_config.get("base_url") or provider.get("base_url", "")
-        base_url = str(base_url).strip() if base_url else ""
-
-        # 如果 base_url 为空，使用渠道默认值
-        if not base_url:
-            if channel.default_base_url:
-                base_url = channel.default_base_url
-                logger.info(f"Using default base_url for channel '{engine}': {base_url}")
-            else:
-                raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
-
-        # 验证 base_url 格式
-        if not base_url.startswith(("http://", "https://")):
-            # 自动添加 https:// 前缀
-            base_url = f"https://{base_url}"
-            logger.info(f"Auto-prefixed base_url: {base_url}")
-        provider["base_url"] = base_url.rstrip('/')
-
-        # 解析测试使用 API Key：显式传参 > provider.api / provider.api_keys
-        explicit_api_key = test_config.get("api_key") or test_config.get("api")
-        if isinstance(explicit_api_key, str) and explicit_api_key.strip():
-            selected_api_key = explicit_api_key.strip()
-            if selected_api_key.startswith("!"):
-                selected_api_key = selected_api_key[1:]
-        else:
-            candidates = _collect_key_candidates(provider.get("api"))
-            candidates.extend(_collect_key_candidates(provider.get("api_keys")))
-
-            for key in candidates:
-                if not key.startswith("!"):
-                    selected_api_key = key
-                    break
-
-            if not selected_api_key and candidates:
-                selected_api_key = candidates[0][1:] if candidates[0].startswith("!") else candidates[0]
-
-        if selected_api_key:
-            provider["api"] = selected_api_key
-
-        # 确保模型映射存在，兼容别名测试
-        provider_models = provider.get("model")
-        if not isinstance(provider_models, list):
-            fallback_models = provider.get("models")
-            provider_models = copy.deepcopy(fallback_models) if isinstance(fallback_models, list) else []
-
-        if not provider_models:
-            if upstream_model_hint and upstream_model_hint != model:
-                provider_models = [{upstream_model_hint: model}]
-            else:
-                provider_models = [model]
-
-        provider["model"] = provider_models
-        provider.pop("models", None)
-
-        model_dict = get_model_dict(provider)
-        prefix = provider.get('model_prefix', '').strip()
-
-        if model not in model_dict:
-            # 前端可能传了不带前缀的模型名，尝试自动匹配带前缀的版本
-            prefixed_model = f"{prefix}{model}" if prefix else None
-            if prefixed_model and prefixed_model in model_dict:
-                model = prefixed_model
-            else:
-                if upstream_model_hint and upstream_model_hint != model:
-                    provider["model"].append({upstream_model_hint: model})
-                else:
-                    provider["model"].append(model)
-                model_dict = get_model_dict(provider)
-
-        provider["_model_dict_cache"] = model_dict
-
-        if model not in model_dict:
-            raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
-
+        provider, selected_api_key, engine = _build_test_provider(test_config, app)
+        _ = engine
         override_providers = [provider]
 
-    # 构建测试请求（允许外部覆盖部分参数，默认保持轻量）
-    prompt = test_config.get("prompt") or "Hi"
-    messages = [{"role": "user", "content": str(prompt)}]
-
-    stream = bool(test_config.get("stream", False))
-
-    max_tokens = test_config.get("max_tokens", 16)
-    try:
-        max_tokens = int(max_tokens) if max_tokens is not None else 16
-    except Exception:
-        max_tokens = 16
-
-    temperature = test_config.get("temperature", 0.5)
-    try:
-        temperature = float(temperature) if temperature is not None else 0.5
-    except Exception:
-        temperature = 0.5
-
-    test_request = RequestModel(
-        model=model,
-        messages=messages,
-        max_tokens=max_tokens,
-        stream=stream,
-        temperature=temperature,
-    )
+    test_request = _build_test_request(test_config)
 
     # ── 走 request_model 全链路（日志、统计、插件、重试全由内核管理） ──
     from routes.deps import get_model_handler
@@ -442,72 +632,14 @@ async def test_channel(
             background_tasks=bg_tasks,
             override_providers=override_providers,
             force_api_key=selected_api_key,
+            # 修改原因：handler.py 的 override 重试语义已经稳定，不应再在 handler 内增加补丁。
+            # 修改方式：单渠道测试显式传 False，虚拟路由测试显式传 True。
+            # 目的：单渠道测试只测当前渠道，虚拟路由测试可以按 chain 候选 fallback。
             override_auto_retry=virtual_route_test,
+            override_timeout=timeout,
         )
 
-        latency_ms = int((time() - start_time) * 1000)
-
-        # 提取响应内容用于预览
-        preview = ""
-        status_code = response.status_code
-        if hasattr(response, "body"):
-            try:
-                preview = response.body.decode("utf-8", errors="ignore")[:800]
-            except Exception:
-                pass
-        elif hasattr(response, "body_iterator"):
-            chunks = []
-            total = 0
-            try:
-                async for chunk in response.body_iterator:
-                    if isinstance(chunk, bytes):
-                        chunk = chunk.decode("utf-8", errors="ignore")
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total > 800:
-                        break
-            except Exception:
-                pass
-            preview = "".join(chunks)[:800]
-
-        success = 200 <= status_code < 300
-        auth_failed = status_code in (401, 403)
-
-        # 解析错误信息，剥离 Zoaholic 内部前缀
-        def _strip_gateway_prefix(msg: str) -> str:
-            if not msg:
-                return msg
-            p = "Error: Current provider response failed: "
-            if msg.startswith(p):
-                return msg[len(p):]
-            if msg.startswith("All ") and " error: " in msg:
-                return msg.split(" error: ", 1)[1]
-            return msg
-
-        error_detail = None
-        if not success and preview:
-            try:
-                resp_json = json.loads(preview)
-                if isinstance(resp_json, dict):
-                    err_obj = resp_json.get("error")
-                    if isinstance(err_obj, dict):
-                        error_detail = _strip_gateway_prefix(err_obj.get("message") or str(err_obj))
-                    elif err_obj:
-                        error_detail = _strip_gateway_prefix(str(err_obj))
-                    elif resp_json.get("detail"):
-                        error_detail = str(resp_json["detail"])
-            except (json.JSONDecodeError, ValueError):
-                error_detail = _strip_gateway_prefix(preview)
-
-        return JSONResponse(content={
-            "success": success,
-            "latency_ms": latency_ms,
-            "message": "测试成功" if success else f"HTTP {status_code}",
-            "error": error_detail,
-            "upstream_status_code": status_code,
-            "auth_failed": auth_failed,
-            "response_preview": preview if success else None,
-        })
+        return JSONResponse(content=await _extract_test_result(response, start_time))
 
     except HTTPException as he:
         latency_ms = int((time() - start_time) * 1000)

@@ -2914,6 +2914,20 @@ export default function Channels() {
         });
       }
     });
+    // 子渠道模型也纳入搜索
+    (p.sub_channels || []).forEach((sub: any) => {
+      const subModels = Array.isArray(sub.model) ? sub.model : [];
+      subModels.forEach((m: any) => {
+        if (typeof m === 'string') {
+          names.push(m);
+        } else if (typeof m === 'object' && m !== null) {
+          Object.entries(m).forEach(([upstream, alias]) => {
+            names.push(String(alias));
+            names.push(upstream);
+          });
+        }
+      });
+    });
     return names;
   };
 

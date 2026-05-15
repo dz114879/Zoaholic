@@ -548,7 +548,10 @@ async def get_matching_providers(
     if virtual_providers is not None:
         if not _is_virtual_model_authorized(request_model, config, api_index):
             return []
-        return _filter_provider_list(virtual_providers, request_model, config, api_index)
+        filtered = _filter_provider_list(virtual_providers, request_model, config, api_index)
+        if filtered:
+            return filtered
+        # chain 全挂 → fallthrough 到常规路由
 
     provider_rules = []
 

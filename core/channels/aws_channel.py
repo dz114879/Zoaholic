@@ -368,6 +368,26 @@ async def get_aws_passthrough_meta(request, engine, provider, api_key=None):
     return url, headers, {}
 
 
+def _strip_cache_control(obj):
+    """递归清除 payload 中所有 cache_control 字段（Bedrock 自动缓存，不认客户端传的）。"""
+    if isinstance(obj, dict):
+        obj.pop("cache_control", None)
+        for v in obj.values():
+            _strip_cache_control(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            _strip_cache_control(item)
+
+
+async def _aws_strip_cache_control_interceptor(request, engine, provider, api_key, url, headers, payload):
+    """AWS 全局拦截器：清除 payload 中的 cache_control 字段。"""
+    if engine != "aws":
+        return url, headers, payload
+    if isinstance(payload, dict):
+        _strip_cache_control(payload)
+    return url, headers, payload
+
+
 async def _aws_passthrough_signing_interceptor(request, engine, provider, api_key, url, headers, payload):
     """Claude 透传路径的 SigV4 签名拦截器：在最终 payload 确定后完成签名。"""
     # 修改原因：AWS SigV4 签名必须包含最终 JSON body 的 SHA256，不能在 passthrough_meta 阶段提前计算。
@@ -751,6 +771,14 @@ def register():
     # 修改原因：透传签名必须在 handler 合成最终 payload 后执行。
     # 修改方式：注册一个内置全局请求拦截器；不设置 plugin_name，避免被 enabled_plugins 过滤跳过。
     # 目的：确保所有 AWS Claude 透传请求都会在发送前补齐正确的 SigV4 headers。
+    register_request_interceptor(
+        interceptor_id="aws_strip_cache_control",
+        callback=_aws_strip_cache_control_interceptor,
+        priority=3,
+        overwrite=True,
+        metadata={"description": "AWS Bedrock 清除 cache_control"},
+    )
+
     register_request_interceptor(
         interceptor_id="aws_passthrough_signing",
         callback=_aws_passthrough_signing_interceptor,
