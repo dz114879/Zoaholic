@@ -394,7 +394,13 @@ async def get_account_quota(key_id: str, request: Request, provider: str):
     channel_id = _require_provider_name(provider)
     if not channel_id:
         return JSONResponse({"error": "provider is required"}, status_code=400)
-    quota = await request.app.state.oauth_manager.fetch_quota(channel_id, key_id)
+    try:
+        # 修改原因：provider 层现在会把 Claude Code usage 上游错误向上抛出，默认 500 无法给前端提供可见细节。
+        # 修改方式：在路由层捕获 quota 查询异常，并返回带错误详情的 502 JSON 响应。
+        # 目的：让前端可以读取错误正文，并在控制台展示可排查的失败原因。
+        quota = await request.app.state.oauth_manager.fetch_quota(channel_id, key_id)
+    except Exception as exc:
+        return JSONResponse({"error": f"Quota query failed: {exc}"}, status_code=502)
     if quota is None:
         return JSONResponse({"error": "Quota not available"}, status_code=404)
     return quota

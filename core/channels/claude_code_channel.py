@@ -416,10 +416,16 @@ class ClaudeCodeProvider(OAuthProvider):
                     headers=headers,
                 )
                 if resp.status_code != 200:
-                    return None
+                    # 修改原因：此前上游 HTTP 错误被转成 None，路由层无法把具体失败原因返回给前端。
+                    # 修改方式：非 200 响应直接抛出包含状态码和响应正文片段的 ValueError。
+                    # 目的：让 Claude Code usage 接口失败时，管理员能在前端控制台看到可排查的上游错误。
+                    raise ValueError(f"upstream {resp.status_code}: {resp.text[:500]}")
                 data = resp.json()
         except Exception:
-            return None
+            # 修改原因：此前异常被静默吞掉，导致上层只能得到 Quota not available。
+            # 修改方式：保留异常原样向上抛出，不在 provider 层改写为 None。
+            # 目的：让路由层统一生成带错误详情的 JSON 响应。
+            raise
 
         result = {}
         # five_hour → 5h 窗口

@@ -195,7 +195,8 @@ class GeminiCLIProvider(OAuthProvider):
         token_url = self._resolve_token_url(config)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(token_url, data=data)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise ValueError(f"{response.status_code} {response.text}")
             payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Invalid token response")

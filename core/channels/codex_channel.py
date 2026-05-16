@@ -397,7 +397,8 @@ class CodexProvider(OAuthProvider):
         }
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(token_url, data=data, headers=headers)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise ValueError(f"{response.status_code} {response.text}")
             payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Invalid token response")
@@ -475,6 +476,38 @@ def _decode_codex_identity(id_token: str | None) -> dict[str, str]:
 
 
 CODEX_USER_AGENT = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
+
+# Codex 端点不接受的字段
+_CODEX_STRIP_FIELDS = {'max_output_tokens', 'max_tokens', 'max_completion_tokens'}
+
+
+async def _codex_payload_interceptor(request, engine, provider, api_key, url, headers, payload):
+    """Codex 全局拦截器：强制必要参数 + 清理不支持的字段。"""
+    if engine != "codex":
+        return url, headers, payload
+    if not isinstance(payload, dict):
+        return url, headers, payload
+    # 强制 store=false（Codex 端点要求）
+    payload["store"] = False
+    # 确保 instructions 存在（Codex 端点必须，模拟官方客户端默认值）
+    if not payload.get("instructions"):
+        payload["instructions"] = "You are ChatGPT"
+    # 清理 Codex 不接受的字段
+    for f in _CODEX_STRIP_FIELDS:
+        payload.pop(f, None)
+    return url, headers, payload
+
+
+# 注册为内置拦截器（无 plugin_name → 全局生效）
+try:
+    from core.plugins.interceptors import register_request_interceptor
+    register_request_interceptor(
+        "codex_payload_enforcer",
+        _codex_payload_interceptor,
+        priority=3,
+    )
+except ImportError:
+    pass
 
 
 async def get_codex_payload(request, engine, provider, api_key=None):

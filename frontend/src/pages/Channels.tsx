@@ -911,7 +911,22 @@ export default function Channels() {
     targets.forEach(([keyId]) => {
       setOauthAccounts(prev => prev[keyId] ? { ...prev, [keyId]: { ...prev[keyId], _quota_loading: true } } : prev);
       apiFetch(`/v1/oauth/accounts/${encodeURIComponent(keyId)}/quota?provider=${encodeURIComponent(providerName)}`, { headers: { Authorization: `Bearer ${token}` } })
-        .then(async res => (res.ok ? await res.json() : null))
+        .then(async res => {
+          if (res.ok) return await res.json();
+          // 修改原因：此前非 ok 响应只写入控制台，管理员在页面上无法看到 OAuth quota 查询失败原因。
+          // 修改方式：非 ok 时尝试读取 JSON 错误正文，并通过 toastWarning 显示账号和错误信息。
+          // 目的：让额度查询失败在界面上可见，避免静默失败。
+          try {
+            const errBody = await res.json();
+            const errMsg = errBody?.error || `HTTP ${res.status}`;
+            toastWarning(`${keyId}: ${errMsg}`);
+          } catch {
+            // 修改原因：某些错误响应可能不是 JSON，解析失败不应影响账号列表状态更新。
+            // 修改方式：忽略解析异常，继续返回 null 走既有 quota_unavailable 标记流程。
+            // 目的：只增加错误可见性，不改变失败时前端状态收敛逻辑。
+          }
+          return null;
+        })
         .then(quota => {
           setOauthAccounts(prev => {
             const current = prev[keyId];

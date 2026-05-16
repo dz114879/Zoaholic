@@ -414,6 +414,21 @@ class OAuthManager:
         provider = self._providers.get(cred.get("type"))
         if not provider or not hasattr(provider, "fetch_quota"):
             return None
+        # 修改原因：fetch_quota 不经过 resolve()，直接使用过期 access_token 会导致额度查询失败。
+        # 修改方式：额度查询前按 5 分钟提前量检查 access_token，有过期风险时先调用 resolve() 刷新。
+        # 目的：让 OAuth 额度查询和正常请求保持同样的 token 有效性保障。
+        import time
+        if time.time() > cred.get("expires_at", 0) - 300:
+            refreshed_token = await self.resolve(channel_id, key_id)
+            if not refreshed_token:
+                raise ValueError("access_token expired and refresh failed")
+            # 修改原因：resolve() 刷新成功后会更新 accounts dict，旧 cred 可能仍持有过期 access_token。
+            # 修改方式：刷新后重新从当前渠道账号表读取 credential。
+            # 目的：确保 provider.fetch_quota 使用刚刷新的 access_token。
+            cred = accounts.get(key_id)
+            if not cred:
+                return None
+
         # 找当前渠道的 provider config（含 base_url 等），传给 provider 走反代
         channel_config = self._find_channel_config(channel_id)
         quota = await self._call_provider_method(provider.fetch_quota, cred, config=channel_config)

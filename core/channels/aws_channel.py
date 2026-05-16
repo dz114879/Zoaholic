@@ -379,12 +379,18 @@ def _strip_cache_control(obj):
             _strip_cache_control(item)
 
 
+# Bedrock body 不接受的字段（模型在 URL 里，streaming 靠 endpoint 区分）
+_BEDROCK_STRIP_FIELDS = {'model', 'stream', 'stream_options'}
+
+
 async def _aws_strip_cache_control_interceptor(request, engine, provider, api_key, url, headers, payload):
-    """AWS 全局拦截器：清除 payload 中的 cache_control 字段。"""
+    """AWS 全局拦截器：清除 payload 中 Bedrock 不接受的字段。"""
     if engine != "aws":
         return url, headers, payload
     if isinstance(payload, dict):
         _strip_cache_control(payload)
+        for f in _BEDROCK_STRIP_FIELDS:
+            payload.pop(f, None)
     return url, headers, payload
 
 
