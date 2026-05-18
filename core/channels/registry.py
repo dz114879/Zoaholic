@@ -92,6 +92,10 @@ class ChannelDefinition:
     # 修改方式：在渠道定义上保存只读布尔标记，由具体渠道注册时声明。
     # 目的：让后端路由和前端管理页都通过统一注册表识别 OAuth 引擎。
     is_oauth: bool = False
+    # 修改原因：OAuth provider 注册需要从 main.py 的硬编码迁移到渠道注册表，插件渠道也要能声明自己的 provider。
+    # 修改方式：在 ChannelDefinition 上保存运行时使用的 OAuthProvider 实例，但不在 to_dict API 输出中暴露。
+    # 目的：启动时扫描注册表即可统一注册内置和外置 OAuth 渠道，同时避免把 provider 对象返回给前端。
+    oauth_provider: Any = None
     source: str = "plugin"
     
     def to_dict(self) -> Dict[str, Any]:
@@ -147,6 +151,10 @@ def register_channel(
     # 修改方式：register_channel 增加可选 is_oauth 参数，默认保持 False 以兼容既有渠道。
     # 目的：具体渠道只需在注册时声明一次，后续路由和前端都可读取同一标记。
     is_oauth: bool = False,
+    # 修改原因：OAuth provider 实例应由渠道自身在 register_channel 时声明，main.py 不应维护渠道清单。
+    # 修改方式：新增可选 oauth_provider 参数；传入 provider 时会自动把渠道标记为 OAuth 渠道。
+    # 目的：让内置渠道和插件渠道都通过同一个注册入口完成 OAuth provider 暴露。
+    oauth_provider: Any = None,
     source: str = "plugin",
 ) -> None:
     """
@@ -166,6 +174,11 @@ def register_channel(
     """
     if id in _REGISTRY and not overwrite:
         raise ValueError(f"Channel with id={id!r} already registered")
+
+    # 修改原因：调用方传入 oauth_provider 时已经明确该渠道走 OAuth 凭据路径，不能要求重复传 is_oauth=True。
+    # 修改方式：注册前根据 oauth_provider 是否存在自动提升 is_oauth 标记，同时保留显式 is_oauth=True 的旧调用。
+    # 目的：减少渠道和插件注册时的重复参数，并避免 provider 已声明但余额路由仍按普通 Key 渠道处理。
+    is_oauth = is_oauth or (oauth_provider is not None)
 
     _REGISTRY[id] = ChannelDefinition(
         id=id,
@@ -191,6 +204,10 @@ def register_channel(
         # 修改方式：把 register_channel 的 is_oauth 参数写入 ChannelDefinition。
         # 目的：余额路由可以从注册表稳定判断是否调用 OAuthManager.fetch_quota。
         is_oauth=is_oauth,
+        # 修改原因：main.py 需要通过注册表发现每个渠道声明的 OAuthProvider 实例。
+        # 修改方式：把 register_channel 的 oauth_provider 参数写入 ChannelDefinition，但不改变 to_dict 输出。
+        # 目的：消除启动期硬编码注册清单，并让外置插件可以复用同一条注册路径。
+        oauth_provider=oauth_provider,
         source=source,
     )
 
@@ -216,6 +233,14 @@ def get_channel(id: str) -> Optional[ChannelDefinition]:
     按 id(engine) 获取渠道定义, 若未注册则返回 None。
     """
     return _REGISTRY.get(id)
+
+
+def get_all_channels() -> Dict[str, ChannelDefinition]:
+    """返回当前渠道注册表的浅拷贝。"""
+    # 修改原因：OAuth provider 自动注册需要按渠道 ID 遍历完整注册表，而 list_channels 会丢失字典 key。
+    # 修改方式：提供只读语义的浅拷贝 getter，不暴露内部 _REGISTRY 对象供外部直接修改。
+    # 目的：main.py 和测试都能稳定枚举渠道定义，同时降低外部误改全局注册表的风险。
+    return dict(_REGISTRY)
 
 
 def list_channels() -> List[ChannelDefinition]:

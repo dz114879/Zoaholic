@@ -1106,6 +1106,10 @@ def register():
         response_adapter=fetch_claude_code_response,
         stream_adapter=fetch_claude_code_response_stream,
         is_oauth=True,
+        # 修改原因：OAuth provider 注册要从 main.py 硬编码迁移到渠道注册声明。
+        # 修改方式：在 Claude Code 渠道定义中直接传入 ClaudeCodeProvider 实例。
+        # 目的：启动流程扫描 registry 时即可自动注册 Claude Code provider，插件渠道也可照此声明。
+        oauth_provider=ClaudeCodeProvider(),
         source="builtin",
     )
 

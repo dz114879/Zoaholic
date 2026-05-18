@@ -35,6 +35,7 @@ from ..stream_utils import aiter_decoded_lines
 from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
+from core.oauth.providers.base import OAuthProvider
 
 
 # ============================================================
@@ -183,6 +184,67 @@ async def get_access_token(client_email, private_key):
         return response.json()["access_token"]
 
 
+
+class VertexProvider(OAuthProvider):
+    """Vertex AI Service Account OAuth provider."""
+    redirect_mode = "manual"
+    localhost_redirect_uri = ""
+
+    async def refresh_token(self, credential: dict, config=None) -> dict:
+        # 修改原因：Vertex AI 使用服务账号 JWT 换取 access_token，不走浏览器授权流程。
+        # 修改方式：从导入的 credential 读取 client_email/private_key，并复用现有 get_access_token 生成 Bearer token。
+        # 目的：让 OAuthManager 可以刷新并保存 Vertex AI 的短期 access_token。
+        client_email = credential.get("client_email", "")
+        private_key = credential.get("private_key", "")
+        if not client_email or not private_key:
+            raise ValueError("Missing client_email or private_key in credential")
+        access_token = await get_access_token(client_email, private_key)
+        credential["access_token"] = access_token
+        credential["expires_at"] = int(time.time()) + 3500
+        credential.setdefault("email", client_email)
+        return credential
+
+    def build_auth_url(self, state, redirect_uri):
+        # 修改原因：Vertex AI 的服务账号导入不需要生成浏览器 OAuth 授权地址。
+        # 修改方式：显式抛出 NotImplementedError，避免调用方误以为支持网页授权。
+        # 目的：把 Vertex OAuth 入口限制为手动导入服务账号凭据。
+        raise NotImplementedError("Vertex AI uses service account import, not browser auth")
+
+    async def exchange_code(self, code, redirect_uri, code_verifier=None, config=None):
+        # 修改原因：Vertex AI 的服务账号导入不需要授权码换取 token。
+        # 修改方式：显式抛出 NotImplementedError，防止误走 code exchange 分支。
+        # 目的：保持 Vertex OAuth provider 的认证路径单一且可预测。
+        raise NotImplementedError("Vertex AI uses service account import, not code exchange")
+
+    def get_default_base_url(self):
+        # 修改原因：注册 OAuth provider 时需要提供 Vertex AI 默认 API 根地址。
+        # 修改方式：返回 Google Vertex AI 官方 aiplatform 根地址。
+        # 目的：让 OAuth 解析后的 provider 与现有渠道默认地址保持一致。
+        return "https://aiplatform.googleapis.com"
+
+
+def _get_vertex_project_id(provider: dict) -> str:
+    """从 provider 配置或 OAuth 凭据上下文中读取 Vertex project_id。"""
+    # 修改原因：OAuthManager.resolve 传给 payload adapter 的是 access_token 字符串，service account JSON 中的 project_id 不会出现在 provider 配置里。
+    # 修改方式：优先读取 provider 顶层和 preferences 中的 project_id/project，缺失时读取请求上下文中的 _oauth_credential_metadata.project_id。
+    # 目的：让服务账号 JSON 导入的 Vertex OAuth 账号在请求时仍能构造包含项目 ID 的 Vertex AI URL。
+    preferences = provider.get("preferences") if isinstance(provider.get("preferences"), dict) else {}
+    project_id = provider.get("project_id") or preferences.get("project_id") or preferences.get("project")
+    project_id = str(project_id or "").strip()
+    if project_id:
+        return project_id
+    try:
+        from core.middleware import request_info
+
+        current_info = request_info.get()
+    except Exception:
+        return ""
+    metadata = current_info.get("_oauth_credential_metadata") if isinstance(current_info, dict) else None
+    if isinstance(metadata, dict):
+        return str(metadata.get("project_id") or "").strip()
+    return ""
+
+
 def normalize_vertex_payload(payload: dict) -> dict:
     """规范化 Vertex Gemini 负载，合并驼峰和下划线字段，处理拼写错误"""
     # Vertex AI 标准使用 snake_case
@@ -212,11 +274,18 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json'
     }
-    if provider.get("client_email") and provider.get("private_key"):
+    if api_key and not (provider.get("client_email") and provider.get("private_key")):
+        # 修改原因：OAuthManager 会把 Vertex OAuth credential 解析后的 access_token 作为 api_key 传入。
+        # 修改方式：当 provider 没有服务账号字段时，把 api_key 写入 Authorization Bearer 头。
+        # 目的：让 OAuth 路径与传统服务账号路径共用 Vertex AI 的 Bearer 认证格式。
+        headers['Authorization'] = f"Bearer {api_key}"
+    elif provider.get("client_email") and provider.get("private_key"):
+        # 修改原因：仍需兼容 yaml 中直接配置服务账号 client_email/private_key 的传统路径。
+        # 修改方式：保留现有 JWT 换取 access_token 的逻辑，并写入 Authorization Bearer 头。
+        # 目的：新增 OAuth 支持时不破坏已有 Vertex AI 配置。
         access_token = await get_access_token(provider['client_email'], provider['private_key'])
         headers['Authorization'] = f"Bearer {access_token}"
-    if provider.get("project_id"):
-        project_id = provider.get("project_id")
+    project_id = _get_vertex_project_id(provider)
 
     if request.stream:
         gemini_stream = "streamGenerateContent"
@@ -245,7 +314,10 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
             MODEL_ID=original_model,
             stream=gemini_stream
         )
-    elif api_key is not None and api_key[2] == ".":
+    # 修改原因：OAuth access_token 也可能通过 api_key 参数进入，不能被误当作 URL query key。
+    # 修改方式：只有在 api_key 足够长、形态符合旧 API key 判断，且当前没有 Authorization 头时才拼入 query。
+    # 目的：避免 OAuth Bearer token 泄入 URL，同时保留旧 API key 路径。
+    elif api_key is not None and len(api_key) > 2 and api_key[2] == "." and "Authorization" not in headers:
         url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{original_model}:{gemini_stream}?key={api_key}"
         headers.pop("Authorization", None)
     else:
@@ -544,11 +616,18 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json',
     }
-    if provider.get("client_email") and provider.get("private_key"):
+    if api_key and not (provider.get("client_email") and provider.get("private_key")):
+        # 修改原因：OAuthManager 会把 Vertex OAuth credential 解析后的 access_token 作为 api_key 传入。
+        # 修改方式：当 provider 没有服务账号字段时，把 api_key 写入 Authorization Bearer 头。
+        # 目的：让 OAuth 路径与传统服务账号路径共用 Vertex AI 的 Bearer 认证格式。
+        headers['Authorization'] = f"Bearer {api_key}"
+    elif provider.get("client_email") and provider.get("private_key"):
+        # 修改原因：仍需兼容 yaml 中直接配置服务账号 client_email/private_key 的传统路径。
+        # 修改方式：保留现有 JWT 换取 access_token 的逻辑，并写入 Authorization Bearer 头。
+        # 目的：新增 OAuth 支持时不破坏已有 Vertex AI 配置。
         access_token = await get_access_token(provider['client_email'], provider['private_key'])
         headers['Authorization'] = f"Bearer {access_token}"
-    if provider.get("project_id"):
-        project_id = provider.get("project_id")
+    project_id = _get_vertex_project_id(provider)
 
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
@@ -927,6 +1006,10 @@ def register():
         response_adapter=fetch_vertex_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=None,
+        # 修改原因：Vertex Gemini 的服务账号 OAuth provider 需要随渠道定义声明，不能依赖 main.py 单独硬编码注册。
+        # 修改方式：在 register_channel 参数中传入 VertexProvider 实例，由 registry 自动标记为 OAuth 渠道。
+        # 目的：让 Vertex Gemini 与插件 OAuth 渠道使用同一条自动 provider 注册路径。
+        oauth_provider=VertexProvider(),
         source="builtin",
     )
     
@@ -941,5 +1024,9 @@ def register():
         response_adapter=fetch_vertex_claude_response,
         stream_adapter=fetch_vertex_claude_response_stream,
         models_adapter=None,
+        # 修改原因：Vertex Claude 同样依赖服务账号 OAuth provider，启动注册应来自 registry 声明。
+        # 修改方式：在第二个 Vertex register_channel 调用中也传入 VertexProvider 实例。
+        # 目的：保证 vertex-claude 和 vertex-gemini 都能被通用扫描逻辑发现并注册。
+        oauth_provider=VertexProvider(),
         source="builtin",
     )

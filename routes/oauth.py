@@ -147,10 +147,10 @@ def _oauth_success_page(key_id: str, state: str, provider: str) -> HTMLResponse:
 
 def _token_data_from_body(body: dict) -> dict:
     """从导入请求中剥离路由控制字段，仅保留凭据字段。"""
-    # 修改原因：key_id、type 和 provider 是路由控制字段，不应原样写入 token_data 后再被 register 二次覆盖。
-    # 修改方式：复制 body 中除 key_id、type、provider 之外的字段。
+    # 修改原因：key_id、type、provider 和 service_account_json 是路由控制字段，不应原样写入 token_data 后再被 register 二次覆盖。
+    # 修改方式：复制 body 中除 key_id、type、provider、service_account_json 之外的字段。
     # 目的：让手动导入同时支持 refresh_token、access_token、id_token 等凭据字段，同时不污染凭据内容。
-    return {k: v for k, v in body.items() if k not in {"key_id", "type", "provider"}}
+    return {k: v for k, v in body.items() if k not in {"key_id", "type", "provider", "service_account_json"}}
 
 
 def _require_provider_name(value: str | None) -> str | None:
@@ -352,11 +352,50 @@ async def import_account(request: Request):
     channel_id = _require_provider_name(body.get("provider"))
     if not channel_id:
         return JSONResponse({"error": "provider is required"}, status_code=400)
-    key_id = body["key_id"]
     type_name = body["type"]
     oauth_mgr = request.app.state.oauth_manager
     oauth_provider = oauth_mgr._providers.get(type_name)
 
+    # 修改原因：Vertex 等渠道可以直接使用 Google service account JSON，不应要求管理员手动拆分字段。
+    # 修改方式：当请求体包含 service_account_json 时，先解析 JSON，校验 client_email 和 private_key，再按 OAuthManager 的分渠道结构注册。
+    # 目的：支持 service account 导入，同时保留 project_id、email 等后续 adapter 需要的非敏感元数据。
+    sa = body.get("service_account_json")
+    if sa is not None:
+        if isinstance(sa, str):
+            try:
+                sa = json.loads(sa)
+            except Exception:
+                return JSONResponse({"error": "service_account_json must be valid JSON"}, status_code=400)
+        if not isinstance(sa, dict):
+            return JSONResponse({"error": "service_account_json must be a JSON object"}, status_code=400)
+
+        client_email = sa.get("client_email", "").strip()
+        private_key = sa.get("private_key", "")
+        project_id = sa.get("project_id", "").strip()
+
+        if not client_email or not private_key:
+            return JSONResponse({"error": "service_account_json missing client_email or private_key"}, status_code=400)
+
+        token_data = {
+            "client_email": client_email,
+            "private_key": private_key,
+            "email": client_email,
+        }
+        if project_id:
+            token_data["project_id"] = project_id
+
+        if oauth_provider:
+            try:
+                updated = await oauth_provider.refresh_token(token_data)
+                await oauth_mgr.register(channel_id, client_email, type_name, updated)
+                return {"message": "Service account imported", "key_id": client_email}
+            except Exception as e:
+                return JSONResponse({"error": f"Failed to verify service account: {e}"}, status_code=400)
+        else:
+            await oauth_mgr.register(channel_id, client_email, type_name, token_data)
+            return {"message": "Service account imported (unverified)", "key_id": client_email}
+
+    key_id = body["key_id"]
     token_data = _token_data_from_body(body)
     try:
         if body.get("refresh_token") and oauth_provider:

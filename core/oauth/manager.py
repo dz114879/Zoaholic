@@ -212,6 +212,18 @@ class OAuthManager:
             return accounts
         return {}
 
+    def get_credential_metadata(self, channel_id: str, key_id: str) -> dict:
+        """返回指定 OAuth 凭据的非敏感元数据。"""
+        # 修改原因：channel adapter 可能需要 credential 中的 project_id、email 等非 token 字段。
+        # 修改方式：复用分渠道账号读取逻辑，并过滤 access_token、refresh_token、private_key、id_token 等敏感字段。
+        # 目的：让 OAuth 解析后能通用透传安全元数据，而不把密钥内容放入请求上下文。
+        accounts = self._get_channel_accounts(channel_id)
+        cred = accounts.get(key_id)
+        if not isinstance(cred, dict):
+            return {}
+        sensitive = {"access_token", "refresh_token", "private_key", "id_token", "client_secret"}
+        return {k: v for k, v in cred.items() if k not in sensitive and v is not None}
+
     async def resolve(self, channel_id: str, key_id: str) -> str | None:
         """把指定渠道中的 key_id 解析成 access_token；不存在时返回 None。"""
         accounts = self._get_channel_accounts(channel_id)

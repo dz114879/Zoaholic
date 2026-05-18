@@ -75,6 +75,19 @@ async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str], channel
         return api_key
     resolved = await app.state.oauth_manager.resolve(channel_id, api_key)
     if resolved is not None:
+        # 修改原因：OAuth resolve 只返回 access_token，但部分 channel adapter 还需要 project_id、email 等非敏感字段。
+        # 修改方式：解析成功后从 OAuthManager 读取过滤后的 credential 元数据，写入当前请求上下文。
+        # 目的：提供通用元数据透传机制，让各 adapter 自行决定是否读取这些字段。
+        try:
+            from core.middleware import request_info
+            current_info = request_info.get()
+            if isinstance(current_info, dict):
+                current_info["_oauth_resolved"] = True
+                metadata = app.state.oauth_manager.get_credential_metadata(channel_id, api_key)
+                if metadata:
+                    current_info["_oauth_credential_metadata"] = metadata
+        except Exception:
+            pass
         return resolved
     return api_key
 

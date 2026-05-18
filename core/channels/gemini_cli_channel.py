@@ -620,6 +620,10 @@ def register():
         response_adapter=fetch_gemini_cli_response,
         stream_adapter=fetch_gemini_cli_response_stream,
         is_oauth=True,
+        # 修改原因：Gemini CLI OAuth provider 不应再由 main.py 通过硬编码导入注册。
+        # 修改方式：在渠道注册时直接传入 GeminiCLIProvider 实例，交给 registry 保存。
+        # 目的：让 Gemini CLI 与内置、插件 OAuth 渠道共享同一条自动注册路径。
+        oauth_provider=GeminiCLIProvider(),
         source="builtin",
     )
 

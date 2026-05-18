@@ -391,6 +391,7 @@ async def _aws_strip_cache_control_interceptor(request, engine, provider, api_ke
         _strip_cache_control(payload)
         for f in _BEDROCK_STRIP_FIELDS:
             payload.pop(f, None)
+        payload.setdefault("anthropic_version", "bedrock-2023-05-31")
     return url, headers, payload
 
 

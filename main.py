@@ -348,6 +348,26 @@ async def cleanup_expired_logs(app):
             next_sleep_seconds = 60
 
 
+def _register_oauth_providers_from_registry(oauth_manager) -> None:
+    """从渠道注册表统一注册 OAuth provider。"""
+    # 修改原因：OAuth provider 注册不能继续写在 main.py 的固定渠道清单里，否则内置渠道和插件渠道会走两套路径。
+    # 修改方式：遍历 registry 中所有 ChannelDefinition，发现 oauth_provider 后按 channel_id 注册到 OAuthManager。
+    # 目的：让 register_channel 成为 OAuth provider 声明的唯一入口，并支持插件在加载后自动加入 OAuthManager。
+    from core.channels.registry import get_all_channels
+
+    for channel_id, channel_def in get_all_channels().items():
+        oauth_provider = channel_def.oauth_provider
+        if oauth_provider is None:
+            continue
+        bind_oauth_manager = getattr(oauth_provider, "set_oauth_manager", None)
+        if callable(bind_oauth_manager):
+            # 修改原因：Codex 的被动额度采集仍需要共享 OAuthManager 执行 update_quota，旧硬编码入口移除后必须保留这个绑定点。
+            # 修改方式：provider 若声明 set_oauth_manager 钩子，就在通用扫描注册前注入当前 OAuthManager。
+            # 目的：保留渠道内部必要副作用，同时不把具体渠道名称重新写回 main.py。
+            bind_oauth_manager(oauth_manager)
+        oauth_manager.register_provider(channel_id, oauth_provider)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
@@ -483,16 +503,10 @@ async def lifespan(app: FastAPI):
         # 目的：启动迁移可以把旧凭据放入正确渠道，而不是全部落入 _unmapped。
         app.state.oauth_manager.set_config_ref(lambda: app.state.config or {})
         await app.state.oauth_manager.init()
-        # OAuth provider 注册：各渠道自行注册自己的 provider
-        from core.channels.codex_channel import register_oauth_provider as _reg_codex_oauth
-        from core.channels.claude_code_channel import register_oauth_provider as _reg_cc_oauth
-        # 修改原因：Gemini CLI OAuth provider 需要在应用启动时注册到共享 OAuthManager。
-        # 修改方式：导入 gemini_cli_channel 的 register_oauth_provider，并与现有 OAuth 渠道一起注册。
-        # 目的：让 /v1/oauth/authorize?type=gemini-cli 和请求路径的 access_token 解析可用。
-        from core.channels.gemini_cli_channel import register_oauth_provider as _reg_gemini_cli_oauth
-        _reg_codex_oauth(app.state.oauth_manager)
-        _reg_cc_oauth(app.state.oauth_manager)
-        _reg_gemini_cli_oauth(app.state.oauth_manager)
+        # 修改原因：OAuth provider 注册已迁移到 ChannelDefinition.oauth_provider，main.py 不应再知道具体渠道模块。
+        # 修改方式：启动时扫描 registry 中所有声明了 oauth_provider 的渠道，并统一注册到 OAuthManager。
+        # 目的：消除 Codex、Claude Code、Gemini CLI 等渠道硬编码，让内置渠道和插件渠道共享注册路径。
+        _register_oauth_providers_from_registry(app.state.oauth_manager)
 
 
     if app and not hasattr(app.state, "channel_manager"):
@@ -520,6 +534,11 @@ async def lifespan(app: FastAPI):
             for group in load_result.values()
         )
         logger.info("Plugin system initialized: %d/%d plugins enabled", enabled, total)
+        if hasattr(app.state, "oauth_manager"):
+            # 修改原因：外置插件渠道通常在 plugin_manager.load_all() 时才调用 register_channel，早于此处的 OAuth 扫描看不到它们。
+            # 修改方式：插件加载完成后再次扫描 registry；重复注册内置 provider 只会覆盖为同一个声明实例。
+            # 目的：让插件 OAuth 渠道和内置 OAuth 渠道真正走同一条 registry 自动注册路径。
+            _register_oauth_providers_from_registry(app.state.oauth_manager)
     except Exception as e:
         logger.error("Failed to initialize plugin system: %s", e)
 

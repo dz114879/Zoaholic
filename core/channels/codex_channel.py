@@ -219,6 +219,14 @@ class CodexProvider(OAuthProvider):
         # 目的：让 provider 不依赖 FastAPI app 全局对象，也能拿到最新配置。
         self._config_getter = config_getter
 
+    def set_oauth_manager(self, oauth_manager):
+        """绑定共享 OAuthManager，供 Codex 被动额度采集使用。"""
+        global _oauth_manager
+        # 修改原因：main.py 改为扫描 registry 后不再调用 register_oauth_provider，原先在该函数中的全局 manager 赋值会丢失。
+        # 修改方式：给 registry 中保存的 CodexProvider 提供显式绑定钩子，由通用扫描逻辑在注册 provider 前调用。
+        # 目的：保留 Codex 响应头被动额度采集的 update_quota 副作用，同时不恢复 main.py 的渠道硬编码。
+        _oauth_manager = oauth_manager
+
     def _get_runtime_config(self) -> dict:
         """读取当前运行时配置。"""
         # 修改原因：配置读取函数可能尚未设置，或读取过程中因测试替身、热更新状态异常而失败。
@@ -549,6 +557,10 @@ def register():
         response_adapter=fetch_codex_response,
         stream_adapter=fetch_codex_response_stream,
         is_oauth=True,
+        # 修改原因：OAuth provider 注册要成为 register_channel 的一部分，main.py 只负责扫描注册表。
+        # 修改方式：注册渠道时直接创建并传入 CodexProvider 实例，由 registry 保存给启动流程使用。
+        # 目的：让 Codex 与插件 OAuth 渠道走同一条自动 provider 注册路径。
+        oauth_provider=CodexProvider(),
         source="builtin",
     )
 
@@ -560,5 +572,9 @@ def register_oauth_provider(oauth_manager, providers: list | None = None):
     # 修改原因：providers 参数来自启动时配置，继续读取 token_url 会把后续前端保存的新配置挡在旧 provider 实例之外。
     # 修改方式：保留 providers 形参仅用于兼容旧调用方，但注册时始终创建不带 token_url 的 CodexProvider。
     # 目的：让 token_url 统一由 CodexProvider 在每次 token 请求前通过 OAuthManager 的运行时配置引用读取。
-    _oauth_manager = oauth_manager
-    oauth_manager.register_provider("codex", CodexProvider())
+    provider = CodexProvider()
+    # 修改原因：旧兼容入口仍可能被测试或外部调用，它必须继续完成 Codex 被动额度采集所需的全局 manager 绑定。
+    # 修改方式：复用 CodexProvider.set_oauth_manager，再把同一个 provider 注册给 OAuthManager。
+    # 目的：保留旧函数的副作用，同时让新 registry 扫描路径和旧调用路径行为一致。
+    provider.set_oauth_manager(oauth_manager)
+    oauth_manager.register_provider("codex", provider)

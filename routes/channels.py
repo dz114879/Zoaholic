@@ -390,6 +390,35 @@ async def _extract_test_result(response: Any, start_time: float) -> Dict[str, An
     }
 
 
+@router.get("/v1/playground/keys", dependencies=[Depends(rate_limit_dependency)])
+async def get_playground_keys(token: str = Depends(verify_admin_api_key)):
+    """返回 Playground 可切换的全局用户 API Key 列表。"""
+    # 修改原因：Playground Key 选择需要模拟不同 api.yaml 用户身份，而不是指定 provider 上游密钥。
+    # 修改方式：只读取全局 api_keys，返回显示名、脱敏文本和完整 api；该端点仍由管理员认证保护。
+    # 目的：让 chat 和 models 请求都能用所选用户的 Bearer token 重新鉴权，并解除 Key 列表与 model 的耦合。
+    _ = token
+    app = get_app()
+    config = getattr(getattr(app, "state", None), "config", None) or {}
+    api_keys = config.get("api_keys") or []
+
+    keys = []
+    for index, item in enumerate(api_keys):
+        if not isinstance(item, dict):
+            continue
+        api = str(item.get("api", "")).strip()
+        if not api:
+            continue
+        name = item.get("name") or None
+        masked = f"{api[:3]}...{api[-4:]}" if len(api) > 7 else "***"
+        keys.append({
+            "index": index,
+            "name": name,
+            "masked_key": masked,
+            "api": api,
+        })
+    return JSONResponse(content={"keys": keys})
+
+
 @router.get("/v1/channels", dependencies=[Depends(rate_limit_dependency)])
 async def get_channels(token: str = Depends(verify_admin_api_key)):
     """
