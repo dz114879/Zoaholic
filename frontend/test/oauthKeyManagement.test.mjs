@@ -18,8 +18,8 @@ function sliceBetween(startMarker, endMarker, fromIndex = 0) {
 }
 
 assert.match(channelsSource, /ClipboardPaste, LogIn/, 'Channels.tsx 应该导入 OAuth 导入和登录按钮图标');
-assert.match(channelsSource, /const OAUTH_ENGINES = new Set\(\['codex', 'claude-code', 'antigravity'\]\);/, '应该集中声明 OAuth 类型引擎集合');
-assert.match(channelsSource, /const isOAuthEngine = OAUTH_ENGINES\.has\(formData\?\.engine \|\| ''\);/, '编辑面板应该从当前 engine 派生 isOAuthEngine');
+assert.match(channelsSource, /const OAUTH_ENGINES = new Set\(\['codex', 'claude-code', 'antigravity', 'gemini-cli'\]\);/, '应该集中声明 OAuth 类型引擎集合');
+assert.match(channelsSource, /const isOAuthEngine = selectedChannelType\?\.is_oauth \?\? OAUTH_ENGINES\.has\(formData\?\.engine \|\| ''\);/, '编辑面板应该优先从渠道元数据并回退到当前 engine 派生 isOAuthEngine');
 assert.match(channelsSource, /const \[oauthAccounts, setOauthAccounts\] = useState<Record<string, any>>\(\{\}\);/, '应该保存 OAuth 账号列表');
 assert.match(channelsSource, /const \[importModalIdx, setImportModalIdx\] = useState<number \| null>\(null\);/, '应该保存导入弹窗目标 Key 下标');
 assert.match(channelsSource, /const \[importToken, setImportToken\] = useState\(''\);/, '应该保存待导入 refresh_token');
@@ -27,7 +27,7 @@ assert.match(channelsSource, /const \[importing, setImporting\] = useState\(fals
 
 const oauthAccountsEffect = sliceBetween('// ── 打开 OAuth 编辑面板时同步账号状态 ──', 'const openModal');
 assert.match(channelsSource, /const refreshOAuthAccounts = useCallback\(async \(\) => \{/, '应该把 OAuth 账号拉取封装为可复用函数');
-assert.match(channelsSource, /apiFetch\('\/v1\/oauth\/accounts', \{ headers: \{ Authorization: `Bearer \$\{token\}` \} \}\)/, '账号列表请求应该携带管理员 token');
+assert.match(channelsSource, /apiFetch\(`\/v1\/oauth\/accounts\?provider=\$\{encodeURIComponent\(providerName\)\}`, \{ headers: \{ Authorization: `Bearer \$\{token\}` \} \}\)/, '账号列表请求应该携带当前渠道名和管理员 token');
 assert.match(channelsSource, /setOauthAccounts\(data \|\| \{\}\)/, '账号列表响应应该落入 oauthAccounts');
 assert.match(oauthAccountsEffect, /if \(isModalOpen && isOAuthEngine\)/, '只应在 OAuth 编辑面板打开时拉取账号列表');
 assert.match(oauthAccountsEffect, /refreshOAuthAccounts\(\);/, '打开 OAuth 编辑面板时应该复用账号刷新函数');
@@ -39,17 +39,17 @@ assert.match(importBlock, /const keyId = `account_\$\{Date\.now\(\)\}`;/, '导�
 assert.match(importBlock, /type: formData\.engine/, '导入请求应该携带当前 OAuth engine');
 assert.match(importBlock, /refresh_token: importToken\.trim\(\)/, '导入请求应该提交修剪后的 refresh_token');
 assert.match(importBlock, /updateKey\(importModalIdx, data\.key_id \|\| keyId\);/, '导入成功后应该用后端返回的 key_id 更新 Key 列表');
-assert.match(importBlock, /alert\(`导入失败: \$\{err\.detail \|\| err\.message \|\| res\.statusText\}`\);/, '导入失败应该展示后端错误信息');
+assert.match(importBlock, /toastError\(fmtErr\(err, res\.status\), '导入失败'\);/, '导入失败应该展示后端错误信息');
 
 const loginBlock = sliceBetween('const startOAuthLogin', 'const handleKeyPaste');
 // 修改原因：OAuth 登录流程已分为 manual 粘贴回调 URL 和 auto 成功页 postMessage 两种模式。
 // 修改方式：把旧的弹窗地址轮询断言改为锁定 mode 分支、manual 状态保存和 auto 消息校验。
 // 目的：保证 Codex 固定 localhost 回调和可自定义回调 provider 都能沿当前流程完成登录。
-assert.match(loginBlock, /apiFetch\(`\/v1\/oauth\/authorize\?type=\$\{encodeURIComponent\(formData\.engine\)\}`/, '登录应该请求 authorize 端点获取授权 URL');
+assert.match(loginBlock, /apiFetch\(`\/v1\/oauth\/authorize\?type=\$\{encodeURIComponent\(formData\.engine\)\}&provider=\$\{encodeURIComponent\(providerName\)\}&origin=\$\{encodeURIComponent\(window\.location\.origin\)\}`/, '登录应该请求 authorize 端点获取授权 URL');
 assert.match(loginBlock, /Authorization: `Bearer \$\{token\}`/, 'authorize 请求应该携带管理员 token');
 assert.match(loginBlock, /const \{ auth_url, state, mode \} = await res\.json\(\);/, '登录应该读取 auth_url、state 和登录模式');
 assert.match(loginBlock, /window\.open\(auth_url, '_blank', 'width=600,height=700'\);/, '登录应该打开授权窗口');
-assert.match(loginBlock, /if \(mode === 'manual'\) \{[\s\S]*setOauthManualState\(\{ idx, state \}\);[\s\S]*setManualUrl\(''\);[\s\S]*return;/, 'manual 模式应该打开手动粘贴弹窗并保存本次 state');
+assert.match(loginBlock, /if \(mode === 'manual'\) \{[\s\S]*setOauthManualState\(\{ idx, state, provider: providerName \}\);[\s\S]*setManualUrl\(''\);[\s\S]*return;/, 'manual 模式应该打开手动粘贴弹窗并保存本次 state 和渠道名');
 assert.match(loginBlock, /const handler = \(event: MessageEvent\) => \{[\s\S]*event\.data\?\.type !== 'oauth_callback_success'/, 'auto 模式应该监听 callback 成功页消息');
 assert.match(loginBlock, /event\.data\?\.state && event\.data\.state !== state/, 'auto 模式应该校验 postMessage 中的 state');
 assert.match(loginBlock, /window\.removeEventListener\('message', handler\);[\s\S]*const keyId = event\.data\.key_id;[\s\S]*updateKey\(idx, keyId\);/, 'auto 模式收到 key_id 后应该更新当前 Key 行');
@@ -63,8 +63,8 @@ assert.doesNotMatch(loginBlock, /浏览器登录功能开发中，请先使用�
 
 const manualExchangeBlock = sliceBetween('const doManualExchange', 'const toggleKeyDisabled');
 assert.match(manualExchangeBlock, /const url = new URL\(manualUrl\.trim\(\)\);[\s\S]*url\.searchParams\.get\('code'\)[\s\S]*url\.searchParams\.get\('state'\)/, 'manual 交换应该解析用户粘贴 URL 中的 code 和 state');
-assert.match(manualExchangeBlock, /callbackState && callbackState !== oauthManualState\.state[\s\S]*alert\('state 不匹配，可能不是本次登录的回调'\);/, 'manual 交换应该校验回调 URL 中的 state');
-assert.match(manualExchangeBlock, /apiFetch\('\/v1\/oauth\/exchange', \{[\s\S]*method: 'POST'[\s\S]*JSON\.stringify\(\{ code, state: oauthManualState\.state \}\)/, 'manual 交换应该调用 exchange 端点提交 code 和保存的 state');
+assert.match(manualExchangeBlock, /callbackState && callbackState !== oauthManualState\.state[\s\S]*toastError\('state 不匹配，可能不是本次登录的回调'\);/, 'manual 交换应该校验回调 URL 中的 state');
+assert.match(manualExchangeBlock, /apiFetch\('\/v1\/oauth\/exchange', \{[\s\S]*method: 'POST'[\s\S]*JSON\.stringify\(\{ provider: oauthManualState\.provider, code, state: oauthManualState\.state \}\)/, 'manual 交换应该调用 exchange 端点提交 provider、code 和保存的 state');
 assert.match(manualExchangeBlock, /updateKey\(oauthManualState\.idx, data\.key_id \|\| ''\);/, 'manual 交换成功后应该自动填入 key_id');
 assert.match(manualExchangeBlock, /await refreshOAuthAccounts\(\);[\s\S]*setOauthManualState\(null\);[\s\S]*setManualUrl\(''\);/, 'manual 交换成功后应该刷新账号列表并关闭粘贴弹窗');
 
@@ -74,14 +74,14 @@ assert.match(channelsSource, /5h: \$\{quota5h \?\? '\?'\}% · 7d: \$\{quota7d \?
 
 const keyRows = sliceBetween('{formData.api_keys.map((keyObj, idx) => {', '{formData.api_keys.length === 0');
 assert.match(keyRows, /const oauthAccount = oauthAccounts\[keyObj\.key\];/, 'Key 行应该按 key_id 查找 OAuth 账号');
-assert.match(keyRows, /const oauthQuota = getOAuthQuota\(oauthAccount\);/, 'Key 行应该归一化 OAuth 配额字段');
+assert.match(keyRows, /const oauthQuota = getOAuthQuota\(oauthAccount, formData\.engine\);/, 'Key 行应该按当前 engine 归一化 OAuth 配额字段');
 assert.match(keyRows, /!isOAuthEngine && !isFocused && balColor && balPct != null/, '普通余额进度条不应该覆盖 OAuth 专属行');
 assert.match(keyRows, /placeholder=\{isOAuthEngine \? "邮箱或标识符" : "sk-\.\.\."\}/, 'OAuth Key 输入框 placeholder 应该改为邮箱或标识符');
 assert.match(keyRows, /isOAuthEngine && !keyObj\.key[\s\S]*openImportModal\(idx\)[\s\S]*<ClipboardPaste className="w-3 h-3" \/> 导入/, 'OAuth 空条目应该显示导入按钮');
 assert.match(keyRows, /isOAuthEngine && !keyObj\.key[\s\S]*startOAuthLogin\(idx\)[\s\S]*<LogIn className="w-3 h-3" \/> 登录/, 'OAuth 空条目应该显示登录按钮');
 assert.match(keyRows, /isOAuthEngine && !isFocused && oauthQuota[\s\S]*<QuotaArcs quota5h=\{oauthQuota\.quota_5h\} quota7d=\{oauthQuota\.quota_7d\} \/>/, 'OAuth 已有账号应该显示双弧配额');
 assert.match(keyRows, /isOAuthEngine && !isFocused && oauthAccount && !oauthQuota[\s\S]*已连接[\s\S]*刷新失败[\s\S]*冷却中/, 'OAuth 无配额账号应该显示连接状态标签');
-assert.match(keyRows, /!isOAuthEngine && !isFocused && balLabel && balColor/, '普通余额标签不应该显示在 OAuth 行上');
+assert.match(keyRows, /!isOAuthEngine && !isFocused && balLabel/, '普通余额标签不应该显示在 OAuth 行上');
 
 // 修改原因：OAuth 弹窗已经迁移到 document.body portal，旧的编辑抽屉前置位置断言会误判。
 // 修改方式：分别截取导入弹窗和手动粘贴弹窗的 createPortal 代码段做断言。

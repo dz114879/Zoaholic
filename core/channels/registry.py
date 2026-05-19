@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, AsyncIterator, Dict, List, Optional
+from typing import Any, Awaitable, Callable, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -9,9 +9,12 @@ import httpx
 # - StreamAdapter: handle streaming responses
 # - ResponseAdapter: handle non-stream responses (仍然是 async generator)
 # - ModelsAdapter: fetch models list for a given provider config
+# 修改原因：部分部署环境的 python3 仍会执行类型别名表达式，内建 tuple[...] 在旧版本 Python 中不可下标。
+# 修改方式：RequestAdapter 返回类型使用 typing.Tuple，避免导入 registry.py 时触发 TypeError。
+# 目的：让注册表在用户要求的 python3 验证命令下也能稳定导入。
 RequestAdapter = Callable[
     [Any, str, Dict[str, Any], Optional[str]],
-    Awaitable[tuple[str, Dict[str, Any], Dict[str, Any]]],
+    Awaitable[Tuple[str, Dict[str, Any], Dict[str, Any]]],
 ]
 
 StreamAdapter = Callable[
@@ -92,6 +95,10 @@ class ChannelDefinition:
     # 修改方式：在渠道定义上保存只读布尔标记，由具体渠道注册时声明。
     # 目的：让后端路由和前端管理页都通过统一注册表识别 OAuth 引擎。
     is_oauth: bool = False
+    # 修改原因：渠道/插件需要能注册任意前端渲染代码，不应为每种 UI 新增专有字段。
+    # 修改方式：新增通用 ui_slots 字典，key 为插槽名（如 quota_display、key_detail），value 为内联 JS 字符串。
+    # 目的：让渠道在 register_channel 时一次性声明所有前端插槽，以后加新插槽只需往 dict 里写新 key。
+    ui_slots: Optional[Dict[str, str]] = None
     # 修改原因：OAuth provider 注册需要从 main.py 的硬编码迁移到渠道注册表，插件渠道也要能声明自己的 provider。
     # 修改方式：在 ChannelDefinition 上保存运行时使用的 OAuthProvider 实例，但不在 to_dict API 输出中暴露。
     # 目的：启动时扫描注册表即可统一注册内置和外置 OAuth 渠道，同时避免把 provider 对象返回给前端。
@@ -120,6 +127,10 @@ class ChannelDefinition:
             # 修改方式：把 ChannelDefinition.is_oauth 输出为只读字段。
             # 目的：前端无需继续只依赖硬编码引擎列表即可识别 OAuth 渠道。
             "is_oauth": self.is_oauth,
+            # 修改原因：前端需要按插槽名获取渠道注册的内联 JS 代码，以决定走自定义渲染还是默认组件。
+            # 修改方式：把 ui_slots 字典原样输出，前端按 key 查找并用 Blob URL + import() 加载。
+            # 目的：无需新增 API 端点，渠道元数据接口一次性返回所有插槽脚本。
+            "ui_slots": self.ui_slots,
             "source": self.source,
         }
 
@@ -151,6 +162,10 @@ def register_channel(
     # 修改方式：register_channel 增加可选 is_oauth 参数，默认保持 False 以兼容既有渠道。
     # 目的：具体渠道只需在注册时声明一次，后续路由和前端都可读取同一标记。
     is_oauth: bool = False,
+    # 修改原因：渠道注册时需要一并声明前端各插槽的渲染代码。
+    # 修改方式：新增可选 ui_slots 参数（dict[str, str]），透传至 ChannelDefinition。
+    # 目的：让渠道在单一 register_channel 调用中完成后端适配器和所有前端插槽 UI 的注册。
+    ui_slots: Optional[Dict[str, str]] = None,
     # 修改原因：OAuth provider 实例应由渠道自身在 register_channel 时声明，main.py 不应维护渠道清单。
     # 修改方式：新增可选 oauth_provider 参数；传入 provider 时会自动把渠道标记为 OAuth 渠道。
     # 目的：让内置渠道和插件渠道都通过同一个注册入口完成 OAuth provider 暴露。
@@ -204,6 +219,10 @@ def register_channel(
         # 修改方式：把 register_channel 的 is_oauth 参数写入 ChannelDefinition。
         # 目的：余额路由可以从注册表稳定判断是否调用 OAuthManager.fetch_quota。
         is_oauth=is_oauth,
+        # 修改原因：前端插槽脚本是渠道定义的一部分，需要随注册参数一起保存。
+        # 修改方式：把 register_channel 的 ui_slots 参数写入 ChannelDefinition。
+        # 目的：让渠道元数据接口能把各插槽脚本交给前端动态加载。
+        ui_slots=ui_slots,
         # 修改原因：main.py 需要通过注册表发现每个渠道声明的 OAuthProvider 实例。
         # 修改方式：把 register_channel 的 oauth_provider 参数写入 ChannelDefinition，但不改变 to_dict 输出。
         # 目的：消除启动期硬编码注册清单，并让外置插件可以复用同一条注册路径。

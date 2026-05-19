@@ -537,6 +537,26 @@ async def fetch_channel_models(
         provider["base_url"] = f"https://{base_url}"
         logger.info(f"Auto-prefixed base_url: {provider['base_url']}")
     
+    # OAuth 渠道：api 字段是邮箱/key_id，路由层统一 resolve 成 access_token
+    if getattr(channel, "is_oauth", False) and hasattr(app.state, "oauth_manager"):
+        # 修改原因：oauth_state 第一层 key 是用户配置的 provider 名，不是 engine；Antigravity 的 key 可能是“反重力oauth”。
+        # 修改方式：先把 api/api_key 归一为 key_id 候选，再遍历 OAuthManager._state 的所有 channel_id 调 resolve。
+        # 目的：models_adapter 只接收已经解析好的 access_token，保持签名为 (client, provider) 且不自行做 OAuth 查找。
+        _om = app.state.oauth_manager
+        _state = getattr(_om, "_state", {})
+        _resolved_token = None
+        for _key_id in _collect_key_candidates(provider.get("api")):
+            if _key_id.startswith("!"):
+                continue
+            for _ch_id in list(_state.keys()) if isinstance(_state, dict) else []:
+                _resolved = await _om.resolve(_ch_id, _key_id)
+                if _resolved:
+                    _resolved_token = _resolved
+                    break
+            if _resolved_token:
+                provider["api"] = _resolved_token
+                break
+
     try:
         from core.http import proxy_context
         import asyncio
@@ -1019,6 +1039,12 @@ async def query_channel_balance(
         # 修改方式：在普通 balance.py 逻辑之前按渠道注册表标记分流到 OAuthManager.fetch_quota。
         # 目的：让管理端余额按钮对 Codex 等 OAuth 渠道可用，同时不影响普通 API Key 渠道。
         result = await _query_oauth_channel_balance(app, provider)
+        # 修改原因：OAuth 余额结果也可能需要插件补充 tier、rpm、tpm 等被动采集字段。
+        # 修改方式：从原始 provider_config 读取 enabled_plugins，并在返回前调用 balance_enricher 链。
+        # 目的：让 oai_tier 可以在不改 OAuth 查询逻辑的情况下补充 balance result。
+        from core.plugins.interceptors import apply_balance_enrichers
+        enabled_plugins = safe_get(provider_config, "preferences", "enabled_plugins", default=None)
+        result = await apply_balance_enrichers(result, engine, provider, enabled_plugins)
         return JSONResponse(content=result)
 
     from core.balance import query_provider_balance, build_balance_config
@@ -1026,6 +1052,15 @@ async def query_channel_balance(
     # 验证是否配置了 balance
     balance_cfg = build_balance_config(provider)
     if not balance_cfg:
+        # 没有 balance 模板，但插件可能有数据（如 oai_tier 的被动采集）
+        enabled_plugins = safe_get(provider_config, "preferences", "enabled_plugins", default=None)
+        if enabled_plugins:
+            from core.plugins.interceptors import apply_balance_enrichers
+            fallback = {"supported": True, "value_type": "amount", "raw": None, "error": None}
+            fallback = await apply_balance_enrichers(fallback, engine, provider, enabled_plugins)
+            # enricher 补了有效字段（如 tier）就返回，否则返回 unsupported
+            if any(k not in ("supported", "value_type", "raw", "error") for k in fallback):
+                return JSONResponse(content=fallback)
         return JSONResponse(content={
             "supported": False,
             "error": "该渠道未配置余额查询（preferences.balance）",
@@ -1056,6 +1091,11 @@ async def query_channel_balance(
                     client = InterceptedClient(client, engine, provider, enabled_plugins)
 
                 result = await query_provider_balance(client, provider)
+                # 修改原因：普通渠道的余额查询返回后需要允许插件补充 OpenAI Tier 等被动信息。
+                # 修改方式：复用上方已解析的 enabled_plugins，对 result 调用 balance_enricher 链。
+                # 目的：不改 core.balance 模板，也能把 oai_tier 缓存的信息带回前端。
+                from core.plugins.interceptors import apply_balance_enrichers
+                result = await apply_balance_enrichers(result, engine, provider, enabled_plugins)
                 return JSONResponse(content=result)
 
     except Exception as e:

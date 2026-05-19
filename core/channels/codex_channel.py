@@ -485,6 +485,43 @@ def _decode_codex_identity(id_token: str | None) -> dict[str, str]:
 
 CODEX_USER_AGENT = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 
+# 修改原因：Codex OAuth 的 plan tier 存在响应头 raw 数据中，默认 QuotaArcs 只能显示百分比。
+# 修改方式：注册 quota_display 内联脚本，从 raw['x-codex-plan-type'] 或 raw.plan_type 读取 tier，并与 5h/7d 最低百分比组合显示。
+# 目的：让 Codex key 行能显示 Plus 80%、Pro 60% 这类 tier + quota 标签。
+CODEX_QUOTA_DISPLAY = """
+export default function render(ctx) {
+    const { el, data } = ctx || {};
+    if (!el) return;
+    const raw = data?.raw || {};
+    
+    // 读 tier
+    const planType = raw['x-codex-plan-type'] || raw.plan_type || '';
+    const tierLabel = planType ? planType.charAt(0).toUpperCase() + planType.slice(1).toLowerCase() : '';
+    // "plus" → "Plus", "pro" → "Pro", "team" → "Team", "free" → "Free", "prolite" → "Prolite"
+    
+    // 读 quota 百分比
+    const q5 = typeof data?.quota_5h === 'number' ? data.quota_5h : null;
+    const q7 = typeof data?.quota_7d === 'number' ? data.quota_7d : null;
+    const pcts = [q5, q7].filter(v => v != null);
+    const minPct = pcts.length ? Math.round(Math.min(...pcts)) : null;
+    
+    // 读 credits
+    const credits = raw.credits || raw['x-codex-credits'];
+    
+    if (minPct != null) {
+        const colorCls = minPct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : minPct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+        el.textContent = tierLabel ? tierLabel + ' ' + minPct + '%' : minPct + '%';
+        el.className = 'flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-default ' + colorCls;
+    } else if (tierLabel) {
+        el.textContent = tierLabel;
+        el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 relative z-[2] cursor-default';
+    } else {
+        el.textContent = '';
+        el.style.display = 'none';
+    }
+}
+""".strip()
+
 # Codex 端点不接受的字段
 _CODEX_STRIP_FIELDS = {'max_output_tokens', 'max_tokens', 'max_completion_tokens'}
 
@@ -561,6 +598,10 @@ def register():
         # 修改方式：注册渠道时直接创建并传入 CodexProvider 实例，由 registry 保存给启动流程使用。
         # 目的：让 Codex 与插件 OAuth 渠道走同一条自动 provider 注册路径。
         oauth_provider=CodexProvider(),
+        # 修改原因：Codex 默认额度标签无法显示 OAuth plan tier。
+        # 修改方式：注册 quota_display 插槽，由前端加载 CODEX_QUOTA_DISPLAY 渲染 plan_type 与最低百分比。
+        # 目的：让响应头采集到的 x-codex-plan-type 直接展示在 key 行标签中。
+        ui_slots={"quota_display": CODEX_QUOTA_DISPLAY},
         source="builtin",
     )
 

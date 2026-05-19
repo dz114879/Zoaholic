@@ -452,6 +452,12 @@ class ClaudeCodeProvider(OAuthProvider):
             result["extra_usage_used"] = eu.get("used_credits")
             result["extra_usage_utilization"] = eu.get("utilization")
 
+        # 修改原因：usage 接口未必返回订阅类型，但前端刷新 quota 后仍需要在 raw 数据中读到 tier。
+        # 修改方式：从已保存 credential 中取 subscription_type 并补入 fetch_quota 结果。
+        # 目的：让 quota_display 既能从 account 读 tier，也能从 data.raw 读到同一字段。
+        if credential.get("subscription_type"):
+            result["subscription_type"] = credential["subscription_type"]
+
         return result if result else None
 
     # ── 内部方法 ──
@@ -565,6 +571,17 @@ class ClaudeCodeProvider(OAuthProvider):
 
         if token_response.get("token_type"):
             updated["token_type"] = token_response["token_type"]
+
+        # 修改原因：Claude Code token response 会返回 subscriptionType 和 rateLimitTier，前端 tier 标签需要从 oauth_state 读取这些非敏感字段。
+        # 修改方式：兼容 camelCase 与 snake_case 两种字段名，并保存为本地统一的 snake_case 字段。
+        # 目的：让 /v1/oauth/accounts 能把订阅 tier 透传给 quota_display 插槽。
+        sub_type = token_response.get("subscriptionType") or token_response.get("subscription_type")
+        if sub_type:
+            updated["subscription_type"] = sub_type
+
+        rate_tier = token_response.get("rateLimitTier") or token_response.get("rate_limit_tier")
+        if rate_tier:
+            updated["rate_limit_tier"] = rate_tier
 
         try:
             expires_in = int(token_response.get("expires_in") or 0)
@@ -1089,6 +1106,100 @@ async def _passthrough_sanitize(payload, modifications, request, engine, provide
     return _sanitize_for_plan_billing(payload, headers=original_headers)
 
 
+# 修改原因：Claude Code 的 extra_usage 可视化属于渠道专属 UI，不能继续由 Channels.tsx 写死计算和样式。
+# 修改方式：在渠道文件中注册 key_background、quota_label、balance_summary 三个内联 JS 插槽。
+# 目的：前端只提供通用挂载点，CC 的额度条、金额标签和余额汇总都随渠道元数据下发。
+CC_KEY_BACKGROUND_UI = """
+export default function render(ctx) {
+  const { el, account } = ctx;
+  // 修改原因：只有开启 extra_usage 的 Claude Code 账号才需要背景条。
+  // 修改方式：从账号透传字段读取 limit/used，并兼容旧 monthly limit 字段。
+  // 目的：让背景条宽度和颜色完全由 CC 渠道脚本控制。
+  if (!account?.extra_usage_enabled) { el.style.width = '0%'; el.style.background = 'transparent'; return; }
+  const limit = account.extra_usage_limit ?? account.extra_usage_monthly_limit ?? 0;
+  const used = account.extra_usage_used ?? 0;
+  const pct = limit > 0 ? Math.max(1, ((limit - used) / limit) * 100) : 0;
+  const colors = { green: 'rgba(34,197,94,0.08)', yellow: 'rgba(234,179,8,0.08)', red: 'rgba(239,68,68,0.08)' };
+  const color = pct >= 50 ? colors.green : pct >= 20 ? colors.yellow : colors.red;
+  el.style.width = pct + '%';
+  el.style.background = color;
+}
+""".strip()
+
+CC_QUOTA_LABEL_UI = """
+export default function render(ctx) {
+  const { el, account } = ctx;
+  // 修改原因：$remaining / $limit 是 Claude Code extra_usage 的专属金额标签，通用前端不应计算。
+  // 修改方式：在插槽脚本中读取账号透传字段，计算剩余额度并写入标签文本和 Tailwind 类。
+  // 目的：让 CC 金额标签可以独立演进，不影响其他 OAuth 渠道。
+  if (!account?.extra_usage_enabled) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const limit = account.extra_usage_limit ?? account.extra_usage_monthly_limit ?? 0;
+  const used = account.extra_usage_used ?? 0;
+  const remaining = Math.max(0, limit - used);
+  const pct = limit > 0 ? (remaining / limit) * 100 : 0;
+  const cls = pct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : pct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+  el.textContent = '$' + remaining.toFixed(0) + ' / $' + limit.toFixed(0);
+  el.className = 'flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ' + cls;
+}
+""".strip()
+
+# 修改原因：Claude Code 默认 quota_display 只能显示百分比，用户无法在 key 行直接识别 Pro、Max 等订阅层级。
+# 修改方式：新增 quota_display 插槽，从账号 context 或 quota raw 中读取 subscription_type，再与最低 quota 百分比组合显示。
+# 目的：让 CC key 行显示 Max 80%、Pro 50% 这类 tier + quota 标签。
+CC_QUOTA_DISPLAY = """
+export default function render(ctx) {
+    const { el, data, account } = ctx || {};
+    if (!el) return;
+    
+    // 读 tier — 从 account 或 data.raw
+    const subType = account?.subscription_type || account?.subscriptionType || data?.raw?.subscription_type || '';
+    const tierMap = { 'pro': 'Pro', 'max': 'Max', 'team': 'Team', 'enterprise': 'Enterprise' };
+    const tierLabel = tierMap[subType.toLowerCase()] || (subType ? subType.charAt(0).toUpperCase() + subType.slice(1) : '');
+    
+    // 读 quota
+    const q5 = typeof data?.quota_5h === 'number' ? data.quota_5h : null;
+    const q7 = typeof data?.quota_7d === 'number' ? data.quota_7d : null;
+    const pcts = [q5, q7].filter(v => v != null);
+    const minPct = pcts.length ? Math.round(Math.min(...pcts)) : null;
+    
+    if (minPct != null) {
+        const colorCls = minPct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : minPct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+        el.textContent = tierLabel ? tierLabel + ' ' + minPct + '%' : minPct + '%';
+        el.className = 'flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-default ' + colorCls;
+    } else if (tierLabel) {
+        el.textContent = tierLabel;
+        el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 relative z-[2] cursor-default';
+    } else {
+        el.textContent = '';
+        el.style.display = 'none';
+    }
+}
+""".strip()
+
+CC_BALANCE_SUMMARY_UI = """
+export default function render(ctx) {
+  const { el, accounts } = ctx;
+  // 修改原因：Claude Code 余额按钮需要汇总所有开启 extra_usage 的账号，通用前端不应读取这些字段。
+  // 修改方式：从 balance_summary 插槽上下文中的 accounts 聚合 limit/used，并写入按钮内联文本。
+  // 目的：保持余额按钮平台化，同时让 CC 渠道自行定义汇总文案和 title。
+  if (!accounts) return;
+  const accts = Object.values(accounts).filter(a => a?.extra_usage_enabled);
+  if (!accts.length) return;
+  const totalLimit = accts.reduce((s, a) => s + (a.extra_usage_limit ?? a.extra_usage_monthly_limit ?? 0), 0);
+  const totalUsed = accts.reduce((s, a) => s + (a.extra_usage_used ?? 0), 0);
+  if (totalLimit <= 0) return;
+  const r = totalLimit - totalUsed;
+  el.innerHTML = '余额 <span class="font-mono">$' + r.toFixed(1) + '</span>';
+  el.title = '总额 $' + totalLimit.toFixed(0) + ' / 已用 $' + totalUsed.toFixed(1);
+}
+""".strip()
+
+
+# 修改原因：Claude Code Extra Usage 的充值入口是渠道专属提示，通用前端不能硬编码外部链接。
+
+
+
 def register():
     """注册 Claude Code OAuth 渠道。"""
     from .registry import register_channel
@@ -1106,6 +1217,15 @@ def register():
         response_adapter=fetch_claude_code_response,
         stream_adapter=fetch_claude_code_response_stream,
         is_oauth=True,
+        # 修改原因：Claude Code 的 extra_usage 背景、金额标签、按钮汇总和订阅 tier 标签都属于渠道专属 UI。
+        # 修改方式：注册 key_background、quota_label、balance_summary 和 quota_display 四个插槽，不注册 key_border。
+        # 目的：让前端通用挂载点加载 CC 专属脚本，同时继续使用默认 QuotaBorderOverlay 绘制 5h/7d 弧线。
+        ui_slots={
+            "key_background": CC_KEY_BACKGROUND_UI,
+            "quota_label": CC_QUOTA_LABEL_UI,
+            "balance_summary": CC_BALANCE_SUMMARY_UI,
+            "quota_display": CC_QUOTA_DISPLAY,
+        },
         # 修改原因：OAuth provider 注册要从 main.py 硬编码迁移到渠道注册声明。
         # 修改方式：在 Claude Code 渠道定义中直接传入 ClaudeCodeProvider 实例。
         # 目的：启动流程扫描 registry 时即可自动注册 Claude Code provider，插件渠道也可照此声明。

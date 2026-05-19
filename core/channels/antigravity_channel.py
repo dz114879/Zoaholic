@@ -53,6 +53,7 @@ STREAM_ACTION = "streamGenerateContent"
 GENERATE_ACTION = "generateContent"
 COUNT_TOKENS_ACTION = "countTokens"
 LOAD_CODE_ASSIST_ACTION = "loadCodeAssist"
+FETCH_AVAILABLE_MODELS_ACTION = "fetchAvailableModels"
 
 RELEASES_URL = "https://antigravity-auto-updater-974169037036.us-central1.run.app/releases"
 DEFAULT_ANTIGRAVITY_VERSION = "1.21.9"
@@ -345,41 +346,67 @@ class AntigravityProvider(OAuthProvider):
         return updated
 
     async def fetch_quota(self, credential: dict, config: dict | None = None) -> dict | None:
-        """通过 loadCodeAssist 获取 paidTier credits 信息。"""
-        load_payload = await self._load_code_assist(credential.get("access_token"), config=config)
-        if not isinstance(load_payload, dict):
-            return None
+        """通过 fetchAvailableModels 获取各模型组 quota + loadCodeAssist 获取 credits。"""
+        # 修改原因：loadCodeAssist 只返回 paidTier/credits，不含各模型组的 remainingFraction。
+        # 修改方式：主调 fetchAvailableModels 获取按模型的 quotaInfo，辅调 loadCodeAssist 获取 credits。
+        # 目的：让前端能按模型组画半圆弧，同时兼容有 credits 池的账号。
+        access_token = credential.get("access_token")
         raw: dict[str, Any] = {}
-        paid_tier = load_payload.get("paidTier")
-        if isinstance(paid_tier, dict):
-            raw["paidTier"] = paid_tier
-            if paid_tier.get("availableCredits") is not None:
-                raw["availableCredits"] = paid_tier.get("availableCredits")
-        project_id = _extract_project_from_load_code_assist(load_payload)
-        if project_id:
-            raw["cloudaicompanionProject"] = project_id
 
-        # 从 availableCredits 提取百分比供前端展示
-        quota_result: dict[str, Any] = {"raw": raw} if raw else {}
-        credits_list = raw.get("availableCredits")
-        if isinstance(credits_list, list):
-            for credit in credits_list:
-                if not isinstance(credit, dict):
-                    continue
-                try:
-                    amount = float(credit.get("creditAmount", 0))
-                    min_amount = float(credit.get("minimumCreditAmountForUsage", 0))
-                    # creditAmount 是剩余可用额度，没有总量概念
-                    # 用 amount / (amount + min_amount) 近似百分比，或直接用 amount 作 raw 值
-                    # 前端 _oauth_quota_to_balance_result 读 quota_5h/quota_7d
-                    # Antigravity 没有时间窗口概念，两个都设成一样的值
-                    if amount > 0:
-                        quota_result["quota_5h"] = min(amount / 10.0, 100.0)  # 1000 credits → 100%
-                        quota_result["quota_7d"] = quota_result["quota_5h"]
-                        break
-                except (TypeError, ValueError):
-                    continue
-        return quota_result if quota_result else None
+        # 1. fetchAvailableModels — 各模型独立 quota
+        models_payload = await self._fetch_available_models(access_token, config=config)
+        model_quotas = _extract_model_quotas_from_available_models(models_payload)
+        if model_quotas:
+            raw["modelQuotas"] = model_quotas
+
+        # 2. loadCodeAssist — paidTier + credits
+        load_payload = await self._load_code_assist(access_token, config=config)
+        if isinstance(load_payload, dict):
+            paid_tier = load_payload.get("paidTier")
+            if isinstance(paid_tier, dict):
+                raw["paidTier"] = paid_tier
+                if paid_tier.get("availableCredits") is not None:
+                    raw["availableCredits"] = paid_tier.get("availableCredits")
+            project_id = _extract_project_from_load_code_assist(load_payload)
+            if project_id:
+                raw["cloudaicompanionProject"] = project_id
+
+        if not raw:
+            return None
+
+        # 修改原因：Antigravity 前端把上弧定义为 Gemini 组最低值、下弧定义为 Claude/GPT 外部模型组最低值。
+        # 修改方式：优先从 raw.modelQuotas 按 provider 计算 quota_5h/quota_7d；无法识别 provider 时再回退到旧的全模型最低值。
+        # 目的：/v1/channels/balance、OAuth 缓存和管理端 Key 行使用同一套分组语义。
+        quota_result: dict[str, Any] = {"raw": raw}
+        provider_quota = _compute_antigravity_provider_quota_percentages(raw.get("modelQuotas", []))
+        if provider_quota:
+            quota_result.update(provider_quota)
+        else:
+            fractions = [
+                mq["remainingFraction"]
+                for mq in raw.get("modelQuotas", [])
+                if isinstance(mq.get("remainingFraction"), (int, float))
+            ]
+            if fractions:
+                min_pct = min(fractions) * 100.0
+                quota_result["quota_5h"] = min_pct
+                quota_result["quota_7d"] = min_pct
+            else:
+                # fallback: 从 credits 提取
+                credits_list = raw.get("availableCredits")
+                if isinstance(credits_list, list):
+                    for credit in credits_list:
+                        if not isinstance(credit, dict):
+                            continue
+                        try:
+                            amount = float(credit.get("creditAmount", 0))
+                            if amount > 0:
+                                quota_result["quota_5h"] = min(amount / 10.0, 100.0)
+                                quota_result["quota_7d"] = quota_result["quota_5h"]
+                                break
+                        except (TypeError, ValueError):
+                            continue
+        return quota_result
 
     async def _post_token_form(self, data: dict, config: dict | None = None) -> dict:
         """向 Google token endpoint 提交 form-urlencoded 请求。"""
@@ -413,6 +440,41 @@ class AntigravityProvider(OAuthProvider):
             if isinstance(payload, dict):
                 return str(payload.get("email") or "")
         return ""
+
+    async def _fetch_available_models(self, access_token: str | None, config: dict | None = None) -> dict:
+        """调用 Antigravity fetchAvailableModels，获取各模型 quotaInfo。"""
+        # 修改原因：loadCodeAssist 不返回各模型组的 remainingFraction，前端无法按模型画 quota 弧。
+        # 修改方式：新增调用 fetchAvailableModels 端点，返回 models 字典（含 quotaInfo）。
+        # 目的：让 fetch_quota 能拿到按模型粒度的 quota 数据供 QUOTA_UI 渲染。
+        if not access_token:
+            return {}
+        version = await get_antigravity_version()
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": _antigravity_load_code_assist_user_agent(version),
+            "X-Goog-Api-Client": ANTIGRAVITY_API_CLIENT_HEADER,
+        }
+        # 修改原因：部分反代不支持 fetchAvailableModels 路径，返回 403。
+        # 修改方式：优先试官方直连域名，再 fallback 到用户配置的反代。
+        # 目的：确保 quota 查询不受反代路径限制影响。
+        bases = [DEFAULT_BASE_URL, FALLBACK_BASE_URL, self._resolve_base_url(config)]
+        seen: set[str] = set()
+        for base in bases:
+            normalized_base = str(base or "").rstrip("/")
+            if not normalized_base or normalized_base in seen:
+                continue
+            seen.add(normalized_base)
+            url = _build_antigravity_url_from_base(normalized_base, FETCH_AVAILABLE_MODELS_ACTION)
+            try:
+                async with httpx.AsyncClient(timeout=30, http2=False) as client:
+                    response = await client.post(url, json={}, headers=headers)
+                if response.status_code < 400:
+                    payload = response.json()
+                    return payload if isinstance(payload, dict) else {}
+            except Exception:
+                continue
+        return {}
 
     async def _load_code_assist(self, access_token: str | None, config: dict | None = None) -> dict:
         """调用 Antigravity loadCodeAssist，提取 IDE project 和 credits 信息。"""
@@ -675,6 +737,162 @@ def _extract_quota_raw_from_load_code_assist(payload: dict | None) -> dict:
     if project:
         raw["cloudaicompanionProject"] = project
     return raw
+
+
+def _coerce_remaining_fraction(value: Any) -> float | None:
+    """把 remainingFraction 清洗为 0 到 1 之间的浮点数。"""
+    # 修改原因：fetchAvailableModels 的 remainingFraction 可能来自 JSON 数字，也可能经过反代或缓存后变成字符串。
+    # 修改方式：统一尝试转 float，非法值返回 None，合法值裁剪到 0..1。
+    # 目的：后端兼容 quota_5h/quota_7d 计算，前端 QUOTA_UI 也能收到稳定 number。
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, number))
+
+
+def _classify_antigravity_quota_provider(model_quota: dict[str, Any]) -> str | None:
+    """把 Antigravity modelProvider 归类为 gemini 或 external。"""
+    # 修改原因：UI 上弧和下弧不再表示 5h/7d 时间窗，而是 Gemini 与 Claude/GPT 两类 provider 的剩余额度。
+    # 修改方式：优先识别官方 MODEL_PROVIDER_*，并兼容旧缓存中的 google/gemini/anthropic/openai 字符串和模型名前缀。
+    # 目的：让真实响应、历史缓存和单元测试替身都能稳定得到同一套分组结果。
+    provider = str(model_quota.get("modelProvider") or "").upper()
+    model = str(model_quota.get("model") or "").lower()
+    if model.startswith(("tab_", "chat_")):
+        return None
+    if provider == "MODEL_PROVIDER_GOOGLE" or "GOOGLE" in provider or "GEMINI" in provider or model.startswith("gemini-"):
+        return "gemini"
+    if (
+        provider == "MODEL_PROVIDER_ANTHROPIC"
+        or provider == "MODEL_PROVIDER_OPENAI"
+        or "ANTHROPIC" in provider
+        or "OPENAI" in provider
+        or model.startswith("claude-")
+        or model.startswith("gpt-")
+    ):
+        return "external"
+    return None
+
+
+def _compute_antigravity_provider_quota_percentages(model_quotas: Any) -> dict[str, float]:
+    """按 Gemini 与外部模型 provider 计算 Antigravity 上下弧百分比。"""
+    # 修改原因：旧实现把所有模型 remainingFraction 取一个最低值，无法让前端复用 QuotaBorderOverlay 分别绘制 Gemini 和 External。
+    # 修改方式：过滤 tab_*、chat_* 后按 provider 归类，Gemini 最低值写入 quota_5h，Claude/GPT 最低值写入 quota_7d。
+    # 目的：balance 接口、OAuth 缓存和前端标签使用一致的数据语义。
+    if not isinstance(model_quotas, list):
+        return {}
+    grouped: dict[str, list[float]] = {"gemini": [], "external": []}
+    for model_quota in model_quotas:
+        if not isinstance(model_quota, dict):
+            continue
+        provider_kind = _classify_antigravity_quota_provider(model_quota)
+        if provider_kind not in grouped:
+            continue
+        fraction = _coerce_remaining_fraction(model_quota.get("remainingFraction"))
+        if fraction is None:
+            continue
+        grouped[provider_kind].append(fraction)
+    result: dict[str, float] = {}
+    if grouped["gemini"]:
+        result["quota_5h"] = min(grouped["gemini"]) * 100.0
+    if grouped["external"]:
+        result["quota_7d"] = min(grouped["external"]) * 100.0
+    return result
+
+
+def _model_identifier_from_info(model_info: dict, fallback: str = "") -> str:
+    """从 fetchAvailableModels 的单个模型对象中提取模型 ID。"""
+    # 修改原因：上游返回形态可能是 {models:{id:info}}，也可能是 {models:[{name/id/model...}]}。
+    # 修改方式：优先使用 fallback key，再读取常见模型标识字段并去空白。
+    # 目的：同一套解析同时服务 quota_raw.modelQuotas 和 fetch_models 列表。
+    candidates = [
+        fallback,
+        model_info.get("name"),
+        model_info.get("id"),
+        model_info.get("model"),
+        model_info.get("modelId"),
+        model_info.get("model_id"),
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _iter_available_model_items(payload: Any) -> list[tuple[str, dict[str, Any]]]:
+    """把 fetchAvailableModels 的 dict/list 形态归一为 (model_id, model_info) 列表。"""
+    # 修改原因：当前实现只处理 models 字典，真实接口或反代可能返回 models 数组，导致 modelQuotas 和模型列表断裂。
+    # 修改方式：支持 payload.models、payload.availableModels、payload.modelQuotas 和顶层 dict/list，并为 list 项读取 name/id 字段。
+    # 目的：让后端 quota 和 fetch_models 不再依赖单一上游 JSON 形态。
+    if isinstance(payload, dict):
+        raw_models = (
+            payload.get("models")
+            if payload.get("models") is not None
+            else payload.get("availableModels")
+            if payload.get("availableModels") is not None
+            else payload.get("modelQuotas")
+            if payload.get("modelQuotas") is not None
+            else payload
+        )
+    else:
+        raw_models = payload
+
+    items: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(raw_models, dict):
+        for model_id, model_info in raw_models.items():
+            if not isinstance(model_info, dict):
+                continue
+            resolved_id = _model_identifier_from_info(model_info, str(model_id))
+            if resolved_id:
+                items.append((resolved_id, model_info))
+    elif isinstance(raw_models, list):
+        for model_info in raw_models:
+            if not isinstance(model_info, dict):
+                continue
+            resolved_id = _model_identifier_from_info(model_info)
+            if resolved_id:
+                items.append((resolved_id, model_info))
+    return items
+
+
+def _extract_model_quotas_from_available_models(payload: Any) -> list[dict[str, Any]]:
+    """从 fetchAvailableModels 响应中提取前端需要的 modelQuotas。"""
+    # 修改原因：QUOTA_UI 只读取 raw.modelQuotas，后端必须在各种上游形态下稳定生成这个数组。
+    # 修改方式：复用 _iter_available_model_items，并兼容 quotaInfo 内层或顶层 remainingFraction 字段。
+    # 目的：OAuthManager.update_quota 落盘后，/v1/oauth/accounts 可以直接给前端渲染完整额度。
+    model_quotas: list[dict[str, Any]] = []
+    for model_id, model_info in _iter_available_model_items(payload):
+        quota_info = model_info.get("quotaInfo") if isinstance(model_info.get("quotaInfo"), dict) else model_info
+        remaining_fraction = _coerce_remaining_fraction(quota_info.get("remainingFraction"))
+        if remaining_fraction is None:
+            continue
+        model_quotas.append({
+            "model": model_id,
+            "displayName": model_info.get("displayName") or model_info.get("display_name") or model_id,
+            "modelProvider": model_info.get("modelProvider") or model_info.get("provider") or "unknown",
+            "remainingFraction": remaining_fraction,
+            "resetTime": quota_info.get("resetTime"),
+            "isExhausted": bool(quota_info.get("isExhausted", remaining_fraction <= 0)),
+        })
+    return model_quotas
+
+
+def _extract_model_names_from_available_models(payload: Any) -> list[str]:
+    """从 fetchAvailableModels 响应中提取模型名列表。"""
+    # 修改原因：管理端“获取模型”和 quota 查询使用同一个上游接口，不能一个支持 list 一个不支持。
+    # 修改方式：复用归一化后的模型项，按出现顺序去重。
+    # 目的：让 fetch_antigravity_models 签名保持 (client, provider) 的同时稳定返回 List[str]。
+    names: list[str] = []
+    seen: set[str] = set()
+    for model_id, _model_info in _iter_available_model_items(payload):
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        names.append(model_id)
+    return names
 
 
 def _normalize_tool_config(tool_config: Any) -> dict | None:
@@ -1118,6 +1336,504 @@ async def fetch_antigravity_response_stream(client, url, headers, payload, model
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 前端额度渲染脚本（内联 JS，由 UI 插槽机制动态加载）
+# ═══════════════════════════════════════════════════════════════════
+
+# 修改原因：fetchAvailableModels 返回各模型组独立 quota，需要按 modelProvider 分组展示 remainingFraction。
+# 修改方式：内联 JS 按 provider 分组取最低百分比，显示总览标签 + 点击弹出详细 quota。
+# 目的：key 行显示最低 quota，点击展开按模型组的额度列表。
+QUOTA_UI = """
+export default function render(ctx) {
+    const { el, data } = ctx || {};
+    if (!el) return;
+    const raw = data?.raw || {};
+    // 修改原因：Antigravity 的边框弧已由 React QuotaBorderOverlay 负责，Blob 插槽只应该提供标签和点击详情。
+    // 修改方式：脚本只读取 raw.modelQuotas，回写 data.quota_5h/quota_7d，并用纯 DOM 在点击时创建 tooltip。
+    // 目的：让上下边框复用现有组件，同时保留 CPA shared quota group 的明细查看能力。
+    const modelQuotas = Array.isArray(raw?.modelQuotas) ? raw.modelQuotas : [];
+    const credits = Array.isArray(raw?.availableCredits) ? raw.availableCredits : [];
+    const paidTier = raw?.paidTier;
+    const initialQuota5h = typeof data?.quota_5h === 'number' && Number.isFinite(data.quota_5h) ? data.quota_5h : undefined;
+    const initialQuota7d = typeof data?.quota_7d === 'number' && Number.isFinite(data.quota_7d) ? data.quota_7d : undefined;
+
+    const normalizeFraction = value => {
+        if (value == null || value === '') return null;
+        const n = Number(value);
+        if (!Number.isFinite(n)) return null;
+        return Math.max(0, Math.min(1, n));
+    };
+    const percentFromFraction = value => {
+        const fraction = normalizeFraction(value);
+        return fraction == null ? null : fraction * 100;
+    };
+    const isIgnoredModel = model => {
+        const id = String(model || '').toLowerCase();
+        return id.startsWith('tab_') || id.startsWith('chat_');
+    };
+    const providerKindOf = modelQuota => {
+        const provider = String(modelQuota?.modelProvider || '').toUpperCase();
+        const model = String(modelQuota?.model || '').toLowerCase();
+        if (isIgnoredModel(model)) return null;
+        if (provider === 'MODEL_PROVIDER_GOOGLE' || provider.includes('GOOGLE') || provider.includes('GEMINI') || model.startsWith('gemini-')) return 'gemini';
+        if (provider === 'MODEL_PROVIDER_ANTHROPIC' || provider === 'MODEL_PROVIDER_OPENAI' || provider.includes('ANTHROPIC') || provider.includes('OPENAI') || model.startsWith('claude-') || model.startsWith('gpt-')) return 'external';
+        return null;
+    };
+    const colorOf = pct => pct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : pct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+    const strokeColorOf = pct => pct >= 50 ? '#10b981' : pct >= 20 ? '#f59e0b' : '#ef4444';
+    const shortProviderName = providerKind => providerKind === 'external' ? 'Claude + GPT' : 'Gemini';
+    const prettyModelName = model => {
+        const base = String(model || 'quota')
+            .replace(/-(low|high|thinking|agent|medium)$/g, '')
+            .replace(/-/g, ' ')
+            .replace(/\\b\\w/g, ch => ch.toUpperCase())
+            .replace(/Gpt/g, 'GPT');
+        return base || 'Quota';
+    };
+    const geminiSeriesName = model => {
+        const id = String(model || '').toLowerCase();
+        if (id.startsWith('gemini-3.1-pro')) return 'Gemini 3.1 Pro';
+        if (id.startsWith('gemini-3.1-flash-lite') || id.startsWith('gemini-3.1-image')) return 'Gemini 3.1 Flash Lite / Image';
+        if (id.startsWith('gemini-3-pro')) return 'Gemini 3 Pro';
+        if (id.startsWith('gemini-3-flash') || id.includes('gemini-3') && id.endsWith('-agent')) return 'Gemini 3 Flash';
+        if (id.startsWith('gemini-2.5-pro')) return 'Gemini 2.5 Pro';
+        if (id.startsWith('gemini-2.5-flash')) return 'Gemini 2.5 Flash';
+        return prettyModelName(model);
+    };
+    const groupLabelOf = modelQuota => {
+        const providerKind = providerKindOf(modelQuota);
+        if (providerKind === 'external') return 'Claude + GPT';
+        if (providerKind === 'gemini') return geminiSeriesName(modelQuota?.model);
+        return prettyModelName(modelQuota?.model) || shortProviderName(providerKind);
+    };
+    const formatResetDuration = resetTime => {
+        if (!resetTime) return 'unknown';
+        const target = new Date(resetTime).getTime();
+        if (!Number.isFinite(target)) return 'unknown';
+        const diffMs = Math.max(0, target - Date.now());
+        const totalMinutes = Math.ceil(diffMs / 60000);
+        if (totalMinutes <= 0) return 'now';
+        const days = Math.floor(totalMinutes / 1440);
+        const hours = Math.floor((totalMinutes % 1440) / 60);
+        const minutes = totalMinutes % 60;
+        if (days > 0) return `${days}d ${hours}h`;
+        if (hours > 0) return `${hours}h ${minutes}m`;
+        return `${minutes}m`;
+    };
+    const groupModels = modelQuotaList => {
+        // 修改原因：CPA 的 quota 是 shared group，不应在点击气泡里逐模型铺开。
+        // 修改方式：过滤 tab_* 和 chat_*，Gemini 按系列与 reset/fraction 分组，Claude/GPT 外部模型统一合并。
+        // 目的：让气泡行数对应真实 quota 池，避免同一 shared group 被多个模型重复显示。
+        const groups = {};
+        for (const modelQuota of modelQuotaList) {
+            const model = String(modelQuota?.model || '');
+            if (isIgnoredModel(model)) continue;
+            const providerKind = providerKindOf(modelQuota);
+            if (providerKind !== 'gemini' && providerKind !== 'external') continue;
+            const fraction = normalizeFraction(modelQuota?.remainingFraction);
+            if (fraction == null) continue;
+            const label = groupLabelOf(modelQuota);
+            const resetTime = modelQuota?.resetTime || '';
+            const key = providerKind === 'external'
+                ? `external|${resetTime}|${fraction}`
+                : `gemini|${label}|${resetTime}|${fraction}`;
+            if (!groups[key]) {
+                groups[key] = { label, providerKind, fraction, resetTime, models: [] };
+            }
+            groups[key].models.push(model || String(modelQuota?.displayName || label));
+        }
+        return Object.values(groups).sort((a, b) => {
+            if (a.providerKind !== b.providerKind) return a.providerKind === 'gemini' ? -1 : 1;
+            return a.label.localeCompare(b.label);
+        });
+    };
+
+    const filteredQuotas = modelQuotas.filter(modelQuota => !isIgnoredModel(modelQuota?.model));
+    const geminiPcts = filteredQuotas.filter(modelQuota => providerKindOf(modelQuota) === 'gemini').map(modelQuota => percentFromFraction(modelQuota?.remainingFraction)).filter(value => value != null);
+    const externalPcts = filteredQuotas.filter(modelQuota => providerKindOf(modelQuota) === 'external').map(modelQuota => percentFromFraction(modelQuota?.remainingFraction)).filter(value => value != null);
+    const geminiPct = geminiPcts.length ? Math.min(...geminiPcts) : undefined;
+    const externalPct = externalPcts.length ? Math.min(...externalPcts) : undefined;
+    if (geminiPct != null) data.quota_5h = geminiPct;
+    if (externalPct != null) data.quota_7d = externalPct;
+
+    const fallbackPcts = [geminiPct, externalPct, initialQuota5h, initialQuota7d].filter(value => typeof value === 'number' && Number.isFinite(value));
+    const minPct = fallbackPcts.length ? Math.round(Math.min(...fallbackPcts)) : null;
+    const tierName = paidTier?.name
+        ? String(paidTier.name).replace(/Google\s*(AI\s*)?/i, '').replace(/Gemini Code Assist in /i, '').trim()
+        : '';
+    if (minPct != null) {
+        // 修改原因：Antigravity key 行只显示百分比时，无法直接区分 Free、Pro、Ultra 等账号层级。
+        // 修改方式：从 paidTier.name 提取短 tier 名称，有名称时把它拼到最低 quota 百分比前。
+        // 目的：让标签显示为 Pro 60% 这类形式，同时没有 tier 时保持原百分比显示。
+        el.textContent = tierName ? `${tierName} ${minPct}%` : `${minPct}%`;
+        el.className = `flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-pointer ${colorOf(minPct)}`;
+    } else if (paidTier?.name) {
+        el.textContent = String(paidTier.name).replace(/Gemini Code Assist in /i, '').replace(/Google One /i, '');
+        el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 relative z-[2] cursor-pointer';
+    } else if (credits.length) {
+        const amount = Number.parseFloat(credits[0]?.creditAmount || 0);
+        const displayAmount = Number.isFinite(amount) ? (amount >= 1000 ? `${(amount / 1000).toFixed(1)}k` : amount.toFixed(0)) : '0';
+        el.textContent = `${displayAmount} cr`;
+        el.className = `flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-pointer ${colorOf(amount >= 500 ? 80 : amount >= 100 ? 30 : 5)}`;
+    } else {
+        el.textContent = 'N/A';
+        el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-muted text-muted-foreground relative z-[2] cursor-default';
+        // 修改原因：如果额度数据消失，旧 tooltip 不能继续悬挂在 document.body 中。
+        // 修改方式：无可展示标签时显式执行旧清理函数，再退出本轮 render。
+        // 目的：避免异常数据让已存在的气泡和事件监听残留。
+        if (typeof el.__antigravityQuotaCleanup === 'function') {
+            el.__antigravityQuotaCleanup();
+        }
+        return;
+    }
+
+    const nextTooltipState = { groups: groupModels(modelQuotas), credits, paidTier };
+    if (el.__agTooltipOpen && el.__agQuotaState?.update) {
+        // 修改原因：React 轮询刷新 quota 时会重新调用 render，直接 cleanup 会移除用户已打开的气泡。
+        // 修改方式：打开状态下跳过 DOM 重建，只刷新标签文本、颜色、quota 回写值和现有气泡内容。
+        // 目的：让点击打开的 tooltip 稳定保留，直到用户点击外部、再次点击标签或滚动关闭。
+        el.__agQuotaState.update(nextTooltipState);
+        if (typeof el.__agQuotaState.placeTooltip === 'function') {
+            el.__agQuotaState.placeTooltip();
+        }
+        return;
+    }
+
+    if (typeof el.__antigravityQuotaCleanup === 'function') {
+        el.__antigravityQuotaCleanup();
+    }
+
+    let tooltipState = nextTooltipState;
+    const tooltip = document.createElement('div');
+    tooltip.className = 'absolute z-[9999] hidden min-w-[280px] max-w-[360px] bg-popover border-border text-foreground rounded-lg border p-3 text-xs shadow-lg';
+    tooltip.style.background = 'hsl(var(--popover, 0 0% 100%))';
+    tooltip.style.color = 'hsl(var(--popover-foreground, 222.2 84% 4.9%))';
+    tooltip.style.borderColor = 'hsl(var(--border, 214.3 31.8% 91.4%))';
+    tooltip.style.pointerEvents = 'auto';
+    tooltip.style.zIndex = '9999';
+
+    const renderTooltip = (nextState) => {
+        // 修改原因：打开状态下 render 会复用同一个 tooltip DOM，闭包中的旧数据必须被替换。
+        // 修改方式：renderTooltip 接收最新分组、credits 和 paidTier，并写入 tooltipState 后重绘内容。
+        // 目的：React 重渲染时不关闭 tooltip，也能显示最新 quota 明细。
+        if (nextState) tooltipState = nextState;
+        const activeGroups = Array.isArray(tooltipState?.groups) ? tooltipState.groups : [];
+        const activeCredits = Array.isArray(tooltipState?.credits) ? tooltipState.credits : [];
+        const activePaidTier = tooltipState?.paidTier;
+        tooltip.textContent = '';
+        const title = document.createElement('div');
+        title.className = 'mb-2 font-semibold text-foreground';
+        title.textContent = activePaidTier?.name || 'Antigravity quota';
+        tooltip.appendChild(title);
+
+        if (!activeGroups.length) {
+            const empty = document.createElement('div');
+            empty.className = 'text-muted-foreground';
+            empty.textContent = activeCredits.length ? `Credits: ${activeCredits.map(c => c?.creditAmount).filter(Boolean).join(', ')}` : 'No model quota details';
+            tooltip.appendChild(empty);
+            return;
+        }
+
+        for (const group of activeGroups) {
+            const pct = Math.round(group.fraction * 100);
+            const row = document.createElement('div');
+            row.className = 'flex items-center justify-between gap-3 py-1';
+            row.title = group.models.join(', ');
+
+            const left = document.createElement('div');
+            left.className = 'flex min-w-0 items-center gap-2';
+            const arcSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            arcSvg.setAttribute('width', '16');
+            arcSvg.setAttribute('height', '10');
+            arcSvg.setAttribute('viewBox', '0 0 16 10');
+            arcSvg.style.flexShrink = '0';
+            const arcPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            arcPath.setAttribute('d', 'M 1 9 A 7 7 0 0 1 15 9');
+            arcPath.setAttribute('fill', 'none');
+            arcPath.setAttribute('stroke', strokeColorOf(pct));
+            arcPath.setAttribute('stroke-width', '2');
+            arcPath.setAttribute('stroke-linecap', 'round');
+            arcPath.setAttribute('pathLength', '100');
+            arcPath.style.strokeDasharray = `${pct} 100`;
+            arcSvg.appendChild(arcPath);
+            const name = document.createElement('span');
+            name.className = 'truncate';
+            name.textContent = group.label;
+            left.appendChild(arcSvg);
+            left.appendChild(name);
+
+            const right = document.createElement('div');
+            right.className = 'flex flex-shrink-0 items-center gap-2 font-mono';
+            const percent = document.createElement('span');
+            percent.textContent = `${pct}%`;
+            const reset = document.createElement('span');
+            reset.className = 'text-muted-foreground';
+            reset.textContent = `resets in ${formatResetDuration(group.resetTime)}`;
+            right.appendChild(percent);
+            right.appendChild(reset);
+
+            row.appendChild(left);
+            row.appendChild(right);
+            tooltip.appendChild(row);
+        }
+    };
+
+    let open = false;
+    const placeTooltip = () => {
+        const rect = el.getBoundingClientRect();
+        const tw = tooltip.offsetWidth || 280;
+        const left = Math.max(8, Math.min(window.scrollX + rect.right - tw, window.scrollX + window.innerWidth - tw - 8));
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = `${window.scrollY + rect.bottom + 4}px`;
+    };
+    const show = () => {
+        if (open) return;
+        if (!tooltip.isConnected) document.body.appendChild(tooltip);
+        renderTooltip();
+        tooltip.style.display = 'block';
+        placeTooltip();
+        open = true;
+        el.__agTooltipOpen = true;
+    };
+    const hide = () => {
+        if (!open) return;
+        tooltip.style.display = 'none';
+        open = false;
+        el.__agTooltipOpen = false;
+    };
+    const onElClick = (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        open ? hide() : show();
+    };
+    const onOutsideClick = (e) => {
+        if (open && !tooltip.contains(e.target) && !el.contains(e.target)) hide();
+    };
+    const onScroll = () => { if (open) hide(); };
+    // 修改原因：QUOTA_UI 插槽会被 React 轮询刷新重复调用，hover 和延时关闭容易在刷新时误关或重建气泡。
+    // 修改方式：只保留标签点击切换、document 外部点击关闭和滚动关闭，不再注册鼠标移入移出监听或延时关闭。
+    // 目的：让用户显式点击打开的 quota 明细稳定保留，直到用户明确关闭或页面滚动。
+    el.__agQuotaState = { update: renderTooltip, placeTooltip };
+    el.addEventListener('click', onElClick);
+    document.addEventListener('click', onOutsideClick);
+    window.addEventListener('scroll', onScroll, true);
+    el.__antigravityQuotaCleanup = () => {
+        el.removeEventListener('click', onElClick);
+        document.removeEventListener('click', onOutsideClick);
+        window.removeEventListener('scroll', onScroll, true);
+        open = false;
+        el.__agTooltipOpen = false;
+        el.__agQuotaState = null;
+        tooltip.remove();
+    };
+}
+""".strip()
+
+
+# 修改原因：QuotaBorderOverlay 读取 OAuth 缓存中的 quota_5h/quota_7d，可能落后于 QUOTA_UI 从 raw.modelQuotas 算出的实时百分比。
+# 修改方式：新增 key_border 插槽脚本，直接从 data.raw.modelQuotas 分组计算 Gemini 与 External 最低额度，并在插槽 div 内绘制 SVG 上下弧。
+# 目的：让 Antigravity Key 行的边框弧和额度气泡使用同一个实时数据源，避免上弧或下弧停留在 100%。
+AG_KEY_BORDER_UI = """
+export default function render(ctx) {
+    const { el, data } = ctx || {};
+    if (!el) return;
+
+    // 修改原因：UiSlot 会在 React 重渲染和额度轮询时重复调用，旧的 SVG 和 ResizeObserver 不能残留。
+    // 修改方式：每轮渲染开始前执行上一次注册的清理函数，再根据最新 data.raw.modelQuotas 重建 DOM。
+    // 目的：避免重复观察器、旧弧线和旧 title 在同一个 Key 行上叠加。
+    if (typeof el.__agBorderCleanup === 'function') {
+        el.__agBorderCleanup();
+    }
+
+    const raw = data?.raw || {};
+    const modelQuotas = Array.isArray(raw?.modelQuotas) ? raw.modelQuotas : [];
+
+    const normalizePercent = value => {
+        if (value == null || value === '') return null;
+        const n = Number(value);
+        if (!Number.isFinite(n)) return null;
+        return Math.max(0, Math.min(100, n));
+    };
+    const percentFromFraction = value => {
+        if (value == null || value === '') return null;
+        const n = Number(value);
+        if (!Number.isFinite(n)) return null;
+        return normalizePercent(n * 100);
+    };
+    const isIgnored = model => {
+        const id = String(model || '').toLowerCase();
+        return id.startsWith('tab_') || id.startsWith('chat_');
+    };
+    const providerOf = mq => {
+        const p = String(mq?.modelProvider || '').toUpperCase();
+        const m = String(mq?.model || '').toLowerCase();
+        if (isIgnored(m)) return null;
+        if (p.includes('GOOGLE') || p.includes('GEMINI') || m.startsWith('gemini-')) return 'gemini';
+        if (p.includes('ANTHROPIC') || p.includes('OPENAI') || m.startsWith('claude-') || m.startsWith('gpt-')) return 'external';
+        return null;
+    };
+
+    let geminiMin = null;
+    let externalMin = null;
+    for (const mq of modelQuotas) {
+        const pct = percentFromFraction(mq?.remainingFraction);
+        if (pct == null) continue;
+        const kind = providerOf(mq);
+        if (kind === 'gemini') geminiMin = geminiMin == null ? pct : Math.min(geminiMin, pct);
+        if (kind === 'external') externalMin = externalMin == null ? pct : Math.min(externalMin, pct);
+    }
+
+    const q5 = normalizePercent(geminiMin ?? data?.quota_5h);
+    const q7 = normalizePercent(externalMin ?? data?.quota_7d);
+    if (q5 == null && q7 == null) return;
+
+    const buildTopHalfPath = (x, y, bw, bh, r) => {
+        // 修改原因：Antigravity 自定义边框必须与 Channels.tsx 的 buildTopHalfPath 几何路径一致。
+        // 修改方式：使用同样的左中点到右中点顺时针路径，并使用 SVG A 圆角命令而不是另造 Q 曲线。
+        // 目的：替换默认 QuotaBorderOverlay 时，弧线位置、长度和圆角视觉保持一致。
+        const my = y + bh / 2;
+        return [
+            `M ${x} ${my}`,
+            `L ${x} ${y + r}`,
+            `A ${r} ${r} 0 0 1 ${x + r} ${y}`,
+            `L ${x + bw - r} ${y}`,
+            `A ${r} ${r} 0 0 1 ${x + bw} ${y + r}`,
+            `L ${x + bw} ${my}`,
+        ].join(' ');
+    };
+    const buildBottomHalfPath = (x, y, bw, bh, r) => {
+        // 修改原因：下弧必须复用 Channels.tsx 的 buildBottomHalfPath 方向，否则 strokeDasharray 百分比会从错误位置增长。
+        // 修改方式：同样从左中点出发，沿左下圆角、下边、右下圆角到右中点，保留 A 命令 sweep 参数。
+        // 目的：确保 External 百分比缩短时与通用 QuotaBorderOverlay 的表现一致。
+        const my = y + bh / 2;
+        return [
+            `M ${x} ${my}`,
+            `L ${x} ${y + bh - r}`,
+            `A ${r} ${r} 0 0 0 ${x + r} ${y + bh}`,
+            `L ${x + bw - r} ${y + bh}`,
+            `A ${r} ${r} 0 0 0 ${x + bw} ${y + bh - r}`,
+            `L ${x + bw} ${my}`,
+        ].join(' ');
+    };
+
+    let ro = null;
+    const draw = () => {
+        const w = el.offsetWidth;
+        const h = el.offsetHeight;
+        el.innerHTML = '';
+        if (w <= 0 || h <= 0) return;
+
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+        svg.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none;';
+
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = `Gemini: ${q5 != null ? Math.round(q5) + '%' : '?'} · External: ${q7 != null ? Math.round(q7) + '%' : '?'}`;
+        svg.appendChild(title);
+
+        const x = 1;
+        const y = 1;
+        const bw = w - 2;
+        const bh = h - 2;
+        const r = 7;
+
+        if (q5 != null) {
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', buildTopHalfPath(x, y, bw, bh, r));
+            path.setAttribute('pathLength', '100');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('stroke', '#3b82f6');
+            path.setAttribute('stroke-width', '2');
+            path.setAttribute('stroke-linecap', 'round');
+            path.style.strokeDasharray = `${q5} 100`;
+            path.style.strokeDashoffset = '0';
+            path.style.transition = 'stroke-dasharray 0.5s ease';
+            svg.appendChild(path);
+        }
+
+        if (q7 != null) {
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', buildBottomHalfPath(x, y, bw, bh, r));
+            path.setAttribute('pathLength', '100');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('stroke', '#8b5cf6');
+            path.setAttribute('stroke-width', '2');
+            path.setAttribute('stroke-linecap', 'round');
+            path.style.strokeDasharray = `${q7} 100`;
+            path.style.strokeDashoffset = '0';
+            path.style.transition = 'stroke-dasharray 0.5s ease';
+            svg.appendChild(path);
+        }
+
+        el.appendChild(svg);
+    };
+
+    draw();
+    if (typeof ResizeObserver !== 'undefined') {
+        ro = new ResizeObserver(draw);
+        ro.observe(el);
+    }
+    el.__agBorderCleanup = () => {
+        if (ro) ro.disconnect();
+        el.innerHTML = '';
+        el.__agBorderCleanup = null;
+    };
+}
+""".strip()
+
+
+# 修改原因：Antigravity 的请求体参数覆写需要嵌套在 request 下，通用前端不能硬编码这个渠道专属格式提醒。
+# 修改方式：注册 override_hint 插槽脚本，只通过 ctx.el.textContent 写入纯提示文本。
+# 目的：让 Antigravity 编辑面板显示参数覆写格式提醒，未注册该插槽的渠道不显示提示。
+AG_OVERRIDE_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = '⚠️ 反重力参数覆写需嵌套在 request: 下，如 {"all": {"request": {"generationConfig": {"temperature": 0.7}}}}';
+}
+""".strip()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 模型列表适配器
+# ═══════════════════════════════════════════════════════════════════
+
+
+async def fetch_antigravity_models(client, provider):
+    """通过 fetchAvailableModels 获取 Antigravity 可用模型列表。"""
+    # OAuth resolve 已在路由层完成，provider["api"] 已是 access_token
+    access_token = provider.get("api")
+    if isinstance(access_token, list):
+        access_token = access_token[0] if access_token else None
+    if not access_token:
+        return []
+
+    version = await get_antigravity_version()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": f"antigravity/{version} darwin/arm64 google-api-nodejs-client/10.3.0",
+        "X-Goog-Api-Client": ANTIGRAVITY_API_CLIENT_HEADER,
+    }
+    base_url = provider.get("base_url") or DEFAULT_BASE_URL
+    bases = [DEFAULT_BASE_URL, FALLBACK_BASE_URL, str(base_url).rstrip("/")]
+    seen: set[str] = set()
+    for base in bases:
+        normalized = str(base or "").rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        url = _build_antigravity_url_from_base(normalized, FETCH_AVAILABLE_MODELS_ACTION)
+        try:
+            async with httpx.AsyncClient(timeout=30, http2=False) as _client:
+                response = await _client.post(url, json={}, headers=headers)
+            if response.status_code < 400:
+                payload = response.json()
+                models = _extract_model_names_from_available_models(payload)
+                if models:
+                    return models
+        except Exception:
+            continue
+    return []
+
+# ═══════════════════════════════════════════════════════════════════
 # 注册
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1144,8 +1860,17 @@ def register():
         passthrough_response_adapter=fetch_antigravity_passthrough_response,
         response_adapter=fetch_antigravity_response,
         stream_adapter=fetch_antigravity_response_stream,
+        models_adapter=fetch_antigravity_models,
         is_oauth=True,
         oauth_provider=provider,
+        # 修改原因：Antigravity 的额度标签、边框弧和请求体覆写提示都属于渠道专属 UI，通用前端只负责提供挂载点。
+        # 修改方式：注册 quota_display、key_border、override_hint 三个内联 UI 插槽，额度脚本读实时 raw 数据，提示脚本只写入 ctx.el。
+        # 目的：让前端从渠道元数据加载 Antigravity 专用 UI，同时保持未注册插槽的渠道不显示额外提示。
+        ui_slots={
+            "quota_display": QUOTA_UI,
+            "key_border": AG_KEY_BORDER_UI,
+            "override_hint": AG_OVERRIDE_HINT,
+        },
         source="builtin",
     )
 
