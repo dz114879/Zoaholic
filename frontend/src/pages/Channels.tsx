@@ -893,9 +893,7 @@ export default function Channels() {
   }, [isModalOpen, isOAuthEngine, refreshOAuthAccounts]);
 
   useEffect(() => {
-    // 修改原因：OAuth quota 查询需要访问上游 API，不能阻塞 /v1/oauth/accounts 列表加载。
-    // 修改方式：对已连接且尚无 quota 的账号逐个调用 /quota，并用 _quota_loading 或 _quota_unavailable 避免重复请求。
-    // 目的：让 Key 行打开后异步显示双弧配额，同时不造成无限渲染循环。
+    // OAuth 弹窗打开时，对尚无 quota 的活跃账号批量调 /balance 查询额度。
     if (!isModalOpen || !isOAuthEngine) return;
     const providerName = (formData?.provider || '').trim();
     if (!providerName) return;
@@ -908,48 +906,78 @@ export default function Channels() {
     ));
     if (targets.length === 0) return;
 
-    targets.forEach(([keyId]) => {
-      setOauthAccounts(prev => prev[keyId] ? { ...prev, [keyId]: { ...prev[keyId], _quota_loading: true } } : prev);
-      apiFetch(`/v1/oauth/accounts/${encodeURIComponent(keyId)}/quota?provider=${encodeURIComponent(providerName)}`, { headers: { Authorization: `Bearer ${token}` } })
-        .then(async res => {
-          if (res.ok) return await res.json();
-          // 修改原因：此前非 ok 响应只写入控制台，管理员在页面上无法看到 OAuth quota 查询失败原因。
-          // 修改方式：非 ok 时尝试读取 JSON 错误正文，并通过 toastWarning 显示账号和错误信息。
-          // 目的：让额度查询失败在界面上可见，避免静默失败。
-          try {
-            const errBody = await res.json();
-            const errMsg = errBody?.error || `HTTP ${res.status}`;
-            toastWarning(`${keyId}: ${errMsg}`);
-          } catch {
-            // 修改原因：某些错误响应可能不是 JSON，解析失败不应影响账号列表状态更新。
-            // 修改方式：忽略解析异常，继续返回 null 走既有 quota_unavailable 标记流程。
-            // 目的：只增加错误可见性，不改变失败时前端状态收敛逻辑。
-          }
-          return null;
-        })
-        .then(quota => {
-          setOauthAccounts(prev => {
-            const current = prev[keyId];
-            if (!current) return prev;
-            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
-            // 修改原因：上游可能只返回 reset 等原始 header，缺少可计算百分比时继续重试会形成重复请求。
-            // 修改方式：成功响应里没有 quota_5h 和 quota_7d 时，也写入 _quota_unavailable 标记。
-            // 目的：让每次账号列表刷新周期最多查询一次 quota，避免渲染循环触发连续网络请求。
-            const quotaPatch = quota && typeof quota === 'object'
-              ? { ...quota, _quota_unavailable: quota.quota_5h == null && quota.quota_7d == null }
-              : { _quota_unavailable: true };
-            return { ...prev, [keyId]: { ...accountWithoutLoading, ...quotaPatch } };
-          });
-        })
-        .catch(() => {
-          setOauthAccounts(prev => {
-            const current = prev[keyId];
-            if (!current) return prev;
-            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
-            return { ...prev, [keyId]: { ...accountWithoutLoading, _quota_unavailable: true } };
-          });
-        });
+    // 标记所有目标为 loading
+    setOauthAccounts(prev => {
+      const next = { ...prev };
+      for (const [keyId] of targets) {
+        if (next[keyId]) next[keyId] = { ...next[keyId], _quota_loading: true };
+      }
+      return next;
     });
+
+    // 一次 /balance 调用，后端会逐 key 查询并聚合返回
+    apiFetch('/v1/channels/balance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        provider: formData?.provider,
+        engine: formData?.engine,
+        base_url: formData?.base_url,
+        api_key: targets.map(([keyId]) => keyId),
+        preferences: formData?.preferences,
+      }),
+    })
+      .then(async res => {
+        if (res.ok) return await res.json();
+        try {
+          const errBody = await res.json();
+          toastWarning(errBody?.error || `HTTP ${res.status}`);
+        } catch { /* ignore */ }
+        return null;
+      })
+      .then(data => {
+        setOauthAccounts(prev => {
+          const next = { ...prev };
+          const perAccount = data?.results || {};
+          for (const [keyId] of targets) {
+            const current = next[keyId];
+            if (!current) continue;
+            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
+            const result = perAccount[keyId] || data;
+            if (result && typeof result === 'object') {
+              const hasQuota = result.quota_5h != null || result.quota_7d != null;
+              next[keyId] = {
+                ...accountWithoutLoading,
+                ...(result.quota_5h != null ? { quota_5h: result.quota_5h } : {}),
+                ...(result.quota_7d != null ? { quota_7d: result.quota_7d } : {}),
+                ...(result.raw ? { quota_raw: result.raw } : {}),
+                ...(result.extra_usage_enabled ? {
+                  extra_usage_enabled: true,
+                  extra_usage_limit: result.extra_usage_limit,
+                  extra_usage_used: result.extra_usage_used,
+                  extra_usage_utilization: result.extra_usage_utilization,
+                } : {}),
+                _quota_unavailable: !hasQuota && !result.extra_usage_enabled,
+              };
+            } else {
+              next[keyId] = { ...accountWithoutLoading, _quota_unavailable: true };
+            }
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        setOauthAccounts(prev => {
+          const next = { ...prev };
+          for (const [keyId] of targets) {
+            const current = next[keyId];
+            if (!current) continue;
+            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
+            next[keyId] = { ...accountWithoutLoading, _quota_unavailable: true };
+          }
+          return next;
+        });
+      });
   }, [isModalOpen, isOAuthEngine, oauthAccounts, token, formData?.provider]);
 
   const openModal = async (provider: any = null, index: number | null = null) => {

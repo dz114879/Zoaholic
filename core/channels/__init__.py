@@ -34,6 +34,10 @@ from . import claude_code_channel
 # 修改方式：像 Codex 和 Claude Code 一样导入自包含渠道模块。
 # 目的：让 core.channels.get_channel("gemini-cli") 能被请求路由和管理端发现。
 from . import gemini_cli_channel
+# 修改原因：Antigravity OAuth 是新的内置渠道，必须在 channels 包导入时加载模块定义。
+# 修改方式：与其他自包含 OAuth 渠道一样显式导入 antigravity_channel。
+# 目的：让注册表、OAuthManager 和管理端都能发现 antigravity engine。
+from . import antigravity_channel
 
 # 调用各渠道的 register() 函数
 openai_channel.register()
@@ -52,6 +56,10 @@ claude_code_channel.register()
 # 修改方式：在 OAuth 内置渠道注册序列中追加 Gemini CLI。
 # 目的：让 Gemini 方言透传和普通请求都可以选择 gemini-cli engine。
 gemini_cli_channel.register()
+# 修改原因：Antigravity 渠道同样自包含 provider 和 adapters，导入后还需要显式注册。
+# 修改方式：在内置渠道注册序列末尾调用 antigravity_channel.register()。
+# 目的：让 core.channels.get_channel("antigravity") 和 OAuth provider 扫描都能工作。
+antigravity_channel.register()
 
 __all__ = [
     # 类型定义

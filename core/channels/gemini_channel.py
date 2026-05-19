@@ -926,18 +926,18 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
             if image_base64:
                     # 注意：避免在此处直接打印或使用 image_base64，它可能是一个极大的字符串
                 logger.debug(f"[Gemini] image_base64 received, length={len(image_base64)}, finish={finishReason}")
+            # 追踪有效内容（必须在 finishReason 判断之外，每个 chunk 都检查）
+            if is_thinking and reasoning_content:
+                has_reasoning = True
+            if content and content.strip():
+                has_content = True
+            if image_base64:
+                has_image = True
+            if function_calls_list:
+                has_function_call = True
+
             if finishReason:
                 logger.debug(f"[Gemini] finishReason={finishReason}, has_image={bool(image_base64)}, len={len(content) if content else 0}")
-
-                # 追踪有效内容
-                if is_thinking and reasoning_content:
-                    has_reasoning = True
-                if content and content.strip():
-                    has_content = True
-                if image_base64:
-                    has_image = True
-                if function_calls_list:
-                    has_function_call = True
 
             if totalTokenCount > 0 or promptTokenCount > 0 or candidatesTokenCount > 0:
                 _cache_usage = extract_cache_usage(safe_get(response_json, "usageMetadata", default={}) or {})
