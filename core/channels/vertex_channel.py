@@ -990,6 +990,25 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
     yield "data: [DONE]" + end_of_line
 
 
+_VERTEX_KEY_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = 'Key 填服务账号 JSON（整段粘贴），系统自动解析 project_id 和签发 access_token';
+}
+""".strip()
+
+_VERTEX_BASE_URL_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = '默认 https://aiplatform.googleapis.com（Region 和 Project ID 从服务账号 JSON 自动读取）';
+}
+""".strip()
+
+_VERTEX_TOKEN_URL_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = 'Vertex 使用服务账号 JWT 自签 token，无需填写此项';
+}
+""".strip()
+
+
 def register():
     """注册 Vertex AI 渠道到注册中心"""
     from .registry import register_channel
@@ -1006,10 +1025,12 @@ def register():
         response_adapter=fetch_vertex_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=None,
-        # 修改原因：Vertex Gemini 的服务账号 OAuth provider 需要随渠道定义声明，不能依赖 main.py 单独硬编码注册。
-        # 修改方式：在 register_channel 参数中传入 VertexProvider 实例，由 registry 自动标记为 OAuth 渠道。
-        # 目的：让 Vertex Gemini 与插件 OAuth 渠道使用同一条自动 provider 注册路径。
         oauth_provider=VertexProvider(),
+        ui_slots={
+            "key_hint": _VERTEX_KEY_HINT,
+            "base_url_hint": _VERTEX_BASE_URL_HINT,
+            "token_url_hint": _VERTEX_TOKEN_URL_HINT,
+        },
         source="builtin",
     )
     
@@ -1024,9 +1045,11 @@ def register():
         response_adapter=fetch_vertex_claude_response,
         stream_adapter=fetch_vertex_claude_response_stream,
         models_adapter=None,
-        # 修改原因：Vertex Claude 同样依赖服务账号 OAuth provider，启动注册应来自 registry 声明。
-        # 修改方式：在第二个 Vertex register_channel 调用中也传入 VertexProvider 实例。
-        # 目的：保证 vertex-claude 和 vertex-gemini 都能被通用扫描逻辑发现并注册。
         oauth_provider=VertexProvider(),
+        ui_slots={
+            "key_hint": _VERTEX_KEY_HINT,
+            "base_url_hint": _VERTEX_BASE_URL_HINT,
+            "token_url_hint": _VERTEX_TOKEN_URL_HINT,
+        },
         source="builtin",
     )

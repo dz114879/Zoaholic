@@ -170,6 +170,19 @@ async def fetch_azure_models(client, provider):
 # ============================================================
 
 
+_AZURE_KEY_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = 'Azure Portal → 资源 → Keys and Endpoint 中获取 API Key';
+}
+""".strip()
+
+_AZURE_BASE_URL_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = '格式：https://{资源名}.openai.azure.com（部署名在模型映射中配置）';
+}
+""".strip()
+
+
 def register():
     """注册 Azure 渠道到注册中心"""
     from .registry import register_channel
@@ -186,5 +199,9 @@ def register():
         response_adapter=fetch_responses_response,
         stream_adapter=fetch_responses_stream,
         models_adapter=fetch_azure_models,
+        ui_slots={
+            "key_hint": _AZURE_KEY_HINT,
+            "base_url_hint": _AZURE_BASE_URL_HINT,
+        },
         source="builtin",
     )

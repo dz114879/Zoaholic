@@ -51,7 +51,7 @@ def _rebuild_runtime_rate_limits(app) -> None:
         )
 
 
-async def _persist_config(app, sections_to_verify=None):
+async def _persist_config(app, sections_to_verify=None, changed_providers=None):
     """
     持久化当前配置，并在需要写回文件时校验指定 section。
     """
@@ -79,6 +79,7 @@ async def _persist_config(app, sections_to_verify=None):
             skip_model_fetch=True,
             save_to_file=save_to_file,
             save_to_db=save_to_db,
+            changed_providers=changed_providers,
         )
         try:
             _rebuild_runtime_rate_limits(app)
@@ -269,7 +270,8 @@ async def create_provider(
         raise HTTPException(status_code=409, detail=f'Provider "{provider_name}" already exists.')
 
     providers.append(provider_data)
-    await _persist_config(app)
+    # 增量重建：只重建新增的渠道
+    await _persist_config(app, changed_providers={provider_name})
     return JSONResponse(
         status_code=201,
         content={"message": "Provider created", "provider_id": provider_name},
@@ -315,7 +317,10 @@ async def update_provider(
         raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
 
     providers[provider_index] = provider_data
-    await _persist_config(app)
+    # 增量重建：只重建被修改的渠道的 CircularList，其他保持不动
+    new_provider_name = provider_data.get('provider') or provider_id
+    changed = {provider_id, new_provider_name}  # 支持重命名：旧名+新名
+    await _persist_config(app, changed_providers=changed)
     return JSONResponse(content={"message": "Provider updated", "provider_id": provider_id})
 
 
@@ -337,5 +342,6 @@ async def delete_provider(
         raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
 
     providers.pop(provider_index)
-    await _persist_config(app)
+    # 删除不需要重建任何 CircularList，但传空 set 会跳过所有重建
+    await _persist_config(app, changed_providers=set())
     return JSONResponse(content={"message": "Provider deleted", "provider_id": provider_id})

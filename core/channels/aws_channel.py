@@ -751,6 +751,19 @@ async def fetch_aws_models(client, provider):
     return sorted(models)
 
 
+_AWS_KEY_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = 'Key 格式：AK:SK（如 AKIA...:wJalr...）或在渠道配置中单独填写 aws_access_key / aws_secret_key';
+}
+""".strip()
+
+_AWS_BASE_URL_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = 'URL 含 Region，如 https://bedrock-runtime.us-east-1.amazonaws.com（反代可填自定义地址）';
+}
+""".strip()
+
+
 def register():
     """注册 AWS 渠道到注册中心"""
     from .registry import register_channel
@@ -772,6 +785,10 @@ def register():
         response_adapter=fetch_aws_response,
         stream_adapter=fetch_aws_response_stream,
         models_adapter=fetch_aws_models,
+        ui_slots={
+            "key_hint": _AWS_KEY_HINT,
+            "base_url_hint": _AWS_BASE_URL_HINT,
+        },
         source="builtin",
     )
 

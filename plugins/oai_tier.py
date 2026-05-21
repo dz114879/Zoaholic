@@ -1,7 +1,8 @@
 """
-oai_tier — OpenAI 官方渠道 Tier 被动检测
+oai_tier — OpenAI 官方渠道 Tier 检测（被动 + 主动）
 
-通过响应头 x-ratelimit-limit-tokens 被动采集 TPM 上限，
+被动模式：通过响应头 x-ratelimit-limit-tokens 采集 TPM 上限。
+主动模式：余额查询时缓存无数据，发 max_completion_tokens:0 探测请求从响应头采集（零 token 消耗）。
 推断 OpenAI Tier 等级，并通过 balance_enricher 注入到余额查询结果中。
 
 使用方式：
@@ -9,7 +10,7 @@ oai_tier — OpenAI 官方渠道 Tier 被动检测
   仅给 api.openai.com 的渠道启用，不要给 Azure 或其他兼容站启用
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import json
 import time
 
@@ -25,7 +26,7 @@ from core.plugins import (
 PLUGIN_META = {
     "name": "oai_tier",
     "display_name": "OpenAI Tier 检测",
-    "description": "被动检测 OpenAI 账户 Tier 等级",
+    "description": "检测 OpenAI 账户 Tier 等级（被动采集 + 主动探测）",
     "version": "1.0.0",
     "category": "interceptors",
 }
@@ -57,6 +58,10 @@ EXTENSIONS = PLUGIN_EXPORTS
 
 # key: api_key 前 12 位, value: {"tier": str, "tpm": int, "rpm": int, "updated_at": float}
 _tier_cache: Dict[str, Dict[str, Any]] = {}
+
+# 主动探测防抖: key_prefix -> last_probe_timestamp
+_probe_timestamps: Dict[str, float] = {}
+_PROBE_COOLDOWN = 300  # 5 分钟内不重复探测同一个 key
 
 # TPM → Tier 映射表 (基于 OpenAI 官方文档)
 # https://platform.openai.com/docs/guides/rate-limits
@@ -121,7 +126,7 @@ async def _oai_tier_response_interceptor(response_chunk, engine, model, is_strea
         # 修改原因：余额查询阶段拿不到上一次响应头，需要跨请求暂存被动检测结果。
         # 修改方式：用 API Key 前 12 位作为缓存索引，保存 tier、TPM、RPM、模型和更新时间。
         # 目的：后续 balance_enricher 可以按同一个 Key 把 tier 注入余额查询结果。
-        api_key = info.get("api_key") or info.get("original_api_key") or ""
+        api_key = info.get("_used_api_key") or ""
         ck = _cache_key(api_key)
         if ck:
             _tier_cache[ck] = {
@@ -137,6 +142,52 @@ async def _oai_tier_response_interceptor(response_chunk, engine, model, is_strea
         logger.debug(f"[oai_tier] Error in response interceptor: {e}")
 
     return response_chunk
+
+
+# ==================== Active Probe ====================
+
+async def _probe_tier(api_key: str, base_url: str = "") -> Optional[Dict[str, Any]]:
+    """主动发 max_completion_tokens:0 探测请求，从 400 响应头采集 TPM/RPM（零 token 消耗）"""
+    import httpx
+
+    if not base_url:
+        base_url = "https://api.openai.com/v1"
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": ""}],
+        "max_completion_tokens": 0,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+
+        tpm_str = resp.headers.get("x-ratelimit-limit-tokens")
+        rpm_str = resp.headers.get("x-ratelimit-limit-requests")
+
+        if not tpm_str:
+            return None
+
+        tpm = int(str(tpm_str).replace(",", ""))
+        rpm = int(str(rpm_str).replace(",", "")) if rpm_str else None
+        tier = _tpm_to_tier(tpm)
+
+        return {
+            "tier": tier,
+            "tpm": tpm,
+            "rpm": rpm,
+            "model": "gpt-4o-mini (probe)",
+            "updated_at": time.time(),
+        }
+    except Exception as e:
+        logger.debug(f"[oai_tier] Probe failed: {e}")
+        return None
 
 
 # ==================== Balance Enricher ====================
@@ -155,6 +206,19 @@ async def _oai_tier_balance_enricher(result: dict, engine: str, provider: dict) 
 
         ck = _cache_key(str(api_key))
         cached = _tier_cache.get(ck)
+
+        # 缓存未命中，主动探测
+        if not cached and ck:
+            now = time.time()
+            if now - _probe_timestamps.get(ck, 0) > _PROBE_COOLDOWN:
+                _probe_timestamps[ck] = now
+                base_url = provider.get("base_url") or ""
+                probed = await _probe_tier(str(api_key), base_url)
+                if probed:
+                    _tier_cache[ck] = probed
+                    cached = probed
+                    logger.info(f"[oai_tier] Probed tier for {ck}***: {probed['tier']} (TPM={probed['tpm']})")
+
         if cached:
             result["tier"] = cached["tier"]
             result["tpm"] = cached.get("tpm")
@@ -196,6 +260,7 @@ def teardown(manager):
     unregister_response_interceptor("oai_tier_response")
     unregister_balance_enricher("oai_tier_balance")
     _tier_cache.clear()
+    _probe_timestamps.clear()
     logger.info("[oai_tier] Plugin unloaded")
 
 

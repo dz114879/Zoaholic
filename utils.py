@@ -9,7 +9,8 @@ from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
 from collections import defaultdict
 from typing import List, Dict, Optional
-from ruamel.yaml import YAML, YAMLError
+import yaml as _pyyaml
+from yaml import YAMLError
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, func, case
@@ -48,11 +49,19 @@ class InMemoryRateLimiter:
         self.requests[key].append(now)
         return False
 
-from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+class _YamlHelper:
+    """PyYAML CSafe wrapper — drop-in for the old ruamel YAML() instance."""
+    def load(self, source):
+        if hasattr(source, 'read'):
+            return _pyyaml.load(source, Loader=_pyyaml.CSafeLoader)
+        return _pyyaml.load(source, Loader=_pyyaml.CSafeLoader)
 
-yaml = YAML()
-yaml.preserve_quotes = True
-yaml.indent(mapping=2, sequence=4, offset=2)
+    def dump(self, data, stream):
+        _pyyaml.dump(data, stream, Dumper=_pyyaml.CSafeDumper,
+                     allow_unicode=True, default_flow_style=False,
+                     sort_keys=False)
+
+yaml = _YamlHelper()
 
 # 配置文件路径：
 # - 默认使用项目根目录（utils.py 所在目录）下的 api.yaml，避免受启动 cwd 影响
@@ -288,20 +297,10 @@ async def load_config_from_db() -> Optional[dict]:
 
 def _quote_colon_strings(obj):
     """
-    递归处理配置数据，对包含冒号的纯字符串进行引号包裹，
-    避免 YAML 将其解析为键值对。
+    递归处理配置数据（历史兼容 no-op）。
+    PyYAML CSafeDumper 会自动给含冒号的字符串加引号，无需手动处理。
     """
-    if isinstance(obj, str):
-        # 如果字符串包含冒号，使用双引号包裹
-        if ':' in obj:
-            return DoubleQuotedScalarString(obj)
-        return obj
-    elif isinstance(obj, dict):
-        return {k: _quote_colon_strings(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_quote_colon_strings(item) for item in obj]
-    else:
-        return obj
+    return obj
 
 def save_api_yaml(config_data):
     """将配置持久化到 api.yaml。
@@ -504,7 +503,7 @@ def _expand_sub_channels(providers: list) -> list:
     return expanded
 
 
-async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
+async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False, changed_providers=None):
     # 修改原因：/v1/api_config/update 可以只保存 preferences，此时传入的是已经包含运行时子渠道的 app.state.config。
     # 修改方式：展开子渠道前先移除 _is_sub_channel 运行时 provider，再从主渠道重新展开。
     # 目的：避免多次保存全局设置后，子渠道在运行时 providers 中重复累积。
@@ -539,7 +538,7 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                 # 跳过后面的 circular list 创建
                 provider_api = None
 
-        if provider_api:
+        if provider_api and (changed_providers is None or provider['provider'] in changed_providers):
             # 解析 API key 列表，支持 ! 前缀标记禁用的 key
             # 格式：正常 key 直接使用，以 ! 开头的 key 表示禁用
             def parse_api_keys(api_list):

@@ -730,6 +730,11 @@ export default function Channels() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [originalIndex, setOriginalIndex] = useState<number | null>(null);
   const [formData, setFormData] = useState<ProviderFormData | null>(null);
+  // 修改原因：移动端浏览器在 Radix Dialog 给 body 设置 overflow:hidden 时可能把页面滚动位置重置到顶部。
+  // 修改方式：用 ref 保存打开抽屉前的 scrollY 和 body 原有内联样式，避免用 state 触发重渲染或闭包拿到旧值。
+  // 目的：关闭渠道编辑抽屉后准确恢复背后渠道列表的原始滚动位置。
+  const channelModalScrollYRef = useRef(0);
+  const channelModalBodyStyleRef = useRef<{ position: string; top: string; width: string } | null>(null);
 
   // 子渠道编辑模式：parentIdx = 主渠道在 providers 里的 index，subIdx = sub_channels 里的 index
   const [editingSubChannel, setEditingSubChannel] = useState<{ parentIdx: number; subIdx: number } | null>(null);
@@ -829,6 +834,49 @@ export default function Channels() {
 
   const { token } = useAuthStore();
 
+  const restoreChannelModalScrollLock = useCallback(() => {
+    // 修改原因：渠道编辑抽屉关闭或组件卸载时，body 仍可能保留 fixed 定位，导致页面停在错误位置。
+    // 修改方式：只在存在样式快照时恢复 position、top、width，并用 ref 中保存的 scrollY 调回原列表位置。
+    // 目的：让移动端关闭抽屉后回到打开前浏览的渠道卡片，而不是回到列表顶部。
+    const previousStyle = channelModalBodyStyleRef.current;
+    if (!previousStyle) return;
+
+    const body = document.body;
+    const scrollY = channelModalScrollYRef.current;
+    body.style.position = previousStyle.position;
+    body.style.top = previousStyle.top;
+    body.style.width = previousStyle.width;
+    channelModalBodyStyleRef.current = null;
+    window.scrollTo(0, scrollY);
+  }, []);
+
+  // 修改原因：useEffect 跑得太晚——Radix Dialog mount 时内部 useLayoutEffect 先执行，给 body 加 overflow:hidden，
+  //          移动端浏览器在此时就重置了 scrollTop，等我们的 useEffect 记录 scrollY 时已经是 0 了。
+  // 修改方式：scroll lock 逻辑改为：锁定在 openModal 的 setIsModalOpen(true) 之前同步执行（见下方 applyChannelModalScrollLock），
+  //          解锁仍在 useEffect 中监听 isModalOpen 变为 false 时恢复。
+  // 目的：确保在 Radix Dialog mount 之前就固定 body，scrollY 不会被重置。
+  const applyChannelModalScrollLock = useCallback(() => {
+    if (channelModalBodyStyleRef.current) return;
+    const body = document.body;
+    const currentScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+    channelModalScrollYRef.current = currentScrollY;
+    channelModalBodyStyleRef.current = {
+      position: body.style.position,
+      top: body.style.top,
+      width: body.style.width,
+    };
+    body.style.position = 'fixed';
+    body.style.top = `-${currentScrollY}px`;
+    body.style.width = '100%';
+  }, []);
+
+  useEffect(() => {
+    if (!isModalOpen) {
+      restoreChannelModalScrollLock();
+    }
+    return restoreChannelModalScrollLock;
+  }, [isModalOpen, restoreChannelModalScrollLock]);
+
   const applyApiConfigData = (data: any, options: { syncVirtualModels?: boolean } = {}) => {
     // 修改原因：初始加载和单渠道保存后的刷新都要把 /v1/api_config 响应写回页面状态，但普通 provider 刷新不应覆盖未保存的虚拟路由草稿。
     // 修改方式：始终刷新 providers 和价格；只有初始加载显式传 syncVirtualModels 时才同步 virtual_models。
@@ -864,6 +912,34 @@ export default function Channels() {
     }
     const data = await res.json();
     applyApiConfigData(data, options);
+  };
+
+  const refreshSingleProvider = async (providerId: string) => {
+    // 单渠道局部刷新：GET 单个 provider 后替换本地数组对应项，避免拉全量 200KB
+    try {
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        // fallback 到全量刷新
+        await refreshProviders();
+        return;
+      }
+      const data = await res.json();
+      if (!data?.provider) {
+        await refreshProviders();
+        return;
+      }
+      setProviders(prev => {
+        const updated = prev.map(p =>
+          String(p.provider || '') === providerId ? data.provider : p
+        );
+        return sortProvidersByWeight(updated);
+      });
+    } catch {
+      await refreshProviders();
+    }
   };
 
   const fetchInitialData = async () => {
@@ -1302,6 +1378,7 @@ export default function Channels() {
         sub_channels: [],
       });
     }
+    applyChannelModalScrollLock();
     setIsModalOpen(true);
   };
 
@@ -1625,6 +1702,14 @@ export default function Channels() {
     const keyValue = (formData.api_keys[idx]?.key || '').trim();
     const providerName = formData.provider.trim();
     if (isOAuthEngine && keyValue && providerName && oauthAccounts[keyValue]) {
+      // 修改原因：OAuth 账号删除会立即调用后端清除 refresh_token，和普通表单删行不同，误触后无法恢复。
+      // 修改方式：在 DELETE 请求前使用 window.confirm 展示账号标识和不可逆提醒，用户取消时直接返回。
+      // 目的：让管理员确认风险后才执行即时删除，避免误删账号 token。
+      const confirmOAuthDelete = window.confirm(
+        `确定要删除 OAuth 账号 ${keyValue} 吗？\n\n注意：这是即时生效的不可逆操作。删除后 token 将无法恢复，需要重新导入。`,
+      );
+      if (!confirmOAuthDelete) return;
+
       try {
         // 修改原因：OAuth Key 删除不只要移出 api.yaml 表单，还要清理当前渠道下的 oauth_state 凭据。
         // 修改方式：删除表单行前调用 DELETE /v1/oauth/accounts/{key}?provider=当前渠道名，失败则保留表单行。
@@ -1937,7 +2022,7 @@ export default function Channels() {
         body: JSON.stringify(updatedProvider),
       });
       if (res.ok) {
-        await refreshProviders();
+        await refreshSingleProvider(providerId);
       } else {
         const err = await res.json().catch(() => ({}));
         toastError(fmtErr(err, res.status), '操作失败');
@@ -1975,7 +2060,7 @@ export default function Channels() {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(updatedParent),
       });
-      if (res.ok) await refreshProviders();
+      if (res.ok) await refreshSingleProvider(providerId);
       else toastError('操作失败');
     } catch { toastError('网络错误'); }
   };
@@ -2001,7 +2086,7 @@ export default function Channels() {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(updatedParent),
       });
-      if (res.ok) { await refreshProviders(); }
+      if (res.ok) { await refreshSingleProvider(providerId); }
       else toastError('删除失败');
     } catch { toastError('网络错误'); }
   };
@@ -2110,7 +2195,7 @@ export default function Channels() {
         body: JSON.stringify(updatedProvider),
       });
       if (res.ok) {
-        await refreshProviders();
+        await refreshSingleProvider(providerId);
       } else {
         const err = await res.json().catch(() => ({}));
         toastError(fmtErr(err, res.status), '权重更新失败');
@@ -2954,7 +3039,15 @@ export default function Channels() {
         });
 
       if (res.ok) {
-        await refreshProviders();
+        // PUT 编辑走单渠道刷新；POST 新增走全量刷新（需要获取后端分配的完整对象）
+        const savedProviderId = editingSubChannel
+          ? subChannelParentProviderId
+          : (providerSaveMethod === 'PUT' ? String(providers[originalIndex!]?.provider || '').trim() : '');
+        if (savedProviderId) {
+          await refreshSingleProvider(savedProviderId);
+        } else {
+          await refreshProviders();
+        }
         setIsModalOpen(false);
         setEditingSubChannel(null);
       } else {
@@ -4316,6 +4409,9 @@ export default function Channels() {
                           className="w-full bg-muted border border-border rounded-lg p-2.5 text-sm outline-none focus:border-primary"
                         />
                         <p className="text-[10px] text-muted-foreground">OAuth token exchange 地址，用于换取和刷新 token。不填则使用各 provider 内置默认值。</p>
+                        {hasUiSlot(formData.engine, 'token_url_hint') && (
+                          <UiSlot engine={formData.engine} slot="token_url_hint" data={null} element="div" className="text-xs text-muted-foreground mt-1" />
+                        )}
                       </div>
                     )}
                     <div>

@@ -1058,9 +1058,14 @@ async def query_channel_balance(
             from core.plugins.interceptors import apply_balance_enrichers
             fallback = {"supported": True, "value_type": "amount", "raw": None, "error": None}
             fallback = await apply_balance_enrichers(fallback, engine, provider, enabled_plugins)
-            # enricher 补了有效字段（如 tier）就返回，否则返回 unsupported
+            # enricher 补了有效字段（如 tier）就返回，否则返回提示
             if any(k not in ("supported", "value_type", "raw", "error") for k in fallback):
                 return JSONResponse(content=fallback)
+            # 有插件但缓存还没数据，提示用户发请求触发采集
+            return JSONResponse(content={
+                "supported": True,
+                "error": "尚未采集到数据，请先通过该渠道发送一次请求",
+            })
         return JSONResponse(content={
             "supported": False,
             "error": "该渠道未配置余额查询（preferences.balance）",

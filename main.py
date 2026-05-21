@@ -163,6 +163,26 @@ async def cleanup_expired_raw_data():
 
                 if result.rowcount > 0:
                     logger.info(f"Cleaned up expired raw data from {result.rowcount} log entries")
+                    # SQLite DELETE/UPDATE 不释放磁盘空间，需要 VACUUM 回收 freelist。
+                    # 只在 SQLite 且确实清理了数据时执行，避免 PostgreSQL/MySQL 上不必要的开销。
+                    # VACUUM 必须在事务外执行，用独立的 raw connection + autocommit。
+                    if (DB_TYPE or "sqlite").lower() == "sqlite":
+                        try:
+                            import aiosqlite
+                            db_path = None
+                            try:
+                                from db import DATABASE_URL
+                                if DATABASE_URL and DATABASE_URL.startswith("sqlite"):
+                                    db_path = DATABASE_URL.split("///")[-1]
+                            except Exception:
+                                pass
+                            if not db_path:
+                                db_path = "data/stats.db"
+                            async with aiosqlite.connect(db_path) as vacuum_conn:
+                                await vacuum_conn.execute("VACUUM")
+                                logger.info("SQLite VACUUM completed after raw data cleanup")
+                        except Exception as ve:
+                            logger.warning(f"SQLite VACUUM failed (non-critical): {ve}")
                     
         except asyncio.CancelledError:
             logger.info("Raw data cleanup task cancelled")

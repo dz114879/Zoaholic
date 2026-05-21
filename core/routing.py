@@ -189,6 +189,27 @@ def _filter_provider_list(
     return filtered
 
 
+# 加权轮询归一化上限：sum(weights) 超过此值时等比缩放，防止大权重导致数十亿次迭代。
+_WRR_MAX_TOTAL = 1000
+
+
+def _normalize_wrr_weights(weights: Dict[str, int]) -> Dict[str, int]:
+    """归一化权重：先除 GCD，若总和仍超过 _WRR_MAX_TOTAL 则等比缩放。保证每项至少为 1。"""
+    from math import gcd
+    from functools import reduce
+    vals = list(weights.values())
+    if not vals:
+        return weights
+    g = reduce(gcd, vals)
+    if g > 1:
+        weights = {k: v // g for k, v in weights.items()}
+    total = sum(weights.values())
+    if total > _WRR_MAX_TOTAL:
+        scale = _WRR_MAX_TOTAL / total
+        weights = {k: max(1, int(v * scale)) for k, v in weights.items()}
+    return weights
+
+
 def weighted_round_robin(weights: Dict[str, int]) -> List[str]:
     """
     加权轮询调度算法
@@ -199,6 +220,7 @@ def weighted_round_robin(weights: Dict[str, int]) -> List[str]:
     Returns:
         按加权轮询顺序排列的 provider 名称列表
     """
+    weights = _normalize_wrr_weights(weights)
     provider_names = list(weights.keys())
     current_weights = {name: 0 for name in provider_names}
     num_selections = total_weight = sum(weights.values())
@@ -232,6 +254,7 @@ def lottery_scheduling(weights: Dict[str, int]) -> List[str]:
     Returns:
         按彩票调度顺序排列的 provider 名称列表
     """
+    weights = _normalize_wrr_weights(weights)
     total_tickets = sum(weights.values())
     selections = []
     for _ in range(total_tickets):

@@ -611,6 +611,26 @@ class ClaudeCodeProvider(OAuthProvider):
             org_name = org.get("name")
             if org_name:
                 updated["organization_name"] = org_name
+            # organizationType: "claude_max" / "claude_pro" / "claude_team" 等
+            org_type = org.get("organizationType") or org.get("organization_type") or org.get("type")
+            if org_type:
+                updated["organization_type"] = org_type
+            # organizationRateLimitTier: "default_claude_max_20x" 等
+            org_rate_tier = org.get("organizationRateLimitTier") or org.get("organization_rate_limit_tier") or org.get("rateLimitTier")
+            if org_rate_tier:
+                updated["rate_limit_tier"] = org_rate_tier
+                # 从 rate_limit_tier 反推 subscription_type（比 subscriptionType 字段更靠谱）
+                # "default_claude_max_20x" → "max", "default_claude_pro" → "pro"
+                if not updated.get("subscription_type") or updated.get("subscription_type") == "Claude API":
+                    tier_str = org_rate_tier.lower()
+                    if "max" in tier_str:
+                        updated["subscription_type"] = "max"
+                    elif "pro" in tier_str:
+                        updated["subscription_type"] = "pro"
+                    elif "team" in tier_str:
+                        updated["subscription_type"] = "team"
+                    elif "enterprise" in tier_str:
+                        updated["subscription_type"] = "enterprise"
 
         return updated
 
