@@ -101,15 +101,15 @@ def _oauth_error_page(title: str, message: str, status_code: int = 400) -> HTMLR
     return HTMLResponse(f"<h2>{safe_title}</h2><p>{safe_message}</p>", status_code=status_code)
 
 
-def _oauth_success_page(key_id: str, state: str, provider: str) -> HTMLResponse:
+def _oauth_success_page(key_id: str, state: str, provider: str, already_exists: bool = False) -> HTMLResponse:
     """生成 OAuth 成功提示页，并通知前端窗口刷新账号列表。"""
-    # 修改原因：callback 页面需要把新增账号标识和渠道名传回管理前端，但 key_id/provider 不能直接拼进脚本字符串。
+    # 修改原因：callback 页面需要把新增账号标识和渠道名传回管理前端，but key_id/provider 不能直接拼进脚本字符串。
     # 修改方式：HTML 展示部分使用 html.escape，postMessage 载荷先用 json.dumps 序列化，再转义脚本敏感字符。
     # 目的：完成弹窗登录闭环，同时避免账号字符串中的特殊字符破坏 HTML、JavaScript 或 script 标签边界。
     safe_key_id = html.escape(key_id)
     message_payload = (
         json.dumps(
-            {"type": "oauth_callback_success", "key_id": key_id, "state": state, "provider": provider},
+            {"type": "oauth_callback_success", "key_id": key_id, "state": state, "provider": provider, "already_exists": already_exists},
             ensure_ascii=False,
         )
         .replace("&", "\\u0026")
@@ -151,6 +151,37 @@ def _token_data_from_body(body: dict) -> dict:
     # 修改方式：复制 body 中除 key_id、type、provider、service_account_json 之外的字段。
     # 目的：让手动导入同时支持 refresh_token、access_token、id_token 等凭据字段，同时不污染凭据内容。
     return {k: v for k, v in body.items() if k not in {"key_id", "type", "provider", "service_account_json"}}
+
+
+def _key_exists_in_provider(app, channel_id: str, key_id: str) -> bool:
+    """检查 key_id 是否已存在于指定渠道的 api 列表中。
+
+    用于 OAuth 导入/登录时判断是否需要追加新行。
+    支持 api 列表中的纯字符串、带 ! 前缀和 dict(带 label) 三种格式。
+    """
+    providers = (getattr(getattr(app, 'state', None), 'config', None) or {}).get('providers', [])
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        if p.get('provider') != channel_id:
+            continue
+        api_list = p.get('api', [])
+        if isinstance(api_list, str):
+            api_list = [api_list]
+        if not isinstance(api_list, list):
+            break
+        for item in api_list:
+            if isinstance(item, dict) and len(item) == 1:
+                raw_key = str(next(iter(item.keys()))).strip()
+                clean = raw_key[1:] if raw_key.startswith('!') else raw_key
+            elif isinstance(item, str):
+                clean = item.strip()[1:] if item.strip().startswith('!') else item.strip()
+            else:
+                continue
+            if clean == key_id:
+                return True
+        break
+    return False
 
 
 def _require_provider_name(value: str | None) -> str | None:
@@ -283,8 +314,9 @@ async def oauth_exchange(request: Request):
     # 目的：让前端 manual exchange 登录和 auto callback 登录都能注册为当前渠道下的 OAuthManager key_id。
     email = str(token_data.get("email") or "").strip()
     key_id = email or f"oauth_{secrets.token_hex(4)}"
+    already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
     await oauth_mgr.register(channel_id, key_id, flow["type"], token_data)
-    return {"message": "Account registered", "key_id": key_id}
+    return {"message": "Account registered", "key_id": key_id, "already_exists": already_exists}
 
 
 @router.get("/v1/oauth/callback")
@@ -341,8 +373,9 @@ async def oauth_callback(code: str, state: str, request: Request):
     # 目的：让 callback 登录和手动导入都能最终注册为当前渠道下可解析的 key_id。
     email = str(token_data.get("email") or "").strip()
     key_id = email or f"oauth_{secrets.token_hex(4)}"
+    already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
     await oauth_mgr.register(channel_id, key_id, flow["type"], token_data)
-    return _oauth_success_page(key_id, state, channel_id)
+    return _oauth_success_page(key_id, state, channel_id, already_exists=already_exists)
 
 
 @router.post("/v1/oauth/import", dependencies=[Depends(verify_admin_api_key)])
@@ -405,11 +438,13 @@ async def import_account(request: Request):
                 updated = await oauth_provider.refresh_token(token_data)
             email = updated.get("email")
             final_key_id = email if email else key_id
+            already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
             await oauth_mgr.register(channel_id, final_key_id, type_name, updated)
-            return {"message": "Account imported", "key_id": final_key_id}
+            return {"message": "Account imported", "key_id": final_key_id, "already_exists": already_exists}
         else:
+            already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
             await oauth_mgr.register(channel_id, key_id, type_name, token_data)
-            return {"message": "Account imported", "key_id": key_id}
+            return {"message": "Account imported", "key_id": key_id, "already_exists": already_exists}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

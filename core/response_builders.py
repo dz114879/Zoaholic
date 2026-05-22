@@ -99,7 +99,8 @@ async def generate_sse_response(
     thought_signature=None,
     cached_tokens=0,
     cache_creation_tokens=0,
-    tool_call_index=0
+    tool_call_index=0,
+    refusal=None
 ):
     """
     生成 OpenAI Chat Completions 格式的 SSE 响应
@@ -165,17 +166,20 @@ async def generate_sse_response(
         # 修改方式：参数 chunk 使用调用方传入的 tool_call_index，而不是固定写 0。
         # 目的：保证 stream_convert 和客户端都能把参数累积到正确的 tool call。
         delta_content = {"tool_calls": [{"index": tool_call_index, "function": {"arguments": args_str}}]}
-    # 优先级 6：推理内容
+    # 优先级 6：拒绝回答 (Refusal)
+    elif refusal:
+        delta_content = {"role": "assistant", "refusal": refusal}
+    # 优先级 7：推理内容
     elif reasoning_content:
         delta_content = {"role": "assistant", "content": "", "reasoning_content": reasoning_content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature
-    # 优先级 7：普通文本内容（支持 string 或结构化 list）
+    # 优先级 8：普通文本内容（支持 string 或结构化 list）
     elif content is not None and content != "":
         delta_content = {"role": "assistant", "content": content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature
-    # 优先级 8：空 chunk（无内容）→ 结束信号
+    # 优先级 9：空 chunk（无内容）→ 结束信号
     else:
         delta_content = {}
         finish_reason = "stop"
@@ -214,14 +218,14 @@ async def generate_sse_response(
 
     return sse_response
 
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = False, tool_calls_list: list[dict] | None = None):
+async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = False, tool_calls_list: list[dict] | None = None, refusal=None):
 
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     message = {
         "role": role,
         "content": content,
-        "refusal": None
+        "refusal": refusal
     }
     if reasoning_content:
         message["reasoning_content"] = reasoning_content

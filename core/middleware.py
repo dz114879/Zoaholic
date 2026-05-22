@@ -311,164 +311,176 @@ class StatsMiddleware:
         }
 
         current_request_info = request_info.set(request_info_data)
-        current_info = request_info.get()
-
-        # 读取请求体（仅 POST + JSON）
-        body_bytes = b""
-        parsed_body = None
-        headers_dict = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers}
-        content_type = headers_dict.get("content-type", "")
-
-        if method == "POST" and "application/json" in content_type:
-            # 收集所有 body chunks
-            body_chunks = []
-            while True:
-                message = await receive()
-                body_chunks.append(message.get("body", b""))
-                if not message.get("more_body", False):
-                    break
-            body_bytes = b"".join(body_chunks)
-
-            if body_bytes:
-                try:
-                    # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-                    parsed_body = json_loads(body_bytes)
-                except json.JSONDecodeError:
-                    parsed_body = None
-
-        # 获取原始数据保留时间配置（小时），默认为24小时
-        raw_data_retention_hours = safe_get(
-            config, "preferences", "log_raw_data_retention_hours", default=24
-        )
-        
-        # 如果配置了保留时间，保存请求头和请求体
-        if raw_data_retention_hours > 0:
-            # 过滤敏感头信息
-            safe_headers = {k: v for k, v in headers_dict.items()
-                          if k not in ("authorization", "x-api-key")}
-            current_info["request_headers"] = json.dumps(safe_headers, ensure_ascii=False)
-            
-            # 保存请求体（使用深度截断，保留结构同时限制大小）
-            # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-            if body_bytes:
-                current_info["request_body"] = await asyncio.to_thread(truncate_for_logging, body_bytes)
-            
-            # 设置过期时间
-            current_info["raw_data_expires_at"] = datetime.now(timezone.utc) + timedelta(hours=raw_data_retention_hours)
-
-        # 创建新的 receive 函数，重放已读取的 body
-        body_sent = False
-        async def receive_wrapper() -> Message:
-            nonlocal body_sent
-            if method == "POST" and "application/json" in content_type:
-                if not body_sent:
-                    body_sent = True
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
-                # 等待真正的 disconnect 消息，而不是返回空 body
-                # 这对于 StreamingResponse 的正确迭代很重要
-                return await receive()
-            else:
-                return await receive()
-
+        # 修改原因：request_info 是请求级 ContextVar，body 读取或下游处理异常时也必须恢复旧值。
+        # 修改方式：将 set 之后的请求处理全部放入外层 try/finally，并在 finally 中 reset token。
+        # 目的：避免客户端断连等异常路径让 ContextVar 残留到同一个异步上下文。
         try:
-            # 如果能解析为 UnifiedRequest，则执行模型记录/限流/审查
-            # 注意：方言端点的 api_index 为 None，跳过限流（方言路由自己处理认证）
-            if parsed_body and should_attempt_unified_request(parsed_body) and api_index is not None:
-                try:
-                    request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
-                    request_model = request_model.data
-                    if self.debug:
-                        pass
-                    model = request_model.model
-                    current_info["model"] = model
+            current_info = request_info.get()
 
-                    # ── 运行时指标：带模型名开始追踪 ──
-                    _metrics_model = model
-                    on_request_start(model=_metrics_model)
-                    _metrics_tracked = True
+            # 读取请求体（仅 POST + JSON）
+            body_bytes = b""
+            parsed_body = None
+            headers_dict = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers}
+            content_type = headers_dict.get("content-type", "")
 
+            if method == "POST" and "application/json" in content_type:
+                # 收集所有 body chunks
+                body_chunks = []
+                while True:
+                    message = await receive()
+                    body_chunks.append(message.get("body", b""))
+                    if not message.get("more_body", False):
+                        break
+                body_bytes = b"".join(body_chunks)
 
-                    moderated_content = None
-                    if request_model.request_type == "chat":
-                        moderated_content = request_model.get_last_text_message()
-                    elif request_model.request_type == "image":
-                        moderated_content = request_model.prompt
-                    elif request_model.request_type == "tts":
-                        moderated_content = request_model.input
-                    elif request_model.request_type == "moderation":
-                        pass
-                    elif request_model.request_type == "embedding":
-                        if isinstance(request_model.input, list) and len(request_model.input) > 0 and isinstance(request_model.input[0], str):
-                            moderated_content = "\n".join(request_model.input)
-                        else:
-                            moderated_content = request_model.input
-                    else:
-                        logger.error("Unknown request type: %s", request_model.request_type)
+                if body_bytes:
+                    try:
+                        # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
+                        parsed_body = json_loads(body_bytes)
+                    except json.JSONDecodeError:
+                        parsed_body = None
 
-                    if enable_moderation and moderated_content:
-                        background_tasks_for_moderation = BackgroundTasks()
-                        moderation_response = await self._moderate_content(moderated_content, api_index, background_tasks_for_moderation, app)
-                        is_flagged = moderation_response.get("results", [{}])[0].get("flagged", False)
+            # 获取原始数据保留时间配置（小时），默认为24小时
+            raw_data_retention_hours = safe_get(
+                config, "preferences", "log_raw_data_retention_hours", default=24
+            )
+        
+            # 如果配置了保留时间，保存请求头和请求体
+            if raw_data_retention_hours > 0:
+                # 过滤敏感头信息
+                safe_headers = {k: v for k, v in headers_dict.items()
+                              if k not in ("authorization", "x-api-key")}
+                current_info["request_headers"] = json.dumps(safe_headers, ensure_ascii=False)
+            
+                # 保存请求体（使用深度截断，保留结构同时限制大小）
+                # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
+                if body_bytes:
+                    current_info["request_body"] = await asyncio.to_thread(truncate_for_logging, body_bytes)
+            
+                # 设置过期时间
+                current_info["raw_data_expires_at"] = datetime.now(timezone.utc) + timedelta(hours=raw_data_retention_hours)
 
-                        if is_flagged:
-                            logger.error("Content did not pass the moral check: %s", moderated_content)
-                            process_time = time() - start_time
-                            current_info["process_time"] = process_time
-                            current_info["is_flagged"] = is_flagged
-                            current_info["text"] = moderated_content
-                            await update_stats(current_info, app=app)
-                            response = openai_error_response("Content did not pass the moral check, please modify and try again.", 400)
-                            await response(scope, receive_wrapper, send)
-                            return
-                except ValidationError as e:
-                    # 不在中间件返回 422，避免对非统一请求路由造成影响
-                    # 也不打印庞大的 Payload，防止日志刷屏
-                    pass
+            # 创建新的 receive 函数，重放已读取的 body
+            body_sent = False
+            async def receive_wrapper() -> Message:
+                nonlocal body_sent
+                if method == "POST" and "application/json" in content_type:
+                    if not body_sent:
+                        body_sent = True
+                        return {"type": "http.request", "body": body_bytes, "more_body": False}
+                    # 等待真正的 disconnect 消息，而不是返回空 body
+                    # 这对于 StreamingResponse 的正确迭代很重要
+                    return await receive()
+                else:
+                    return await receive()
 
-            # 包装 send 以捕获流式响应
+            # 修改原因：异常或审查拦截可能发生在 send_wrapper 初始化前，finally 仍会读取响应状态。
+            # 修改方式：进入下游处理前先设置保守默认值，后续 send_wrapper 捕获到响应时再覆盖。
+            # 目的：确保 request_info.reset 所在的 finally 不会被未初始化的响应状态变量阻断。
             response_started = False
-            response_status = 200
+            response_status = 500
             response_headers = []
 
-            async def send_wrapper(message: Message) -> None:
-                nonlocal response_started, response_status, response_headers
-                if message["type"] == "http.response.start":
-                    response_started = True
-                    response_status = message.get("status", 200)
-                    response_headers = message.get("headers", [])
-                await send(message)
+            try:
+                # 如果能解析为 UnifiedRequest，则执行模型记录/限流/审查
+                # 注意：方言端点的 api_index 为 None，跳过限流（方言路由自己处理认证）
+                if parsed_body and should_attempt_unified_request(parsed_body) and api_index is not None:
+                    try:
+                        request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
+                        request_model = request_model.data
+                        if self.debug:
+                            pass
+                        model = request_model.model
+                        current_info["model"] = model
 
-            # 调用下游应用
-            await self.app(scope, receive_wrapper, send_wrapper)
+                        # ── 运行时指标：带模型名开始追踪 ──
+                        _metrics_model = model
+                        on_request_start(model=_metrics_model)
+                        _metrics_tracked = True
 
-        except ValidationError as e:
-            logger.error(
-                "Invalid request body: %s, errors: %s",
-                json.dumps(parsed_body, indent=2, ensure_ascii=False) if parsed_body else "None",
-                e.errors(),
-            )
-            # 将 validation 错误信息格式化为可读字符串
-            error_details = "; ".join([f"{err['loc'][-1]}: {err['msg']}" for err in e.errors()[:3]])
-            if len(e.errors()) > 3:
-                error_details += f" (and {len(e.errors()) - 3} more errors)"
-            response = openai_error_response(f"Invalid request body: {error_details}", 422)
-            await response(scope, receive_wrapper, send)
-        except Exception as e:
-            if self.debug:
-                import traceback
-                traceback.print_exc()
-            logger.error("Error processing request: %s", str(e))
-            response = openai_error_response(f"Internal server error: {str(e)}", 500)
-            await response(scope, receive_wrapper, send)
+
+                        moderated_content = None
+                        if request_model.request_type == "chat":
+                            moderated_content = request_model.get_last_text_message()
+                        elif request_model.request_type == "image":
+                            moderated_content = request_model.prompt
+                        elif request_model.request_type == "tts":
+                            moderated_content = request_model.input
+                        elif request_model.request_type == "moderation":
+                            pass
+                        elif request_model.request_type == "embedding":
+                            if isinstance(request_model.input, list) and len(request_model.input) > 0 and isinstance(request_model.input[0], str):
+                                moderated_content = "\n".join(request_model.input)
+                            else:
+                                moderated_content = request_model.input
+                        else:
+                            logger.error("Unknown request type: %s", request_model.request_type)
+
+                        if enable_moderation and moderated_content:
+                            background_tasks_for_moderation = BackgroundTasks()
+                            moderation_response = await self._moderate_content(moderated_content, api_index, background_tasks_for_moderation, app)
+                            is_flagged = moderation_response.get("results", [{}])[0].get("flagged", False)
+
+                            if is_flagged:
+                                logger.error("Content did not pass the moral check: %s", moderated_content)
+                                process_time = time() - start_time
+                                current_info["process_time"] = process_time
+                                current_info["is_flagged"] = is_flagged
+                                current_info["text"] = moderated_content
+                                await update_stats(current_info, app=app)
+                                response = openai_error_response("Content did not pass the moral check, please modify and try again.", 400)
+                                await response(scope, receive_wrapper, send)
+                                return
+                    except ValidationError as e:
+                        # 不在中间件返回 422，避免对非统一请求路由造成影响
+                        # 也不打印庞大的 Payload，防止日志刷屏
+                        pass
+
+                # 包装 send 以捕获流式响应
+                response_started = False
+                response_status = 200
+                response_headers = []
+
+                async def send_wrapper(message: Message) -> None:
+                    nonlocal response_started, response_status, response_headers
+                    if message["type"] == "http.response.start":
+                        response_started = True
+                        response_status = message.get("status", 200)
+                        response_headers = message.get("headers", [])
+                    await send(message)
+
+                # 调用下游应用
+                await self.app(scope, receive_wrapper, send_wrapper)
+
+            except ValidationError as e:
+                logger.error(
+                    "Invalid request body: %s, errors: %s",
+                    json.dumps(parsed_body, indent=2, ensure_ascii=False) if parsed_body else "None",
+                    e.errors(),
+                )
+                # 将 validation 错误信息格式化为可读字符串
+                error_details = "; ".join([f"{err['loc'][-1]}: {err['msg']}" for err in e.errors()[:3]])
+                if len(e.errors()) > 3:
+                    error_details += f" (and {len(e.errors()) - 3} more errors)"
+                response = openai_error_response(f"Invalid request body: {error_details}", 422)
+                await response(scope, receive_wrapper, send)
+            except Exception as e:
+                if self.debug:
+                    import traceback
+                    traceback.print_exc()
+                logger.error("Error processing request: %s", str(e))
+                response = openai_error_response(f"Internal server error: {str(e)}", 500)
+                await response(scope, receive_wrapper, send)
+            finally:
+                # ── 运行时指标：标记请求结束 ──
+                if not _metrics_tracked:
+                    # 未进入 UnifiedRequest 解析的请求也要追踪
+                    on_request_start(model=None)
+                    _metrics_tracked = True
+                is_success = response_started and 200 <= response_status < 500
+                on_request_end(model=_metrics_model, success=is_success)
+
         finally:
-            # ── 运行时指标：标记请求结束 ──
-            if not _metrics_tracked:
-                # 未进入 UnifiedRequest 解析的请求也要追踪
-                on_request_start(model=None)
-                _metrics_tracked = True
-            is_success = response_started and 200 <= response_status < 500
-            on_request_end(model=_metrics_model, success=is_success)
-
             request_info.reset(current_request_info)
 
     async def _moderate_content(

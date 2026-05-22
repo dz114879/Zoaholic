@@ -720,6 +720,424 @@ function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus
 }
 
 
+
+// 修改原因：Key 数量较多时，完整行模式会占用过多纵向空间，无法快速查看大量 Key 的状态。
+// 修改方式：为机房模式集中定义固定尺寸卡片、350° 缺口圆环、tier 药丸和状态灯等纯展示 helper。
+// 目的：在不改动现有完整行渲染代码的前提下，让 >= 10 个 Key 的渠道自动获得紧凑视图。
+const RACK_ARC_LENGTH = 350;
+const RACK_GAP_LENGTH = 10;
+const RACK_RING_PATH_LENGTH = RACK_ARC_LENGTH + RACK_GAP_LENGTH;
+
+function clampRackPercent(value: number | null | undefined): number | null {
+  // 修改原因：余额、OAuth quota 和缓存字段都可能为空或越界，直接用于 stroke-dasharray 会造成异常弧线。
+  // 修改方式：把不可用值统一收敛为 null，把可用数字裁剪到 0 到 100。
+  // 目的：让机房模式圆环在各种数据状态下都能稳定渲染。
+  if (value == null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, n));
+}
+
+function mixRackRgb(from: [number, number, number], to: [number, number, number], ratio: number): string {
+  // 修改原因：机房模式要求普通 API Key 圆环使用绿到黄再到红的连续渐变，而旧 getBalanceColor 只返回三档名称。
+  // 修改方式：按 0..1 比例在线性 RGB 空间混合两端颜色，供单环 stroke 直接使用。
+  // 目的：保留现有百分比计算，同时让卡片圆环颜色变化更细腻。
+  const r = Math.max(0, Math.min(1, ratio));
+  const mixed = from.map((v, idx) => Math.round(v + (to[idx] - v) * r));
+  return `rgb(${mixed[0]}, ${mixed[1]}, ${mixed[2]})`;
+}
+
+function getRackUsageGradientColor(percent: number): string {
+  // 修改原因：普通 Key 的机房圆环需要按百分比从绿到黄再到红过渡，不能只使用完整行的背景色。
+  // 修改方式：0..50% 在绿色和黄色之间插值，50..100% 在黄色和红色之间插值。
+  // 目的：让圆环颜色直接反映当前百分比强度。
+  const p = Math.max(0, Math.min(1, percent / 100));
+  // 0% = 红色（余额耗尽/危险），100% = 绿色（余额充足/安全）
+  if (p < 0.5) return mixRackRgb([239, 68, 68], [234, 179, 8], p / 0.5);
+  return mixRackRgb([234, 179, 8], [16, 185, 129], (p - 0.5) / 0.5);
+}
+
+function formatRackKeyLabel(keyObj: ApiKeyObj): string {
+  // 修改原因：机房卡片宽度固定，不能直接显示完整 Key，否则会挤占圆环和操作区域。
+  // 修改方式：优先显示备注 label，没有备注时显示 Key 前后片段，空 OAuth 行显示占位文字。
+  // 目的：保证卡片底部在 96px 宽度内仍能识别 Key。
+  const label = keyObj.label?.trim();
+  if (label) return label;
+  const key = keyObj.key.trim();
+  if (!key) return '空账号';
+  if (key.length <= 12) return key;
+  return `${key.slice(0, 6)}…${key.slice(-4)}`;
+}
+
+function formatRackTierText(value: any): string | null {
+  if (value == null) return null;
+  // 如果传入的是对象，尝试取 name 字段
+  if (typeof value === 'object') return formatRackTierText(value?.name);
+  let text = String(value).trim();
+  if (!text) return null;
+  // 剥离常见前缀
+  text = text.replace(/^Google\s*(AI\s*)?/i, '').replace(/^Gemini Code Assist in /i, '').trim() || text;
+  const normalized = text.toLowerCase().replace(/[\s_-]+/g, '');
+  const known: Record<string, string> = {
+    t5: 'T5', tier5: 'T5', tierfive: 'T5',
+    t4: 'T4', tier4: 'T4',
+    t3: 'T3', tier3: 'T3', tierthree: 'T3',
+    t2: 'T2', tier2: 'T2',
+    t1: 'T1', tier1: 'T1',
+    pro: 'Pro', plus: 'Plus', max: 'Max', team: 'Team', enterprise: 'Enterprise', free: 'Free', prolite: 'Prolite',
+  };
+  return known[normalized] || text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function getRackTierLabel(bal: BalanceResult | undefined, oauthAccount: any, oauthQuota: OAuthQuota | null, isOAuthEngine: boolean): string | null {
+  // 修改原因：普通渠道 tier 来自 balanceResults，OAuth 渠道的订阅标签可能来自账号或 quota raw。
+  // 修改方式：普通渠道优先读取 bal.tier，OAuth 渠道补充读取 subscription_type、plan_type、paidTier 等字段。
+  // 目的：让机房卡片底部药丸覆盖 T5、T3、Pro、Max 等主要来源。
+  const balanceTier = formatRackTierText(bal?.tier);
+  if (!isOAuthEngine) return balanceTier;
+  const raw = oauthQuota?.raw || oauthAccount?.quota_raw || oauthAccount?.raw || {};
+  return balanceTier
+    || formatRackTierText(oauthAccount?.subscription_type)
+    || formatRackTierText(oauthAccount?.subscriptionType)
+    || formatRackTierText(oauthAccount?.tier)
+    || formatRackTierText(oauthAccount?.plan_type)
+    || formatRackTierText(raw?.subscription_type)
+    || formatRackTierText(raw?.subscriptionType)
+    || formatRackTierText(raw?.plan_type)
+    || formatRackTierText(raw?.paidTier?.name || raw?.paidTier)
+    || formatRackTierText(raw?.['x-codex-plan-type']);
+}
+
+function getRackTierClass(tierLabel: string): string {
+  // 修改原因：机房模式底部药丸需要用颜色快速区分常见 tier，不能都显示成同一种弱提示。
+  // 修改方式：按归一化标签映射金色、绿色、紫色、粉色等 Tailwind 类，未知标签使用蓝灰色兜底。
+  // 目的：让 T5、T3、Pro、Max 等标签在密集卡片中仍有辨识度。
+  // 修改原因：原有返回值只适合深色主题，浅色主题下 text-*-200 对比度不足。
+  // 修改方式：每个返回值增加浅色主题文字色和边框强度，并用 dark:text-* 保留深色主题视觉。
+  // 目的：让机房模式 tier 药丸在浅色和深色主题下都清晰可读。
+  const normalized = tierLabel.toLowerCase().replace(/[\s_-]+/g, '');
+  if (normalized.includes('t5') || normalized.includes('tier5')) return 'border-amber-600/40 bg-amber-500/20 text-amber-800 dark:text-amber-200';
+  if (normalized.includes('t3') || normalized.includes('tier3')) return 'border-emerald-600/35 bg-emerald-500/15 text-emerald-800 dark:text-emerald-200';
+  if (normalized.includes('max')) return 'border-pink-600/40 bg-pink-500/20 text-pink-800 dark:text-pink-200';
+  if (normalized.includes('pro')) return 'border-purple-600/40 bg-purple-500/20 text-purple-800 dark:text-purple-200';
+  if (normalized.includes('plus')) return 'border-sky-600/35 bg-sky-500/15 text-sky-800 dark:text-sky-200';
+  return 'border-slate-500/30 bg-slate-500/15 text-slate-700 dark:text-slate-200';
+}
+
+function getRackBalanceTextClass(color: 'green' | 'yellow' | 'red' | null): string {
+  // 修改原因：普通 Key 中心百分比仍复用 getBalanceColor 的三档语义，避免卡片文字和旧余额判断脱节。
+  // 修改方式：把 green/yellow/red 映射成适合深色卡片的文字颜色。
+  // 目的：在使用连续圆环颜色的同时保留原有余额分档含义。
+  if (color === 'green') return 'text-emerald-600 dark:text-emerald-100';
+  if (color === 'yellow') return 'text-yellow-600 dark:text-yellow-100';
+  if (color === 'red') return 'text-red-600 dark:text-red-100';
+  return 'text-muted-foreground';
+}
+
+function RackGrid({ children, onClick }: { children: React.ReactNode; onClick?: React.MouseEventHandler<HTMLDivElement> }) {
+  // 修改原因：机房模式需要让卡片横向排列并自动换行，而不能继续使用完整行的纵向间距布局。
+  // 修改方式：用 flex flex-wrap 和固定 gap 包裹 RackCard，外层仍放在原滚动容器内。
+  // 目的：在侧边编辑抽屉中以紧凑网格展示大量 Key。
+  // 修改原因：选中卡片展开成完整行后，用户需要点击机房网格空白处取消选中。
+  // 修改方式：让 RackGrid 接收并透传 onClick，只在调用方判断 target 是否为网格本身。
+  // 目的：避免点击卡片或完整行内部控件时误取消编辑状态。
+  return <div className="flex flex-wrap gap-1.5 pb-1" onClick={onClick}>{children}</div>;
+}
+
+function RackRingCircle({ radius, strokeWidth, percent, color, trackOpacity = 0.72 }: {
+  radius: number;
+  strokeWidth: number;
+  percent: number | null;
+  color: string;
+  trackOpacity?: number;
+}) {
+  // 修改原因：单环和 OAuth 双环都需要相同的 350° 缺口圆环，重复写 SVG 容易让缺口角度不一致。
+  // 修改方式：统一用 circle、pathLength 和 stroke-dasharray 绘制轨道与填充，并整体旋转 5° 让缺口居中在右侧。
+  // 目的：确保普通 Key 和 OAuth Key 的机房圆环视觉一致。
+  // 修改原因：圆环轨道原先使用过深的浅色主题颜色，导致浅色主题下几乎看不见。
+  // 修改方式：轨道 circle 改用 Tailwind stroke 主题类，浅色主题使用 slate-300，深色主题保留原 #1a1a2e。
+  // 目的：让同一个 SVG 轨道在浅色和深色主题中都有稳定对比度。
+  const fillLength = percent == null ? 0 : (percent / 100) * RACK_ARC_LENGTH;
+  return (
+    <g style={{ transform: 'rotate(5deg)', transformOrigin: '32px 32px' }}>
+      <circle
+        cx="32"
+        cy="32"
+        r={radius}
+        pathLength={RACK_RING_PATH_LENGTH}
+        fill="none"
+        className="stroke-slate-300 dark:stroke-[#1a1a2e]"
+        strokeWidth={strokeWidth}
+        strokeLinecap="round"
+        strokeOpacity={trackOpacity}
+        strokeDasharray={`${RACK_ARC_LENGTH} ${RACK_GAP_LENGTH}`}
+      />
+      {percent != null && fillLength > 0 && (
+        <circle
+          cx="32"
+          cy="32"
+          r={radius}
+          pathLength={RACK_RING_PATH_LENGTH}
+          fill="none"
+          stroke={color}
+          strokeWidth={strokeWidth}
+          strokeLinecap="round"
+          strokeDasharray={`${fillLength} ${RACK_RING_PATH_LENGTH - fillLength}`}
+          className="transition-all duration-500"
+        />
+      )}
+    </g>
+  );
+}
+
+function RackSingleRing({ percent, textClassName, label }: { percent: number | null; textClassName: string; label?: string | null }) {
+  const pct = clampRackPercent(percent);
+  const stroke = pct == null ? '#334155' : getRackUsageGradientColor(pct);
+  // 有金额标签时显示金额，否则显示百分比
+  const displayText = label || (pct == null ? '—' : `${Math.round(pct)}%`);
+  const textSize = label && label.length > 5 ? 'text-[8px]' : 'text-[11px]';
+  return (
+    <div className="relative flex h-12 w-12 items-center justify-center">
+      <svg className="h-12 w-12" viewBox="0 0 64 64" aria-hidden="true">
+        <RackRingCircle radius={25} strokeWidth={6} percent={pct} color={stroke} trackOpacity={pct == null ? 0.45 : 0.8} />
+      </svg>
+      <span className={`absolute inset-0 flex items-center justify-center ${textSize} font-bold font-mono ${textClassName}`}>
+        {displayText}
+      </span>
+    </div>
+  );
+}
+
+function RackOAuthRings({ quota, hideText }: { quota: OAuthQuota | null; hideText?: boolean }) {
+  const quota5h = clampRackPercent(quota?.quota_5h);
+  const quota7d = clampRackPercent(quota?.quota_7d);
+  return (
+    <div className="relative flex h-12 w-12 items-center justify-center">
+      <svg className="h-12 w-12" viewBox="0 0 64 64" aria-hidden="true">
+        <RackRingCircle radius={26} strokeWidth={5} percent={quota5h} color="#60a5fa" trackOpacity={quota5h == null ? 0.42 : 0.74} />
+        <RackRingCircle radius={18} strokeWidth={5} percent={quota7d} color="#a78bfa" trackOpacity={quota7d == null ? 0.35 : 0.68} />
+      </svg>
+      {!hideText && (
+        <span className="absolute inset-0 flex items-center justify-center text-[11px] font-bold font-mono text-sky-700 dark:text-sky-100">
+          {quota5h == null ? '—' : `${Math.round(quota5h)}%`}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function RackCoolingBorder({ remainSec, totalDuration }: { remainSec: number; totalDuration: number }) {
+  // 在卡片圆角矩形边框上画红色冷却进度条 + 倒计时叠加层
+  const ref = useRef<HTMLDivElement>(null);
+  const [svgViewBox, setSvgViewBox] = useState('');
+  const [pathD, setPathD] = useState('');
+  const progress = totalDuration > 0 ? Math.max(0, Math.min(100, (remainSec / totalDuration) * 100)) : 0;
+  const safeRemain = Math.max(0, Math.ceil(remainSec));
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const update = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      if (w > 0 && h > 0) {
+        setSvgViewBox(`0 0 ${w} ${h}`);
+        setPathD(buildRoundRectPath(1, 1, w - 2, h - 2, 7));
+      }
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const dasharray = progress > 0 ? `${progress} 100` : '0 100';
+  const dashoffset = progress > 0 ? `${-(100 - progress)}` : '0';
+
+  return (
+    <div ref={ref} className="absolute inset-0 z-[5] pointer-events-none">
+      {pathD && (
+        <svg className="absolute inset-0 w-full h-full" viewBox={svgViewBox} style={{ overflow: 'visible' }}>
+          <path
+            d={pathD}
+            pathLength={100}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            strokeLinecap="round"
+            className="text-red-500"
+            style={{ strokeDasharray: dasharray, strokeDashoffset: dashoffset, transition: 'stroke-dasharray 1s linear, stroke-dashoffset 1s linear' }}
+          />
+        </svg>
+      )}
+      <div className="absolute inset-x-0 bottom-[18px] flex items-center justify-center">
+        <span className="text-[9px] font-bold font-mono text-red-500 bg-background/80 dark:bg-card/80 rounded px-1 py-0.5">
+          {formatCountdown(safeRemain)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function RackCard({ idx, keyObj, providerName, engine, runtimeKeyStatus, localCountdowns, balanceResults, oauthAccounts, isOAuthEngine, onFocus, onImport, onLogin }: {
+  idx: number;
+  keyObj: ApiKeyObj;
+  providerName: string;
+  engine: string;
+  runtimeKeyStatus: Record<string, { auto_disabled?: { key: string; remaining_seconds: number; duration?: number; reason?: string }[]; cooling?: any[] }>;
+  localCountdowns: Record<string, Record<string, { remaining: number; duration: number }>>;
+  balanceResults: Record<string, BalanceResult>;
+  oauthAccounts: Record<string, any>;
+  isOAuthEngine: boolean;
+  onFocus: () => void;
+  onImport: () => void;
+  onLogin: () => void;
+}) {
+  // 修改原因：机房卡片需要复用完整行的数据来源，但完整行渲染分支不能被改写。
+  // 修改方式：在独立 RackCard 中重新计算运行时禁用、冷却、余额、OAuth quota 和插槽状态。
+  // 目的：让紧凑视图与完整行保持相同状态语义和操作回调。
+  const rtDisabled = runtimeKeyStatus[providerName]?.auto_disabled || [];
+  const rtEntry = !keyObj.disabled ? rtDisabled.find((d: any) => d.key === keyObj.key) : undefined;
+  const isPermanent = !!rtEntry && rtEntry.remaining_seconds < 0;
+  const isCooling = !!rtEntry && !isPermanent && rtEntry.remaining_seconds > 0;
+  const countdown = localCountdowns[providerName]?.[keyObj.key];
+  const remainSec = countdown?.remaining ?? (rtEntry?.remaining_seconds || 0);
+  // 修改原因：冷却圆环需要用剩余时间除以总冷却时长，不能再只依赖卡片边框表达冷却状态。
+  // 修改方式：沿用完整行 CoolingKeyRow 的数据来源，优先取本地倒计时 duration，其次取运行时 duration，最后用 remainSec 兜底。
+  // 目的：让机房卡片的冷却弧线和完整行倒计时保持同一套时间语义。
+  const totalDuration = countdown?.duration ?? rtEntry?.duration ?? remainSec;
+  const isGrayed = keyObj.disabled || isPermanent;
+  const status = isGrayed ? 'disabled' : isCooling ? 'cooling' : 'active';
+  const bal = balanceResults[keyObj.key];
+  const balPct = bal ? getBalancePercent(bal) : null;
+  const balColor = getBalanceColor(balPct);
+  const balLabel = bal ? getBalanceLabel(bal) : null;
+  // 如果余额类型不是百分比，圆环中心显示金额而非百分比
+  const ringLabel = (bal && bal.value_type !== 'percent' && balLabel) ? balLabel : null;
+  const oauthAccount = oauthAccounts[keyObj.key];
+  const oauthQuota = getOAuthQuota(oauthAccount);
+  const tierLabel = getRackTierLabel(bal, oauthAccount, oauthQuota, isOAuthEngine);
+  const slotData = isOAuthEngine ? oauthQuota : bal;
+  // 修改原因：部分 OAuth 插槽只读取 account 中的订阅或 extra usage 字段，即使 getOAuthQuota 暂时没有数字也应挂载。
+  // 修改方式：把 slotData 和 oauthAccount 合并成插槽可用性判断，实际 data 仍保持与完整行一致传入 quota 或 balance。
+  // 目的：让 key_background、quota_display、quota_label 在机房模式下不因 quota 缺失而失效。
+  const slotPayloadAvailable = slotData || (isOAuthEngine ? oauthAccount : null);
+  const slotContext = { account: oauthAccount, keyObj, balance: bal };
+  const hasKeyBorderSlot = hasUiSlot(engine, 'key_border');
+  const hasKeyBackgroundSlot = hasUiSlot(engine, 'key_background');
+  const hasQuotaDisplaySlot = hasUiSlot(engine, 'quota_display');
+  const hasQuotaLabelSlot = hasUiSlot(engine, 'quota_label');
+  const isOAuthEmpty = isOAuthEngine && !keyObj.key.trim();
+  const labelText = formatRackKeyLabel(keyObj);
+  const title = `${idx + 1}. ${keyObj.label || keyObj.key || '空账号'}${isCooling ? ` · 冷却 ${formatCountdown(remainSec)}` : ''}`;
+  // 修改原因：冷却状态已经由圆环倒计时表达，继续显示黄色状态灯会让小卡片颜色过于集中。
+  // 修改方式：状态灯只保留启用和禁用两类静态状态，冷却时不再渲染右上角黄色灯。
+  // 目的：让用户主要通过中心倒计时和圆环进度识别冷却状态。
+  const statusClass = isGrayed
+    ? 'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.6)]'
+    : 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.65)]';
+  // 修改原因：冷却卡片的黄色硬边框会和倒计时圆环重复表达，造成小卡片视觉拥挤。
+  // 修改方式：所有机房卡片统一使用普通边框，冷却进度只由圆环承担。
+  // 目的：去掉旧的黄色硬编码冷却边框，保留状态表达但降低干扰。
+  const cardBorder = 'border-border';
+  const balanceTextClass = getRackBalanceTextClass(balColor);
+  // 修改原因：机房卡片原先复用 muted 半透明背景，浅色主题下与滚动区域层次不够清楚。
+  // 修改方式：浅色主题使用 card 表面，深色主题继续使用 muted 半透明表面以维持原暗色观感。
+  // 目的：让大量机房卡片在两种主题下都有明确边界和稳定背景。
+  const cardSurfaceClass = 'bg-card/90 dark:bg-muted/50';
+  // 修改原因：空 OAuth 卡片圆环上的导入和登录操作层原先只使用深色按钮和遮罩。
+  // 修改方式：把遮罩、导入按钮和登录按钮抽成包含 light/dark 变体的类名常量。
+  // 目的：让浅色主题下的空账号操作入口保持可读，同时不改变深色主题视觉。
+  const emptyOAuthOverlayClass = 'absolute inset-0 z-[6] flex flex-col items-center justify-center gap-1 rounded-full bg-white/90 dark:bg-[#0f0f12]/85';
+  const emptyOAuthImportButtonClass = 'flex items-center gap-1 rounded border border-slate-300 bg-white/95 px-1.5 py-0.5 text-[9px] text-slate-700 hover:bg-slate-100 dark:border-[#1e1e22] dark:bg-slate-800/90 dark:text-slate-100 dark:hover:bg-slate-700';
+  const emptyOAuthLoginButtonClass = 'flex items-center gap-1 rounded border border-blue-500/40 bg-blue-500/15 px-1.5 py-0.5 text-[9px] text-blue-700 hover:bg-blue-500/20 dark:text-blue-200 dark:hover:bg-blue-500/25';
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      onFocus();
+    }
+  };
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      title={title}
+      onClick={onFocus}
+      onKeyDown={handleKeyDown}
+      className={`relative h-[92px] overflow-hidden rounded-lg border ${cardSurfaceClass} text-foreground transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 ${cardBorder} ${isGrayed ? 'opacity-50' : 'hover:border-muted-foreground/30'}`}
+      style={{ width: 'calc((100% - 5 * 6px) / 6)', isolation: 'isolate' }}
+    >
+      {/* 修改原因：key_border 和 key_background 插槽在完整行模式已有挂载点，机房卡片也必须保留同等扩展能力。
+          修改方式：把 key_background 放在卡片背景层，把 key_border 放在外层绝对覆盖层，并透传 quota/account/balance 上下文。
+          目的：保证渠道自定义边框、背景和额度装饰在紧凑视图中不丢失。 */}
+      {hasKeyBackgroundSlot && slotPayloadAvailable && (
+        <UiSlot engine={engine} slot="key_background" data={slotData} context={slotContext} element="div" className="absolute inset-0 z-0 rounded-xl pointer-events-none" />
+      )}
+      {hasKeyBorderSlot && slotPayloadAvailable && (
+        <UiSlot engine={engine} slot="key_border" data={slotData} context={slotContext} element="div" className="absolute inset-0 z-[3] pointer-events-none" />
+      )}
+      {isCooling && <RackCoolingBorder remainSec={remainSec} totalDuration={totalDuration} />}
+      <span className={`absolute right-1.5 top-1.5 z-[4] h-2 w-2 rounded-full ring-2 ring-card ${statusClass}`} title={status} />
+      <div className="relative z-[2] flex h-full flex-col items-center px-1 pb-1.5 pt-2">
+        <div className="relative flex h-12 w-12 items-center justify-center">
+          {isOAuthEngine ? (
+            <RackOAuthRings quota={oauthQuota} hideText={hasQuotaDisplaySlot && !!slotPayloadAvailable} />
+          ) : (
+            <RackSingleRing percent={balPct} textClassName={balanceTextClass} label={ringLabel} />
+          )}
+          {/* 修改原因：冷却圆环中心必须显示倒计时，quota_display 再覆盖上去会遮挡剩余秒数。
+              修改方式：quota_display 仍挂载在非冷却卡片的圆环中心，冷却卡片改由 RackCoolingRing 独占中心区域。
+              目的：同时保证普通额度插槽可用，以及冷却状态倒计时清晰可见。 */}
+          {hasQuotaDisplaySlot && slotPayloadAvailable && (
+            <div className="absolute inset-0 z-[5] flex items-center justify-center">
+              <UiSlot engine={engine} slot="quota_display" data={slotData} context={slotContext} element="div" className="flex items-center justify-center text-[10px]" />
+            </div>
+          )}
+          {isOAuthEmpty && (
+            <div className={emptyOAuthOverlayClass}>
+              <button
+                type="button"
+                onClick={(event) => { event.stopPropagation(); onImport(); }}
+                className={emptyOAuthImportButtonClass}
+                title="粘贴 Refresh Token"
+              >
+                <ClipboardPaste className="h-2.5 w-2.5" /> 导入
+              </button>
+              <button
+                type="button"
+                onClick={(event) => { event.stopPropagation(); onLogin(); }}
+                className={emptyOAuthLoginButtonClass}
+                title="浏览器登录"
+              >
+                <LogIn className="h-2.5 w-2.5" /> 登录
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="mt-auto w-full text-center">
+          <div className={`truncate text-[10px] font-semibold font-mono ${isCooling ? 'text-red-400 dark:text-red-300 line-through decoration-red-500/40' : 'text-foreground'}`} title={keyObj.label || keyObj.key || labelText}>{labelText}</div>
+          <div className="mt-1 flex min-h-[16px] items-center justify-center gap-1 overflow-hidden">
+            {/* 修改原因：quota_label 插槽在完整行底部显示渠道额外标签，机房卡片底部也需要保留该插槽位置。
+                修改方式：优先在底部标签区挂载 quota_label；没有该插槽时显示通用 tier 药丸。
+                目的：保持渠道专属标签和通用 tier 标签都能在紧凑卡片中展示。 */}
+            {hasQuotaLabelSlot && slotPayloadAvailable ? (
+              <UiSlot engine={engine} slot="quota_label" data={slotData} context={slotContext} className="max-w-full truncate" />
+            ) : (hasQuotaDisplaySlot && slotPayloadAvailable) ? null : tierLabel ? (
+              <span className={`max-w-full truncate rounded-full border px-1.5 py-0.5 text-[9px] font-bold leading-none ${getRackTierClass(tierLabel)}`}>{tierLabel}</span>
+            ) : null}
+          </div>
+        </div>
+      </div>
+      {/* 修改原因：卡片选中后的编辑入口已改为展开完整行，旧的底部小按钮弹层太小且不能编辑 Key。
+          修改方式：删除 focused popover，让所有操作按钮只出现在展开后的完整行中。
+          目的：避免同一张卡片同时出现两套操作入口。 */}
+    </div>
+  );
+}
+
+
 export default function Channels() {
   const [providers, setProviders] = useState<any[]>([]);
   const [providerActivity, setProviderActivity] = useState<Record<string, string>>({});
@@ -1485,7 +1903,19 @@ export default function Channels() {
   };
 
   const addEmptyKey = () => {
-    if (formData) updateFormData('api_keys', [...formData.api_keys, { key: '', disabled: false }]);
+    if (formData) {
+      const newIdx = formData.api_keys.length;
+      updateFormData('api_keys', [...formData.api_keys, { key: '', disabled: false }]);
+      // setState 是异步批处理，用 setTimeout 确保在下一次渲染后设焦点
+      setTimeout(() => {
+        setFocusedKeyIdx(newIdx);
+        // 再等一帧滚动到底部
+        requestAnimationFrame(() => {
+          const container = document.querySelector('[data-key-scroll]');
+          if (container) container.scrollTop = container.scrollHeight;
+        });
+      }, 0);
+    }
   };
 
   const updateKey = (idx: number, keyStr: string) => {
@@ -1569,7 +1999,9 @@ export default function Channels() {
       });
       if (res.ok) {
         const data = await res.json();
-        updateKey(importModalIdx, data.key_id || keyId);
+        if (!data.already_exists) {
+          updateKey(importModalIdx, data.key_id || keyId);
+        }
         setOauthAccounts(prev => ({ ...prev, [data.key_id || keyId]: prev[data.key_id || keyId] || { type: formData.engine, status: 'active' } }));
         setImportModalIdx(null);
         setImportToken('');
@@ -1626,7 +2058,7 @@ export default function Channels() {
         if (event.data?.provider && event.data.provider !== providerName) return;
         window.removeEventListener('message', handler);
         const keyId = event.data.key_id;
-        if (keyId) {
+        if (keyId && !event.data.already_exists) {
           updateKey(idx, keyId);
         }
         refreshOAuthAccounts();
@@ -1675,7 +2107,9 @@ export default function Channels() {
       });
       if (res.ok) {
         const data = await res.json();
-        updateKey(oauthManualState.idx, data.key_id || '');
+        if (!data.already_exists) {
+          updateKey(oauthManualState.idx, data.key_id || '');
+        }
         await refreshOAuthAccounts();
         setOauthManualState(null);
         setManualUrl('');
@@ -3683,6 +4117,197 @@ export default function Channels() {
     );
   };
 
+
+  const renderFullKeyRow = (keyObj: ApiKeyObj, idx: number, options: { showDecorationsWhileFocused?: boolean } = {}) => {
+    // 修改原因：机房模式选中卡片后必须显示与原完整行模式一致的编辑能力，而不是维护第二套简化操作。
+    // 修改方式：把原 else 分支中的完整 Key 行渲染集中到这个函数，RackGrid 展开项和普通完整行列表都调用它，并允许机房展开行在聚焦时保留插槽装饰。
+    // 目的：保留 CoolingKeyRow、OAuth 导入/登录按钮、全部操作按钮和 UiSlot 挂载点，并避免两处分支后续不一致。
+    if (!formData) return null;
+      const providerName = formData.provider;
+      const rtDisabled = runtimeKeyStatus[providerName]?.auto_disabled || [];
+      const rtEntry = !keyObj.disabled ? rtDisabled.find((d: any) => d.key === keyObj.key) : undefined;
+      const isRtDisabled = !!rtEntry;
+      const isPermanent = isRtDisabled && rtEntry.remaining_seconds < 0;
+      const isCooling = isRtDisabled && !isPermanent && rtEntry.remaining_seconds > 0;
+      const countdown = localCountdowns[providerName]?.[keyObj.key];
+      const remainSec = countdown?.remaining ?? (rtEntry?.remaining_seconds || 0);
+
+      // 永久自动禁用和配置禁用都用同样的变灰样式
+      const isGrayed = keyObj.disabled || isPermanent;
+
+      const isFocused = focusedKeyIdx === idx;
+      // 修改原因：机房展开行使用 focusedKeyIdx 作为“展开”状态，但完整行原本会在 focused 时隐藏边框、背景和额度插槽。
+      // 修改方式：增加 showDecorationsWhileFocused 选项，只有机房展开行开启时才在聚焦状态继续渲染这些插槽。
+      // 目的：让 key_border、key_background、quota_display 和 quota_label 在机房展开行中不被误隐藏。
+      const showRowDecorations = !isFocused || options.showDecorationsWhileFocused;
+      const bal = balanceResults[keyObj.key];
+      const oauthAccount = oauthAccounts[keyObj.key];
+      const oauthQuota = getOAuthQuota(oauthAccount);
+      // 修改原因：Key 行只应知道通用插槽名，不能在渲染层读取 CC extra_usage 等渠道专属字段。
+      // 修改方式：按当前 engine 查询各插槽是否存在，后续只决定挂载点和默认回退。
+      // 目的：把边框、背景、额外标签和额度标签的渠道差异全部交给 ui_slots 脚本。
+      const hasKeyBorderSlot = hasUiSlot(formData.engine, 'key_border');
+      const hasKeyBackgroundSlot = hasUiSlot(formData.engine, 'key_background');
+      const hasQuotaDisplaySlot = hasUiSlot(formData.engine, 'quota_display');
+      const hasQuotaLabelSlot = hasUiSlot(formData.engine, 'quota_label');
+
+      if (isCooling) {
+        return (
+          <CoolingKeyRow
+            key={idx}
+            idx={idx}
+            keyObj={keyObj}
+            remainSec={remainSec}
+            totalDuration={countdown?.duration ?? rtEntry?.duration ?? remainSec}
+            focused={isFocused}
+            onFocus={() => setFocusedKeyIdx(idx)}
+            onBlur={() => setFocusedKeyIdx(null)}
+            onRecover={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }}
+            onToggle={() => toggleKeyDisabled(idx)}
+            onTest={() => openKeyTestDialog(idx)}
+            onDelete={() => deleteKey(idx)}
+            onLabelChange={(label) => {
+              const newKeys = [...formData.api_keys];
+              newKeys[idx] = { ...newKeys[idx], label: label || undefined };
+              setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
+            }}
+          />
+        );
+      }
+
+      const balPct = bal ? getBalancePercent(bal) : null;
+      const balColor = getBalanceColor(balPct);
+      const balLabel = bal ? getBalanceLabel(bal) : null;
+      // 修改原因：普通渠道余额结果现在可能包含 oai_tier 注入的 tier，即使没有可格式化余额也要预留标签空间。
+      // 修改方式：从 balanceResults 读取 tier 并去空白，后续与 balLabel 组合显示。
+      // 目的：让非 OAuth OpenAI 渠道可以在 Key 行显示 Tier 3 | $12.50 这类标签。
+      const tierLabel = typeof bal?.tier === 'string' && bal.tier.trim() ? bal.tier.trim() : null;
+      // 修改原因：右侧标签是否存在现在也可能由渠道插槽或普通渠道 tier 标签决定，不能只按内置余额标签计算遮罩。
+      // 修改方式：把普通 tier 标签以及 quota_display、quota_label 的插槽存在性纳入 hasTag，具体内容仍由各自逻辑渲染。
+      // 目的：保证 Key 备注遮罩在自定义插槽标签或 Tier 标签存在时仍给右侧留出空间。
+      const hasTag = !isGrayed && (!!balLabel || !!tierLabel || isPermanent || (isOAuthEngine && (!!oauthQuota || !!oauthAccount || hasQuotaDisplaySlot || hasQuotaLabelSlot)));
+
+      return (
+        <div
+          key={idx}
+          onBlur={e => {
+            // 修改原因：完整行在机房模式中是临时展开状态，焦点离开整行后应回到紧凑网格。
+            // 修改方式：利用 React 冒泡的 onBlur 检查 relatedTarget 是否仍在当前行内，离开时清空 focusedKeyIdx。
+            // 目的：保留行内按钮和输入框切换焦点的编辑体验，同时支持失焦自动收起。
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusedKeyIdx(null);
+          }}
+          className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? (isFocused ? 'bg-muted/30' : 'bg-muted/30 opacity-50') : 'bg-muted/50'}`}
+        >
+          {/* 修改原因：key 行边框可能由渠道自定义，但默认 OAuth 双弧仍是平台通用能力。
+              修改方式：存在 key_border 插槽时挂载 absolute div 并传入 quota/account；不存在时保留 QuotaBorderOverlay。
+              目的：让渠道可以覆盖边框弧，同时不影响未注册插槽的 OAuth 渠道。 */}
+          {isOAuthEngine && showRowDecorations && oauthQuota && (
+            hasKeyBorderSlot
+              ? <UiSlot engine={formData.engine} slot="key_border" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none z-[1]" />
+              : <QuotaBorderOverlay quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+          )}
+          {/* 修改原因：OAuth 额外用量背景条属于渠道专属 UI，通用前端不应读取 extra_usage 字段或计算颜色。
+              修改方式：仅在渠道注册 key_background 插槽时挂载覆盖整行的 absolute div，并把 quota/account 透传给脚本。
+              目的：删除 extra_usage 背景条硬编码，让 CC 等渠道在 channel.py 中自行实现背景条。 */}
+          {isOAuthEngine && showRowDecorations && oauthAccount && hasKeyBackgroundSlot && (
+            <UiSlot engine={formData.engine} slot="key_background" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none rounded-[7px] z-0 transition-all duration-500" />
+          )}
+          {/* 普通余额背景条 */}
+          {!isOAuthEngine && !isFocused && balColor && balPct != null && (
+            <div className="absolute left-0 top-0 bottom-0 rounded-[7px] z-0 pointer-events-none transition-all duration-500"
+                 style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
+          )}
+          <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
+
+          {/* 修改原因：Key 备注遮罩需要按备注真实渲染宽度计算，不能继续使用固定 30% 宽度。
+              修改方式：把备注覆盖层和输入框交给 KeyLabelOverlay 统一处理，由组件测量 label 后直接写入两个 mask。
+              目的：短备注少占输入空间，长备注尽量完整显示，并保持右侧标签渐隐逻辑。 */}
+          <KeyLabelOverlay label={keyObj.label} hasTag={hasTag} isFocused={isFocused}>
+            <input
+              type="text"
+              value={keyObj.key}
+              onChange={e => updateKey(idx, e.target.value)}
+              onPaste={e => handleKeyPaste(e, idx)}
+              onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
+              onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
+              placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
+              className={`w-full bg-transparent border-none text-sm leading-5 font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
+            />
+          </KeyLabelOverlay>
+          {isOAuthEngine && !keyObj.key && (
+            <>
+              {/* 修改原因：OAuth 新增空行需要把账号导入和后续浏览器登录入口放在输入框右侧。 */}
+              <button onClick={() => openImportModal(idx)} className="text-xs px-2 py-1 rounded border border-border bg-muted hover:bg-muted/80 text-foreground flex items-center gap-1 relative z-[2]" title="粘贴 Refresh Token">
+                <ClipboardPaste className="w-3 h-3" /> 导入
+              </button>
+              <button onClick={() => startOAuthLogin(idx)} className="text-xs px-2 py-1 rounded border border-primary/50 bg-primary/10 hover:bg-primary/20 text-primary flex items-center gap-1 relative z-[2]" title="浏览器登录">
+                <LogIn className="w-3 h-3" /> 登录
+              </button>
+            </>
+          )}
+          {/* 修改原因：quota_display 只是通用插槽之一，加载逻辑已泛化，调用点不应继续依赖旧单一额度插槽。
+              修改方式：存在 quota_display 插槽时挂载 UiSlot，并把当前 OAuth 账号作为 context 传给渠道脚本；否则保留默认 QuotaArcs 百分比标签。
+              目的：兼容 Antigravity、Codex 和 CC 的自定义标签，同时让 CC 能从 account 读取 subscription_type。 */}
+          {isOAuthEngine && showRowDecorations && oauthQuota && (
+            hasQuotaDisplaySlot
+              ? <UiSlot engine={formData.engine} slot="quota_display" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
+              : <QuotaArcs quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+          )}
+          {isOAuthEngine && !isFocused && oauthAccount && !oauthQuota && (
+            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 relative z-[2]">
+              {oauthAccount.status === 'active' ? '已连接' : oauthAccount.status === 'error' ? '刷新失败' : '冷却中'}
+            </span>
+          )}
+          {/* 修改原因：extra_usage 金额标签是渠道专属标签，不应由通用前端计算 remaining/limit。
+              修改方式：存在 quota_label 插槽时挂载 UiSlot 并透传 quota/account；不存在时不渲染任何额外默认标签。
+              目的：让 CC 的 $remaining / $limit 等展示由 claude_code_channel.py 维护。 */}
+          {isOAuthEngine && showRowDecorations && oauthAccount && hasQuotaLabelSlot && (
+            <UiSlot engine={formData.engine} slot="quota_label" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
+          )}
+          {!isOAuthEngine && !isFocused && (balLabel || tierLabel) && (() => {
+            // 修改原因：普通 OpenAI 渠道需要在现有余额标签旁显示 oai_tier 注入的 tier 字段。
+            // 修改方式：优先组合为 “Tier 3 | $12.50”，只有 tier 或只有余额时则单独显示；有余额时沿用余额颜色，只有 tier 时用蓝色弱提示样式。
+            // 目的：不改变 OAuth 插槽和配额展示，只开放普通渠道 Key 行的 Tier 标签显示。
+            const color = balColor || 'green';
+            const label = tierLabel && balLabel ? `${tierLabel} | ${balLabel}` : (tierLabel || balLabel);
+            const tagClass = balLabel ? TAG_CLASSES[color] : 'text-blue-400 bg-blue-500/12';
+            return <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${tagClass}`}>{label}</span>;
+          })()}
+          {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
+          {!isFocused && isPermanent && (
+            <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
+          )}
+
+          <button onClick={() => toggleKeyDisabled(idx)} className={`relative z-[2] ${isGrayed ? 'text-muted-foreground' : 'text-emerald-500'}`} title={keyObj.disabled ? "启用" : "禁用"}>
+            {keyObj.disabled ? <ToggleLeft className="w-5 h-5" /> : <ToggleRight className="w-5 h-5" />}
+          </button>
+          <button onClick={() => openKeyTestDialog(idx)} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 disabled:opacity-50 disabled:cursor-not-allowed relative z-[2]" title="测试此 Key">
+            <Play className="w-4 h-4" />
+          </button>
+          <button onClick={() => deleteKey(idx)} className="text-red-500 hover:text-red-400 ml-1 relative z-[2]"><Trash2 className="w-4 h-4" /></button>
+          {/* Label 编辑：聚焦时在行底部展开 */}
+          {isFocused && (
+            <div className="absolute left-0 right-0 -bottom-6 flex items-center gap-1 z-[5]">
+              <span className="text-[10px] text-muted-foreground/50 pl-8">备注:</span>
+              <input
+                type="text"
+                value={keyObj.label || ''}
+                onChange={e => {
+                  const newKeys = [...formData.api_keys];
+                  newKeys[idx] = { ...newKeys[idx], label: e.target.value || undefined };
+                  setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
+                }}
+                onFocus={() => setFocusedKeyIdx(idx)}
+                placeholder="点击添加备注"
+                className="flex-1 bg-background/80 backdrop-blur-sm border border-border/50 rounded px-2 py-0.5 text-[11px] text-amber-600 dark:text-amber-400 font-mono outline-none focus:border-amber-500/50 placeholder:text-muted-foreground/30"
+              />
+            </div>
+          )}
+        </div>
+      );
+
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 font-sans">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
@@ -4338,7 +4963,7 @@ export default function Channels() {
             </div>
 
             {formData && (
-              <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-6">
+              <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-6" onClick={(e) => { if (!(e.target as HTMLElement).closest('[data-key-scroll]')) setFocusedKeyIdx(null); }}>
                 {/* 1. 基础配置 */}
                 <section>
                   <div className="flex items-center gap-2 text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
@@ -4556,178 +5181,48 @@ export default function Channels() {
                       <UiSlot engine={formData.engine} slot="key_hint" data={null} element="div" className="text-xs text-muted-foreground" />
                     </>
                   )}
-                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1" onClick={e => { if (e.target === e.currentTarget) setFocusedKeyIdx(null); }}>
-                    {formData.api_keys.map((keyObj, idx) => {
-                      const providerName = formData.provider;
-                      const rtDisabled = runtimeKeyStatus[providerName]?.auto_disabled || [];
-                      const rtEntry = !keyObj.disabled ? rtDisabled.find((d: any) => d.key === keyObj.key) : undefined;
-                      const isRtDisabled = !!rtEntry;
-                      const isPermanent = isRtDisabled && rtEntry.remaining_seconds < 0;
-                      const isCooling = isRtDisabled && !isPermanent && rtEntry.remaining_seconds > 0;
-                      const countdown = localCountdowns[providerName]?.[keyObj.key];
-                      const remainSec = countdown?.remaining ?? (rtEntry?.remaining_seconds || 0);
+                  <div data-key-scroll className="space-y-2 max-h-64 overflow-y-auto pr-1" onClick={e => { if (e.target === e.currentTarget) setFocusedKeyIdx(null); }}>
+                    {/* 修改原因：当 Key 数量达到 10 个时，完整行模式会让编辑抽屉过长且难以快速浏览状态。
+                        修改方式：在原滚动容器内按数量阈值切换 RackGrid/RackCard；未达到阈值时把原完整行 map 原样保留在 else 分支。
+                        目的：让机房模式和完整行模式共用同一份数据、滚动区域与操作回调，同时避免改动现有完整行渲染。 */}
+                    {formData.api_keys.length >= 10 ? (
+                      <RackGrid onClick={e => { if (e.target === e.currentTarget) setFocusedKeyIdx(null); }}>
+                        {formData.api_keys.map((keyObj, idx) => {
+                          if (focusedKeyIdx === idx) {
+                            return (
+                              <div key={`full-${idx}`} className="w-full basis-full">
+                                {/* 修改原因：机房模式中被选中的卡片需要展开为原完整行，才能编辑完整 Key、备注和全部操作。
+                                    修改方式：在 flex-wrap 网格中用 w-full basis-full 包裹共用完整行渲染，让展开项独占一整行。
+                                    目的：其他未选中卡片继续保持紧凑排列，选中项上下自然换行。 */}
+                                {renderFullKeyRow(keyObj, idx, { showDecorationsWhileFocused: true })}
+                              </div>
+                            );
+                          }
 
-                      // 永久自动禁用和配置禁用都用同样的变灰样式
-                      const isGrayed = keyObj.disabled || isPermanent;
-
-                      const isFocused = focusedKeyIdx === idx;
-                      const bal = balanceResults[keyObj.key];
-                      const oauthAccount = oauthAccounts[keyObj.key];
-                      const oauthQuota = getOAuthQuota(oauthAccount);
-                      // 修改原因：Key 行只应知道通用插槽名，不能在渲染层读取 CC extra_usage 等渠道专属字段。
-                      // 修改方式：按当前 engine 查询各插槽是否存在，后续只决定挂载点和默认回退。
-                      // 目的：把边框、背景、额外标签和额度标签的渠道差异全部交给 ui_slots 脚本。
-                      const hasKeyBorderSlot = hasUiSlot(formData.engine, 'key_border');
-                      const hasKeyBackgroundSlot = hasUiSlot(formData.engine, 'key_background');
-                      const hasQuotaDisplaySlot = hasUiSlot(formData.engine, 'quota_display');
-                      const hasQuotaLabelSlot = hasUiSlot(formData.engine, 'quota_label');
-
-                      if (isCooling) {
-                        return (
-                          <CoolingKeyRow
-                            key={idx}
-                            idx={idx}
-                            keyObj={keyObj}
-                            remainSec={remainSec}
-                            totalDuration={countdown?.duration ?? rtEntry?.duration ?? remainSec}
-                            focused={isFocused}
-                            onFocus={() => setFocusedKeyIdx(idx)}
-                            onBlur={() => setFocusedKeyIdx(null)}
-                            onRecover={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }}
-                            onToggle={() => toggleKeyDisabled(idx)}
-                            onTest={() => openKeyTestDialog(idx)}
-                            onDelete={() => deleteKey(idx)}
-                            onLabelChange={(label) => {
-                              const newKeys = [...formData.api_keys];
-                              newKeys[idx] = { ...newKeys[idx], label: label || undefined };
-                              setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
-                            }}
-                          />
-                        );
-                      }
-
-                      const balPct = bal ? getBalancePercent(bal) : null;
-                      const balColor = getBalanceColor(balPct);
-                      const balLabel = bal ? getBalanceLabel(bal) : null;
-                      // 修改原因：普通渠道余额结果现在可能包含 oai_tier 注入的 tier，即使没有可格式化余额也要预留标签空间。
-                      // 修改方式：从 balanceResults 读取 tier 并去空白，后续与 balLabel 组合显示。
-                      // 目的：让非 OAuth OpenAI 渠道可以在 Key 行显示 Tier 3 | $12.50 这类标签。
-                      const tierLabel = typeof bal?.tier === 'string' && bal.tier.trim() ? bal.tier.trim() : null;
-                      // 修改原因：右侧标签是否存在现在也可能由渠道插槽或普通渠道 tier 标签决定，不能只按内置余额标签计算遮罩。
-                      // 修改方式：把普通 tier 标签以及 quota_display、quota_label 的插槽存在性纳入 hasTag，具体内容仍由各自逻辑渲染。
-                      // 目的：保证 Key 备注遮罩在自定义插槽标签或 Tier 标签存在时仍给右侧留出空间。
-                      const hasTag = !isGrayed && (!!balLabel || !!tierLabel || isPermanent || (isOAuthEngine && (!!oauthQuota || !!oauthAccount || hasQuotaDisplaySlot || hasQuotaLabelSlot)));
-
-                      return (
-                        <div key={idx} className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? (isFocused ? 'bg-muted/30' : 'bg-muted/30 opacity-50') : 'bg-muted/50'}`}>
-                          {/* 修改原因：key 行边框可能由渠道自定义，但默认 OAuth 双弧仍是平台通用能力。
-                              修改方式：存在 key_border 插槽时挂载 absolute div 并传入 quota/account；不存在时保留 QuotaBorderOverlay。
-                              目的：让渠道可以覆盖边框弧，同时不影响未注册插槽的 OAuth 渠道。 */}
-                          {isOAuthEngine && !isFocused && oauthQuota && (
-                            hasKeyBorderSlot
-                              ? <UiSlot engine={formData.engine} slot="key_border" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none z-[1]" />
-                              : <QuotaBorderOverlay quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
-                          )}
-                          {/* 修改原因：OAuth 额外用量背景条属于渠道专属 UI，通用前端不应读取 extra_usage 字段或计算颜色。
-                              修改方式：仅在渠道注册 key_background 插槽时挂载覆盖整行的 absolute div，并把 quota/account 透传给脚本。
-                              目的：删除 extra_usage 背景条硬编码，让 CC 等渠道在 channel.py 中自行实现背景条。 */}
-                          {isOAuthEngine && !isFocused && oauthAccount && hasKeyBackgroundSlot && (
-                            <UiSlot engine={formData.engine} slot="key_background" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none rounded-[7px] z-0 transition-all duration-500" />
-                          )}
-                          {/* 普通余额背景条 */}
-                          {!isOAuthEngine && !isFocused && balColor && balPct != null && (
-                            <div className="absolute left-0 top-0 bottom-0 rounded-[7px] z-0 pointer-events-none transition-all duration-500"
-                                 style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
-                          )}
-                          <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
-
-                          {/* 修改原因：Key 备注遮罩需要按备注真实渲染宽度计算，不能继续使用固定 30% 宽度。
-                              修改方式：把备注覆盖层和输入框交给 KeyLabelOverlay 统一处理，由组件测量 label 后直接写入两个 mask。
-                              目的：短备注少占输入空间，长备注尽量完整显示，并保持右侧标签渐隐逻辑。 */}
-                          <KeyLabelOverlay label={keyObj.label} hasTag={hasTag} isFocused={isFocused}>
-                            <input
-                              type="text"
-                              value={keyObj.key}
-                              onChange={e => updateKey(idx, e.target.value)}
-                              onPaste={e => handleKeyPaste(e, idx)}
-                              onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
-                              onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
-                              placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
-                              className={`w-full bg-transparent border-none text-sm leading-5 font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
+                          return (
+                            <RackCard
+                              key={idx}
+                              idx={idx}
+                              keyObj={keyObj}
+                              providerName={formData.provider}
+                              engine={formData.engine}
+                              runtimeKeyStatus={runtimeKeyStatus}
+                              localCountdowns={localCountdowns}
+                              balanceResults={balanceResults}
+                              oauthAccounts={oauthAccounts}
+                              isOAuthEngine={isOAuthEngine}
+                              onFocus={() => setFocusedKeyIdx(idx)}
+                              onImport={() => openImportModal(idx)}
+                              onLogin={() => startOAuthLogin(idx)}
                             />
-                          </KeyLabelOverlay>
-                          {isOAuthEngine && !keyObj.key && (
-                            <>
-                              {/* 修改原因：OAuth 新增空行需要把账号导入和后续浏览器登录入口放在输入框右侧。 */}
-                              <button onClick={() => openImportModal(idx)} className="text-xs px-2 py-1 rounded border border-border bg-muted hover:bg-muted/80 text-foreground flex items-center gap-1 relative z-[2]" title="粘贴 Refresh Token">
-                                <ClipboardPaste className="w-3 h-3" /> 导入
-                              </button>
-                              <button onClick={() => startOAuthLogin(idx)} className="text-xs px-2 py-1 rounded border border-primary/50 bg-primary/10 hover:bg-primary/20 text-primary flex items-center gap-1 relative z-[2]" title="浏览器登录">
-                                <LogIn className="w-3 h-3" /> 登录
-                              </button>
-                            </>
-                          )}
-                          {/* 修改原因：quota_display 只是通用插槽之一，加载逻辑已泛化，调用点不应继续依赖旧单一额度插槽。
-                              修改方式：存在 quota_display 插槽时挂载 UiSlot，并把当前 OAuth 账号作为 context 传给渠道脚本；否则保留默认 QuotaArcs 百分比标签。
-                              目的：兼容 Antigravity、Codex 和 CC 的自定义标签，同时让 CC 能从 account 读取 subscription_type。 */}
-                          {isOAuthEngine && !isFocused && oauthQuota && (
-                            hasQuotaDisplaySlot
-                              ? <UiSlot engine={formData.engine} slot="quota_display" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
-                              : <QuotaArcs quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
-                          )}
-                          {isOAuthEngine && !isFocused && oauthAccount && !oauthQuota && (
-                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 relative z-[2]">
-                              {oauthAccount.status === 'active' ? '已连接' : oauthAccount.status === 'error' ? '刷新失败' : '冷却中'}
-                            </span>
-                          )}
-                          {/* 修改原因：extra_usage 金额标签是渠道专属标签，不应由通用前端计算 remaining/limit。
-                              修改方式：存在 quota_label 插槽时挂载 UiSlot 并透传 quota/account；不存在时不渲染任何额外默认标签。
-                              目的：让 CC 的 $remaining / $limit 等展示由 claude_code_channel.py 维护。 */}
-                          {isOAuthEngine && !isFocused && oauthAccount && hasQuotaLabelSlot && (
-                            <UiSlot engine={formData.engine} slot="quota_label" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
-                          )}
-                          {!isOAuthEngine && !isFocused && (balLabel || tierLabel) && (() => {
-                            // 修改原因：普通 OpenAI 渠道需要在现有余额标签旁显示 oai_tier 注入的 tier 字段。
-                            // 修改方式：优先组合为 “Tier 3 | $12.50”，只有 tier 或只有余额时则单独显示；有余额时沿用余额颜色，只有 tier 时用蓝色弱提示样式。
-                            // 目的：不改变 OAuth 插槽和配额展示，只开放普通渠道 Key 行的 Tier 标签显示。
-                            const color = balColor || 'green';
-                            const label = tierLabel && balLabel ? `${tierLabel} | ${balLabel}` : (tierLabel || balLabel);
-                            const tagClass = balLabel ? TAG_CLASSES[color] : 'text-blue-400 bg-blue-500/12';
-                            return <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${tagClass}`}>{label}</span>;
-                          })()}
-                          {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
-                          {!isFocused && isPermanent && (
-                            <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
-                          )}
-
-                          <button onClick={() => toggleKeyDisabled(idx)} className={`relative z-[2] ${isGrayed ? 'text-muted-foreground' : 'text-emerald-500'}`} title={keyObj.disabled ? "启用" : "禁用"}>
-                            {keyObj.disabled ? <ToggleLeft className="w-5 h-5" /> : <ToggleRight className="w-5 h-5" />}
-                          </button>
-                          <button onClick={() => openKeyTestDialog(idx)} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 disabled:opacity-50 disabled:cursor-not-allowed relative z-[2]" title="测试此 Key">
-                            <Play className="w-4 h-4" />
-                          </button>
-                          <button onClick={() => deleteKey(idx)} className="text-red-500 hover:text-red-400 ml-1 relative z-[2]"><Trash2 className="w-4 h-4" /></button>
-                          {/* Label 编辑：聚焦时在行底部展开 */}
-                          {isFocused && (
-                            <div className="absolute left-0 right-0 -bottom-6 flex items-center gap-1 z-[5]">
-                              <span className="text-[10px] text-muted-foreground/50 pl-8">备注:</span>
-                              <input
-                                type="text"
-                                value={keyObj.label || ''}
-                                onChange={e => {
-                                  const newKeys = [...formData.api_keys];
-                                  newKeys[idx] = { ...newKeys[idx], label: e.target.value || undefined };
-                                  setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
-                                }}
-                                onFocus={() => setFocusedKeyIdx(idx)}
-                                placeholder="点击添加备注"
-                                className="flex-1 bg-background/80 backdrop-blur-sm border border-border/50 rounded px-2 py-0.5 text-[11px] text-amber-600 dark:text-amber-400 font-mono outline-none focus:border-amber-500/50 placeholder:text-muted-foreground/30"
-                              />
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
+                          );
+                        })}
+                      </RackGrid>
+                    ) : (
+                      <>
+                        {formData.api_keys.map((keyObj, idx) => renderFullKeyRow(keyObj, idx))}
+                      </>
+                    )}
                     {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥</div>}
                   </div>
                   {isOAuthEngine && (

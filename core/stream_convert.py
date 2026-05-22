@@ -86,6 +86,10 @@ async def assemble_stream_to_json(stream_generator):
                         content += delta["content"]
                     if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
                         reasoning_content += delta["reasoning_content"]
+                    if "refusal" in delta and isinstance(delta["refusal"], str):
+                        if "refusal" not in locals() or refusal is None:
+                            refusal = ""
+                        refusal += delta["refusal"]
 
                     if delta.get("tool_calls"):
                         for tc in delta["tool_calls"]:
@@ -134,7 +138,7 @@ async def assemble_stream_to_json(stream_generator):
         }
 
     # 组装 message
-    message = {"role": role, "refusal": None}
+    message = {"role": role, "refusal": refusal if 'refusal' in locals() else None}
     if tool_calls_accum:
         message["content"] = content if content else None
         message["tool_calls"] = [tool_calls_accum[i] for i in sorted(tool_calls_accum.keys())]

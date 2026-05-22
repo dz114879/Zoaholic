@@ -643,11 +643,52 @@ class ClaudeCodeProvider(OAuthProvider):
 # ═══════════════════════════════════════════════════════════════════
 
 import re as _re
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 
 # 请求级别的反向映射表：sanitize 时存入，response 时读取
 _reverse_tool_map: ContextVar[dict[str, str]] = ContextVar("_reverse_tool_map", default={})
 _reverse_prop_map: ContextVar[dict[str, str]] = ContextVar("_reverse_prop_map", default={})
+# 修改原因：反向映射通过 ContextVar 保存，请求结束后需要用 set 返回的 token 显式恢复旧值。
+# 修改方式：额外保存 tool/property 两个 ContextVar token，并由响应 adapter 的 finally 统一 reset。
+# 目的：保留流式响应期间的反向映射能力，同时避免请求结束后 ContextVar 值残留。
+_reverse_tool_map_token: ContextVar[Token | None] = ContextVar("_reverse_tool_map_token", default=None)
+_reverse_prop_map_token: ContextVar[Token | None] = ContextVar("_reverse_prop_map_token", default=None)
+
+
+def _reset_one_reverse_map(map_var, token_var) -> None:
+    token = token_var.get(None)
+    if token is None:
+        map_var.set({})
+        return
+    try:
+        map_var.reset(token)
+    except (LookupError, RuntimeError, ValueError):
+        # 修改原因：部分异步框架可能在复制后的 Context 中消费响应，旧 token 不能跨 Context reset。
+        # 修改方式：token reset 失败时退回为空映射，保证当前 Context 不再持有请求级映射。
+        # 目的：在不影响响应反向映射的前提下，尽量释放 ContextVar 对请求数据的引用。
+        map_var.set({})
+    finally:
+        token_var.set(None)
+
+
+def _set_reverse_tool_map(value: dict[str, str]) -> None:
+    _reset_one_reverse_map(_reverse_tool_map, _reverse_tool_map_token)
+    token = _reverse_tool_map.set(value)
+    _reverse_tool_map_token.set(token)
+
+
+def _set_reverse_prop_map(value: dict[str, str]) -> None:
+    _reset_one_reverse_map(_reverse_prop_map, _reverse_prop_map_token)
+    token = _reverse_prop_map.set(value)
+    _reverse_prop_map_token.set(token)
+
+
+def _reset_reverse_maps() -> None:
+    # 修改原因：tool/property 反向映射只在当前请求响应转换期间有效。
+    # 修改方式：按设置的反向顺序 reset property 和 tool 两个 ContextVar token。
+    # 目的：让响应结束或异常中断后都能释放请求级映射字典。
+    _reset_one_reverse_map(_reverse_prop_map, _reverse_prop_map_token)
+    _reset_one_reverse_map(_reverse_tool_map, _reverse_tool_map_token)
 
 # Layer 2: 第三方特征串（大小写不敏感匹配）
 _THIRD_PARTY_PATTERNS = _re.compile(
@@ -813,6 +854,11 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
     if not isinstance(payload, dict):
         return payload
 
+    # 修改原因：同一异步上下文可能在异常或重试后复用，旧反向映射不应影响新请求。
+    # 修改方式：每次清洗 payload 前先清空上一轮保存在 ContextVar 中的映射和 token。
+    # 目的：保证本次请求只使用本次 sanitize 产生的反向映射。
+    _reset_reverse_maps()
+
     # ── Layer 1: 确保 billing header 存在 ──
     system = payload.get("system")
     if not _has_billing_header(system):
@@ -863,7 +909,7 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
 
     # 保存反向映射到 ContextVar，供响应侧 Layer 7 使用
     if renamed:
-        _reverse_tool_map.set({v: k for k, v in renamed.items()})
+        _set_reverse_tool_map({v: k for k, v in renamed.items()})
 
     # ── Layer 5: Tool description strip ──
     # 清空 tool schema 的 description 内容（保留 key），减少指纹信号
@@ -908,7 +954,7 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
                     ]
 
     # 保存 property 反向映射
-    _reverse_prop_map.set({v: k for k, v in _PROP_RENAME_MAP.items()})
+    _set_reverse_prop_map({v: k for k, v in _PROP_RENAME_MAP.items()})
 
     # ── Layer 2 + 4: 字符串级清洗（system + messages 中的文本） ──
     _sanitize_text_blocks(payload)
@@ -1076,20 +1122,32 @@ async def get_claude_code_passthrough_meta(request, engine, provider, api_key=No
 
 async def fetch_claude_code_response_stream(client, url, headers, payload, model, timeout):
     """包装 Claude 流式 adapter，补齐 gzip + Layer 7 反向映射。"""
-    async for chunk in fetch_claude_response_stream(_GzipAwareClient(client), url, headers, payload, model, timeout):
-        if isinstance(chunk, str):
-            yield _reverse_map_chunk(chunk)
-        else:
-            yield chunk
+    try:
+        async for chunk in fetch_claude_response_stream(_GzipAwareClient(client), url, headers, payload, model, timeout):
+            if isinstance(chunk, str):
+                yield _reverse_map_chunk(chunk)
+            else:
+                yield chunk
+    finally:
+        # 修改原因：流式响应可能正常结束、异常中断或被客户端提前关闭，ContextVar 都需要清理。
+        # 修改方式：在 async generator 的 finally 中 reset sanitize 阶段保存的 token。
+        # 目的：避免 reverse tool/property map 在请求结束后继续占用上下文。
+        _reset_reverse_maps()
 
 
 async def fetch_claude_code_response(client, url, headers, payload, model, timeout):
     """包装 Claude 非流式 adapter，补齐 gzip + Layer 7 反向映射。"""
-    async for chunk in fetch_claude_response(_GzipAwareClient(client), url, headers, payload, model, timeout):
-        if isinstance(chunk, str):
-            yield _reverse_map_chunk(chunk)
-        else:
-            yield chunk
+    try:
+        async for chunk in fetch_claude_response(_GzipAwareClient(client), url, headers, payload, model, timeout):
+            if isinstance(chunk, str):
+                yield _reverse_map_chunk(chunk)
+            else:
+                yield chunk
+    finally:
+        # 修改原因：非流式响应同样依赖 sanitize 阶段的 ContextVar 反向映射。
+        # 修改方式：响应 adapter 迭代结束后 reset 保存的 token。
+        # 目的：确保一次请求的映射不会残留到后续请求上下文。
+        _reset_reverse_maps()
 
 
 # ═══════════════════════════════════════════════════════════════════

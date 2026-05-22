@@ -951,13 +951,46 @@ class InterceptedClient:
     ):
         self._client = client
         self._engine = engine
-        self._provider = provider
-        self._enabled_plugins = enabled_plugins
-        api_key = provider.get("api", "")
+        # 修改原因：包装器只需要 provider 的当前快照，直接保存原始 dict 会延长请求级配置对象的生命周期。
+        # 修改方式：浅拷贝 provider，并单独浅拷贝 preferences，避免继续强持有原始嵌套配置引用。
+        # 目的：让请求结束或 close 后更快释放 provider、插件配置和底层 client。
+        self._provider = dict(provider or {})
+        preferences = self._provider.get("preferences")
+        if isinstance(preferences, dict):
+            self._provider["preferences"] = dict(preferences)
+        self._enabled_plugins = list(enabled_plugins) if enabled_plugins else None
+        api_key = self._provider.get("api", "")
         self._api_key = api_key[0] if isinstance(api_key, list) and api_key else (api_key or "")
+
+    def close(self) -> None:
+        """释放包装器持有的请求级引用。"""
+        # 修改原因：InterceptedClient 会同时持有底层 client、engine、provider 和 enabled_plugins。
+        # 修改方式：请求使用结束后显式置空这些属性，调用方在 finally 中执行 close。
+        # 目的：断开包装器到请求级对象的强引用，降低 GC 处理引用链的压力。
+        self._client = None
+        self._engine = None
+        self._provider = None
+        self._enabled_plugins = None
+        self._api_key = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     async def _intercept(self, url: str, headers: Optional[Dict] = None) -> Tuple[str, Dict]:
         """对 url 和 headers 应用请求拦截器"""
+        if self._client is None:
+            raise RuntimeError("InterceptedClient is closed")
         headers = dict(headers or {})
         if not self._enabled_plugins:
             return url, headers
@@ -970,16 +1003,25 @@ class InterceptedClient:
 
     async def get(self, url, *, headers=None, **kwargs):
         url, headers = await self._intercept(url, headers)
-        return await self._client.get(url, headers=headers, **kwargs)
+        client = self._client
+        if client is None:
+            raise RuntimeError("InterceptedClient is closed")
+        return await client.get(url, headers=headers, **kwargs)
 
     async def post(self, url, *, headers=None, **kwargs):
         url, headers = await self._intercept(url, headers)
-        return await self._client.post(url, headers=headers, **kwargs)
+        client = self._client
+        if client is None:
+            raise RuntimeError("InterceptedClient is closed")
+        return await client.post(url, headers=headers, **kwargs)
 
     @asynccontextmanager
     async def _stream_intercepted(self, method, url, *, headers=None, **kwargs):
         url, headers = await self._intercept(url, headers)
-        async with self._client.stream(method, url, headers=headers, **kwargs) as response:
+        client = self._client
+        if client is None:
+            raise RuntimeError("InterceptedClient is closed")
+        async with client.stream(method, url, headers=headers, **kwargs) as response:
             yield response
 
     def stream(self, method, url, *, headers=None, **kwargs):
@@ -987,4 +1029,7 @@ class InterceptedClient:
 
     def __getattr__(self, name):
         """未覆盖的属性和方法直接转发到原始 client"""
-        return getattr(self._client, name)
+        client = self._client
+        if client is None:
+            raise AttributeError(f"InterceptedClient is closed; cannot access {name}")
+        return getattr(client, name)

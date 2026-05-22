@@ -563,17 +563,25 @@ async def fetch_channel_models(
 
         with proxy_context(proxy):
             async with app.state.client_manager.get_client(provider["base_url"], proxy) as client:
-                # 包装 client，让请求拦截器能作用于 models_adapter 的请求
-                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
-                if enabled_plugins:
-                    from core.plugins.interceptors import InterceptedClient
-                    client = InterceptedClient(client, engine, provider, enabled_plugins)
+                intercepted_client = None
+                try:
+                    # 修改原因：InterceptedClient 会持有底层 client、provider 和插件列表，必须在请求结束时断开引用。
+                    # 修改方式：保存包装器实例，并在 finally 中调用 close；业务代码仍使用 client 变量。
+                    # 目的：让 models 查询完成或异常中断后都释放包装器持有的请求级对象。
+                    enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                    if enabled_plugins:
+                        from core.plugins.interceptors import InterceptedClient
+                        intercepted_client = InterceptedClient(client, engine, provider, enabled_plugins)
+                        client = intercepted_client
 
-                models = await asyncio.wait_for(
-                    channel.models_adapter(client, provider),
-                    timeout=30.0
-                )
-                return JSONResponse(content={"models": models})
+                    models = await asyncio.wait_for(
+                        channel.models_adapter(client, provider),
+                        timeout=30.0
+                    )
+                    return JSONResponse(content={"models": models})
+                finally:
+                    if intercepted_client is not None:
+                        intercepted_client.close()
     except Exception as e:
         # 尽量提取并返回上游的错误信息
         upstream_status = None
@@ -1089,19 +1097,27 @@ async def query_channel_balance(
         with proxy_context(proxy):
             target_url = provider.get("base_url") or "https://localhost"
             async with app.state.client_manager.get_client(target_url, proxy) as client:
-                # 插件拦截器（和 fetch_models 同样的逻辑）
-                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
-                if enabled_plugins:
-                    from core.plugins.interceptors import InterceptedClient
-                    client = InterceptedClient(client, engine, provider, enabled_plugins)
+                intercepted_client = None
+                try:
+                    # 修改原因：余额查询路径也会创建 InterceptedClient，异常返回时同样需要释放引用。
+                    # 修改方式：将包装器生命周期限定在 try/finally 中，并在 finally 调用 close。
+                    # 目的：避免余额查询结束后继续持有底层 client、provider 和插件配置。
+                    enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                    if enabled_plugins:
+                        from core.plugins.interceptors import InterceptedClient
+                        intercepted_client = InterceptedClient(client, engine, provider, enabled_plugins)
+                        client = intercepted_client
 
-                result = await query_provider_balance(client, provider)
-                # 修改原因：普通渠道的余额查询返回后需要允许插件补充 OpenAI Tier 等被动信息。
-                # 修改方式：复用上方已解析的 enabled_plugins，对 result 调用 balance_enricher 链。
-                # 目的：不改 core.balance 模板，也能把 oai_tier 缓存的信息带回前端。
-                from core.plugins.interceptors import apply_balance_enrichers
-                result = await apply_balance_enrichers(result, engine, provider, enabled_plugins)
-                return JSONResponse(content=result)
+                    result = await query_provider_balance(client, provider)
+                    # 修改原因：普通渠道的余额查询返回后需要允许插件补充 OpenAI Tier 等被动信息。
+                    # 修改方式：复用上方已解析的 enabled_plugins，对 result 调用 balance_enricher 链。
+                    # 目的：不改 core.balance 模板，也能把 oai_tier 缓存的信息带回前端。
+                    from core.plugins.interceptors import apply_balance_enrichers
+                    result = await apply_balance_enrichers(result, engine, provider, enabled_plugins)
+                    return JSONResponse(content=result)
+                finally:
+                    if intercepted_client is not None:
+                        intercepted_client.close()
 
     except Exception as e:
         logger.error(f"Balance query error: {e}")

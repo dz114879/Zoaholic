@@ -529,6 +529,22 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     if content or reasoning_content or tool_calls_list:
         mark_content_start()
 
+    # 如果非流式直接触发拒绝，因为没有半路断联问题，直接 400 报错拦截最为安全，100% 杜绝 Agent 误读
+    if response_json.get("stop_reason") == "refusal":
+        stop_details = response_json.get("stop_details") or {}
+        refusal_reason = (
+            stop_details.get("explanation")
+            or stop_details.get("type")
+            or stop_details.get("category")
+            or "This request triggered Claude safeguards and was refused."
+        )
+        yield {
+            "error": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
+            "status_code": 400,
+            "details": f"Claude Refusal ({stop_details.get('category', 'unknown')})"
+        }
+        return
+
     role = safe_get(response_json, "role")
 
     yield await generate_no_stream_response(
@@ -670,6 +686,40 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                         current_block_id = None
                         current_tc_index = None
                         continue
+
+                    # 处理 message_delta，提取拒绝回答 (Refusal) 信号
+                    if event_type == "message_delta":
+                        delta = resp.get("delta", {})
+                        if delta.get("stop_reason") == "refusal":
+                            stop_details = delta.get("stop_details", {})
+                            # 优先提取 explanation（最详细的说明），次优为 type 或 category，没有则兜底
+                            refusal_reason = (
+                                stop_details.get("explanation")
+                                or stop_details.get("type")
+                                or stop_details.get("category")
+                                or "This request triggered Claude safeguards and was refused."
+                            )
+                            mark_content_start()
+                            
+                            # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
+                            # 这能让那些只认 choices.delta.content 的套壳网页前端正常把原因打印在气泡里
+                            sse_content_filter = await generate_sse_response(
+                                timestamp, model, content=f"\n[Safeguards Refusal] {refusal_reason}\n", stop="content_filter"
+                            )
+                            yield sse_content_filter
+
+                            # 2. 方案 C：紧接着再追加发送一个标准的 OAI Error 裸 chunk
+                            # 此时因为 HTTP 200 已发无法改变，裸吐 error chunk 强行让前端和 SDK 报错，杜绝工作流/Agent 误读
+                            err_payload = {
+                                "error": {
+                                    "message": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
+                                    "type": "invalid_request_error",
+                                    "param": None,
+                                    "code": "content_filter"
+                                }
+                            }
+                            yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
+                            continue
 
                     # 正常文本输出
                     text = safe_get(resp, "delta", "text", default="")

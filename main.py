@@ -1,3 +1,4 @@
+import gc
 import os
 import json
 import asyncio
@@ -390,6 +391,11 @@ def _register_oauth_providers_from_registry(oauth_manager) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 禁用 gen2 自动 GC — gen2 遍历所有存活对象会 stop-the-world 20~30s
+    # gen0/gen1 保持正常回收短期循环引用，凌晨定时任务手动 gc.collect() 回收 gen2
+    gc.set_threshold(700, 10, 0)
+    logger.info(f"[GC] Disabled gen2 auto-collect, thresholds={gc.get_threshold()}")
+
     # 启动时的代码
     # 设置各模块的调试模式
     set_routing_debug_mode(is_debug)
@@ -628,6 +634,24 @@ async def lifespan(app: FastAPI):
                 logger.warning(f"[daily_maintenance] Activity refresh failed: {e}")
 
     asyncio.get_running_loop().create_task(daily_maintenance())
+
+    async def gc_maintenance():
+        """凌晨 4 点手动执行 gen2 GC，回收禁用自动 gen2 后积累的循环引用"""
+        while True:
+            now = datetime.now(timezone(timedelta(hours=8)))  # CST
+            tomorrow_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            if tomorrow_4am <= now:
+                tomorrow_4am += timedelta(days=1)
+            await asyncio.sleep((tomorrow_4am - now).total_seconds())
+            try:
+                before = gc.get_count()
+                collected = gc.collect()  # full gen2 collect
+                after = gc.get_count()
+                logger.info(f"[gc_maintenance] gen2 collect done: freed {collected} objects, counts {before} -> {after}")
+            except Exception as e:
+                logger.warning(f"[gc_maintenance] gc.collect() failed: {e}")
+
+    asyncio.get_running_loop().create_task(gc_maintenance())
 
     app.state.startup_completed = True
     yield

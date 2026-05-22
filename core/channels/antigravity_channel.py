@@ -1457,13 +1457,19 @@ export default function render(ctx) {
 
     const fallbackPcts = [geminiPct, externalPct, initialQuota5h, initialQuota7d].filter(value => typeof value === 'number' && Number.isFinite(value));
     const minPct = fallbackPcts.length ? Math.round(Math.min(...fallbackPcts)) : null;
+    const compactWidth = el.offsetWidth || el.parentElement?.offsetWidth || 0;
+    const isCompact = compactWidth > 0 && compactWidth < 100;
     const tierName = paidTier?.name
         ? String(paidTier.name).replace(/Google\s*(AI\s*)?/i, '').replace(/Gemini Code Assist in /i, '').trim()
         : '';
-    if (minPct != null) {
-        // 修改原因：Antigravity key 行只显示百分比时，无法直接区分 Free、Pro、Ultra 等账号层级。
-        // 修改方式：从 paidTier.name 提取短 tier 名称，有名称时把它拼到最低 quota 百分比前。
-        // 目的：让标签显示为 Pro 60% 这类形式，同时没有 tier 时保持原百分比显示。
+    if (isCompact) {
+        // 小容器（机房卡片）：简化文字，但继续注册 tooltip
+        if (typeof el.__antigravityQuotaCleanup === 'function') {
+            el.__antigravityQuotaCleanup();
+        }
+        el.textContent = minPct != null ? (tierName ? `${tierName} ${minPct}%` : `${minPct}%`) : (tierName || '—');
+        el.className = `text-[9px] font-semibold font-mono leading-none cursor-pointer ${minPct != null ? colorOf(minPct) : 'text-foreground'}`;
+    } else if (minPct != null) {
         el.textContent = tierName ? `${tierName} ${minPct}%` : `${minPct}%`;
         el.className = `flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-pointer ${colorOf(minPct)}`;
     } else if (paidTier?.name) {
@@ -1863,12 +1869,11 @@ def register():
         models_adapter=fetch_antigravity_models,
         is_oauth=True,
         oauth_provider=provider,
-        # 修改原因：Antigravity 的额度标签、边框弧和请求体覆写提示都属于渠道专属 UI，通用前端只负责提供挂载点。
-        # 修改方式：注册 quota_display、key_border、override_hint 三个内联 UI 插槽，额度脚本读实时 raw 数据，提示脚本只写入 ctx.el。
-        # 目的：让前端从渠道元数据加载 Antigravity 专用 UI，同时保持未注册插槽的渠道不显示额外提示。
+        # 修改原因：Antigravity 的 key_border 应复用前端内建 QuotaBorderOverlay，避免继续维护渠道侧手写 SVG 边框。
+        # 修改方式：这里只注册 quota_display 和 override_hint，故意不注册 key_border，让前端走默认 fallback。
+        # 目的：让 Antigravity、CC 和 Codex 三个 OAuth 渠道使用统一的额度边框实现。
         ui_slots={
             "quota_display": QUOTA_UI,
-            "key_border": AG_KEY_BORDER_UI,
             "override_hint": AG_OVERRIDE_HINT,
         },
         source="builtin",

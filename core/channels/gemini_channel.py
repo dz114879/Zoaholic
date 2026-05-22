@@ -753,12 +753,28 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         
         if blockReason and blockReason != "STOP":
             msg = _extract_gemini_block_message(first_resp) or blockReason
-            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": msg}
+            yield {
+                "error": {
+                    "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason})",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "content_filter"
+                },
+                "status_code": 400
+            }
             return
         
         if not safe_get(first_resp, "candidates") and blockReason:
             msg = _extract_gemini_block_message(first_resp) or blockReason
-            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": msg}
+            yield {
+                "error": {
+                    "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason})",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "content_filter"
+                },
+                "status_code": 400
+            }
             return
 
         # 获取 usage (可能在最后一个响应对象中)
@@ -1013,11 +1029,43 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
 
             if parts_json == "[]" or (blockReason and blockReason != "STOP"):
                 msg = _extract_gemini_block_message(response_json) or (blockReason or "Empty Response")
-                yield {"error": f"Gemini Blocked: {blockReason or 'Empty Response'}", "status_code": 400, "details": msg}
+                mark_content_start()
+                # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
+                sse_content_filter = await generate_sse_response(
+                    timestamp, model, content=f"\n[Gemini Safety Block] {msg} (Reason: {blockReason or 'SAFETY'})\n", stop="content_filter"
+                )
+                yield sse_content_filter
+
+                # 2. 方案 C：追加标准的 OAI Error 裸 chunk
+                err_payload = {
+                    "error": {
+                        "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason or 'SAFETY'})",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "content_filter"
+                    }
+                }
+                yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
                 return
             elif finishReason and finishReason not in ["STOP", "MAX_TOKENS"]:
                 # 非正常结束原因（如 SAFETY, RECITATION 等）
-                yield {"error": f"Gemini Finish Reason: {finishReason}", "status_code": 400, "details": f"{finishReason}"}
+                mark_content_start()
+                # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
+                sse_content_filter = await generate_sse_response(
+                    timestamp, model, content=f"\n[Gemini Safety Block] Restricted generation due to {finishReason}\n", stop="content_filter"
+                )
+                yield sse_content_filter
+
+                # 2. 方案 C：追加标准的 OAI Error 裸 chunk
+                err_payload = {
+                    "error": {
+                        "message": f"Gemini generation stopped by safety filter. Finish Reason: {finishReason}",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "content_filter"
+                    }
+                }
+                yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
                 return
             elif finishReason:
                 # 正常结束（STOP 或 MAX_TOKENS）
