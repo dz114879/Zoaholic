@@ -625,7 +625,14 @@ async def get_right_order_providers(
                 continue
 
             # First, check TPR limit
-            is_tpr_exceeded = await provider_api_circular_list[provider_name].is_tpr_exceeded(
+            # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 时不能再隐式创建空 key 池。
+            # 修改方式：使用 get 读取现有循环列表；缺失时保持旧行为，视为没有 TPR 限制并继续保留 provider。
+            # 目的：避免 TPR 检查路径创建空对象，同时不影响无 key provider 的可用性。
+            circular_list = provider_api_circular_list.get(provider_name)
+            if not circular_list:
+                available_providers.append(provider)
+                continue
+            is_tpr_exceeded = await circular_list.is_tpr_exceeded(
                 original_model, tokens=request_total_tokens
             )
             if is_tpr_exceeded:

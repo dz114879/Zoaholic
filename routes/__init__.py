@@ -23,6 +23,7 @@ from routes.auth import router as auth_router
 from routes.health import router as health_router
 from routes.workspace import router as workspace_router
 from routes.system import router as system_router
+from routes.debug import router as debug_router
 
 # 导入方言路由（自动注册所有方言端点）
 from core.dialects import dialect_router
@@ -47,5 +48,9 @@ api_router.include_router(dialect_router)
 api_router.include_router(health_router, tags=["Health"])
 api_router.include_router(workspace_router, tags=["Workspace"])
 api_router.include_router(system_router, tags=["System"])
+# 修改原因：需要临时开放运行时内存诊断端点，不应复用需要鉴权的管理路由。
+# 修改方式：把 debug router 直接注册到主 api_router，保持 /debug/memory 和 /debug/memory/diff 无前缀、无认证。
+# 目的：线上排查内存泄漏时可以直接获取 tracemalloc、RSS 和 GC 信息，诊断完成后可移除。
+api_router.include_router(debug_router, tags=["Debug"])
 
 __all__ = ["api_router"]

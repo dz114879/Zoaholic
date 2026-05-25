@@ -553,7 +553,7 @@ def wrap_gemini_channel():
     _original_stream_adapter = channel.stream_adapter
     _original_response_adapter = channel.response_adapter
     
-    # 重新注册渠道，使用包装后的适配器
+    # 重新注册渠道，使用包装后的适配器（保留原始 source 标记）
     register_channel(
         id="gemini",
         type_name=channel.type_name,
@@ -565,6 +565,7 @@ def wrap_gemini_channel():
         stream_adapter=wrapped_fetch_gemini_response_stream,
         response_adapter=wrapped_fetch_gemini_response,
         models_adapter=channel.models_adapter,
+        source=channel.source,
         overwrite=True,
     )
     
@@ -587,7 +588,7 @@ def unwrap_gemini_channel():
         return
     
     if _original_stream_adapter and _original_response_adapter:
-        # 恢复原始适配器
+        # 恢复原始适配器（保留原始 source 标记）
         register_channel(
             id="gemini",
             type_name=channel.type_name,
@@ -599,6 +600,7 @@ def unwrap_gemini_channel():
             stream_adapter=_original_stream_adapter,
             response_adapter=_original_response_adapter,
             models_adapter=channel.models_adapter,
+            source=channel.source,
             overwrite=True,
         )
         

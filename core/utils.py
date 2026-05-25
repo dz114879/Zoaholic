@@ -249,10 +249,7 @@ def get_proxy(proxy, client_config = {}):
             client_config["transport"] = transport
             # print("proxy", proxy)
         else:
-            client_config["proxies"] = {
-                "http://": proxy,
-                "https://": proxy
-            }
+            client_config["proxy"] = proxy
     return client_config
 
 async def update_initial_model(provider):

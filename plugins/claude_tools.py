@@ -242,17 +242,21 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
 
     tool_config = tool_mapping.get(tool_type)
     if tool_config:
-        # 检查是否已存在相同类型的工具
+        # 检查是否已存在相同 type 或 name 的工具（Anthropic 要求 name 唯一）
         existing_types = {t.get("type") for t in payload["tools"] if isinstance(t, dict)}
-        if tool_config["type"] not in existing_types:
+        existing_names = {t.get("name") for t in payload["tools"] if isinstance(t, dict)}
+        if tool_config["type"] not in existing_types and tool_config.get("name") not in existing_names:
             payload["tools"].append(tool_config.copy())
             logger.debug(f"[claude_tools] Added server tool: {tool_config['type']}")
 
         # web_search_20260209 的 dynamic filtering 依赖 code_execution
         if tool_type == "search":
-            code_type = tool_mapping["code"]["type"]
-            if code_type not in existing_types:
-                payload["tools"].append(tool_mapping["code"].copy())
+            code_tool = tool_mapping["code"]
+            # 重新检查当前 tools 列表（可能上面刚 append 了）
+            current_types = {t.get("type") for t in payload["tools"] if isinstance(t, dict)}
+            current_names = {t.get("name") for t in payload["tools"] if isinstance(t, dict)}
+            if code_tool["type"] not in current_types and code_tool.get("name") not in current_names:
+                payload["tools"].append(code_tool.copy())
                 logger.debug(f"[claude_tools] Auto-added code_execution for dynamic filtering")
 
 

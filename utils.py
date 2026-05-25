@@ -533,8 +533,12 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
             # 子渠道共享主渠道的 key circular list（保证 round_robin 和禁用状态一致）
             parent_name = provider.get('_parent_provider')
-            if parent_name and parent_name in provider_api_circular_list:
-                provider_api_circular_list[provider['provider']] = provider_api_circular_list[parent_name]
+            # 修改原因：provider_api_circular_list 已改为普通 dict，读取父渠道时不能再依赖 [] 自动创建。
+            # 修改方式：用 get 取得父渠道现有循环列表，只有存在时才让子渠道共享同一实例。
+            # 目的：保持子渠道共享 key 状态的行为，同时避免配置顺序或名称错误造成空 key 池泄漏。
+            parent_circular_list = provider_api_circular_list.get(parent_name) if parent_name else None
+            if parent_circular_list:
+                provider_api_circular_list[provider['provider']] = parent_circular_list
                 # 跳过后面的 circular list 创建
                 provider_api = None
 
@@ -1408,6 +1412,27 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
     allow_all = "all" in normalized_rules
     allowed_names = set(normalized_rules)
 
+    # 当前 API Key 允许的分组
+    api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
+    if isinstance(api_key_groups, str):
+        api_key_groups = [api_key_groups]
+    if not isinstance(api_key_groups, list) or not api_key_groups:
+        api_key_groups = ['default']
+    allowed_groups = set(api_key_groups)
+
+    # 构建 provider_name → groups 映射，供虚拟模型 group 检查
+    provider_groups_map = {}
+    for p in config.get("providers", []):
+        pname = p.get("provider", "")
+        if not pname:
+            continue
+        pg = p.get("groups") or ["default"]
+        if isinstance(pg, str):
+            pg = [pg] if pg else ["default"]
+        if not isinstance(pg, list) or not pg:
+            pg = ["default"]
+        provider_groups_map[pname] = set(pg)
+
     for virtual_name, virtual_config in virtual_models.items():
         if not isinstance(virtual_config, dict):
             continue
@@ -1417,8 +1442,25 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
         if enabled_value is False:
             continue
         virtual_name = str(virtual_name).strip()
-        if allow_all or virtual_name in allowed_names:
-            _append_model_info_if_missing(all_models, unique_models, virtual_name)
+        if not (allow_all or virtual_name in allowed_names):
+            continue
+        # 方案 B：检查虚拟模型 chain 中至少有一个 provider 的 group 跟当前 key 有交集
+        chain = virtual_config.get("chain") or virtual_config.get("targets") or []
+        if chain:
+            has_accessible_provider = False
+            for target in chain:
+                if not isinstance(target, dict):
+                    continue
+                if target.get("type") != "channel":
+                    continue
+                target_provider = target.get("value", "")
+                target_groups = provider_groups_map.get(target_provider)
+                if target_groups and allowed_groups.intersection(target_groups):
+                    has_accessible_provider = True
+                    break
+            if not has_accessible_provider:
+                continue
+        _append_model_info_if_missing(all_models, unique_models, virtual_name)
 
 
 def post_all_models(api_index, config, api_list, models_list):
@@ -1494,7 +1536,9 @@ def post_all_models(api_index, config, api_list, models_list):
                                 if model_item == "*":
                                     continue
                                 # 过滤掉作为别名映射上游的模型名
-                                if model_item in upstream_candidates:
+                                # 比较时去掉 prefix，因为 upstream_candidates 存的是不带 prefix 的上游名
+                                bare_name = model_item[len(prefix):] if prefix and model_item.startswith(prefix) else model_item
+                                if bare_name in upstream_candidates:
                                     continue
                                 # 如果有前缀，只返回带前缀的模型名
                                 if prefix and not model_item.startswith(prefix):
@@ -1559,7 +1603,9 @@ def post_all_models(api_index, config, api_list, models_list):
                                 if model_item == "*":
                                     continue
                                 # 过滤掉作为别名映射上游的模型名
-                                if model_item in upstream_candidates:
+                                # 比较时去掉 prefix，因为 upstream_candidates 存的是不带 prefix 的上游名
+                                bare_name = model_item[len(prefix):] if prefix and model_item.startswith(prefix) else model_item
+                                if bare_name in upstream_candidates:
                                     continue
                                 # 如果有前缀，只返回带前缀的模型名
                                 if prefix and not model_item.startswith(prefix):
@@ -1637,7 +1683,9 @@ def get_all_models(config, allowed_groups=None):
             if model == "*":
                 continue
             # 过滤掉作为别名映射上游的模型名
-            if model in upstream_candidates:
+            # 比较时去掉 prefix，因为 upstream_candidates 存的是不带 prefix 的上游名
+            bare_name = model[len(prefix):] if prefix and model.startswith(prefix) else model
+            if bare_name in upstream_candidates:
                 continue
             # 如果有前缀，只返回带前缀的模型名，过滤掉不带前缀的原始模型名
             if prefix and not model.startswith(prefix):
