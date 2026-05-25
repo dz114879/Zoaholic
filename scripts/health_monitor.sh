@@ -78,6 +78,14 @@ write_fail_count() {
 # ==================== 核心检查 ====================
 
 do_check() {
+    # 热重载检测：.reloading 文件存在说明 uvicorn 正在重载，跳过本轮检查
+    local reload_marker="${BASE_DIR}/data/.reloading"
+    if [[ -f "$reload_marker" ]]; then
+        log "INFO" "Hot-reload in progress (.reloading marker found), skipping check"
+        write_fail_count "0"
+        return 0
+    fi
+
     local fail_count
     fail_count="$(read_fail_count)"
 
@@ -136,19 +144,19 @@ except Exception as e:
     last_success_ago="$(echo "$metrics" | grep '^last_success_ago=' | cut -d= -f2)"
     rss_mb="$(echo "$metrics" | grep '^rss_mb=' | cut -d= -f2)"
 
-    # --- Step 3: 功能性死亡检测 ---
-    # 如果 last_success_ago 是数字且超过 STALE_THRESHOLD，判定为功能性死亡
-    if [[ "$last_success_ago" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        local stale_int
-        stale_int="${last_success_ago%%.*}"
-        if [[ "$stale_int" -ge "$STALE_THRESHOLD" ]]; then
-            fail_count=$((fail_count + 1))
-            write_fail_count "$fail_count"
-            log "WARN" "functional stall: no success in ${stale_int}s (threshold=${STALE_THRESHOLD}s), active=${active}, consecutive_failures=${fail_count}/${MAX_FAILURES}"
-            maybe_restart "$fail_count" "functional_stall_${stale_int}s"
-            return 1
-        fi
-    fi
+    # --- Step 3: 功能性死亡检测（已禁用）---
+    # healthz 200 就说明服务活着，没流量不代表卡死
+    # if [[ "$last_success_ago" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    #     local stale_int
+    #     stale_int="${last_success_ago%%.*}"
+    #     if [[ "$stale_int" -ge "$STALE_THRESHOLD" ]]; then
+    #         fail_count=$((fail_count + 1))
+    #         write_fail_count "$fail_count"
+    #         log "WARN" "functional stall: no success in ${stale_int}s (threshold=${STALE_THRESHOLD}s), active=${active}, consecutive_failures=${fail_count}/${MAX_FAILURES}"
+    #         maybe_restart "$fail_count" "functional_stall_${stale_int}s"
+    #         return 1
+    #     fi
+    # fi
 
     # --- Step 4: 一切正常，重置计数 ---
     if [[ "$fail_count" -gt 0 ]]; then
