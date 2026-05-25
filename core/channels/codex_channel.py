@@ -50,12 +50,12 @@ def _parse_ratelimit_headers(headers) -> dict | None:
     secondary_used = headers.get("x-codex-secondary-used-percent")
     if primary_used is not None:
         try:
-            result["quota_7d"] = round(max(0.0, 100.0 - float(primary_used)), 2)
+            result["quota_outer"] = round(max(0.0, 100.0 - float(primary_used)), 2)
         except (TypeError, ValueError):
             pass
     if secondary_used is not None:
         try:
-            result["quota_5h"] = round(max(0.0, 100.0 - float(secondary_used)), 2)
+            result["quota_inner"] = round(max(0.0, 100.0 - float(secondary_used)), 2)
         except (TypeError, ValueError):
             pass
     codex_raw = {}
@@ -65,7 +65,7 @@ def _parse_ratelimit_headers(headers) -> dict | None:
             codex_raw[kl] = v
     if codex_raw:
         result["raw"] = codex_raw
-        if result.get("quota_5h") is not None or result.get("quota_7d") is not None:
+        if result.get("quota_inner") is not None or result.get("quota_outer") is not None:
             return result
 
     # Fallback: x-ratelimit-*（api.openai.com 端点）
@@ -76,12 +76,12 @@ def _parse_ratelimit_headers(headers) -> dict | None:
     reset_requests = headers.get("x-ratelimit-reset-requests")
     reset_tokens = headers.get("x-ratelimit-reset-tokens")
 
-    quota_5h = _percentage(remaining_requests, limit_requests)
-    quota_7d = _percentage(remaining_tokens, limit_tokens)
-    if quota_5h is not None:
-        result["quota_5h"] = quota_5h
-    if quota_7d is not None:
-        result["quota_7d"] = quota_7d
+    quota_inner = _percentage(remaining_requests, limit_requests)
+    quota_outer = _percentage(remaining_tokens, limit_tokens)
+    if quota_inner is not None:
+        result["quota_inner"] = quota_inner
+    if quota_outer is not None:
+        result["quota_outer"] = quota_outer
 
     raw = {
         k: v
@@ -260,6 +260,25 @@ class CodexProvider(OAuthProvider):
             break
         return DEFAULT_TOKEN_URL
 
+    def _resolve_proxy(self, config: dict | None = None) -> str | None:
+        """从当前运行时配置动态获取 codex provider 的 proxy。"""
+        runtime_config = config if config is not None else self._get_runtime_config()
+        # provider 级 proxy
+        for provider in (runtime_config or {}).get("providers", []):
+            if not isinstance(provider, dict):
+                continue
+            if provider.get("engine") != "codex":
+                continue
+            proxy = provider.get("preferences", {}).get("proxy")
+            if isinstance(proxy, str) and proxy.strip():
+                return proxy.strip()
+            break
+        # 全局 proxy
+        global_proxy = (runtime_config or {}).get("preferences", {}).get("proxy")
+        if isinstance(global_proxy, str) and global_proxy.strip():
+            return global_proxy.strip()
+        return None
+
     def _resolve_base_url(self, config: dict | None = None) -> str:
         """从当前运行时配置动态获取 Codex API base_url。"""
         # 修改原因：额度查询需要访问 OpenAI API 端点，而用户可能在 api.yaml 中配置了 Codex API 反代地址。
@@ -359,7 +378,7 @@ class CodexProvider(OAuthProvider):
         """把 OpenAI ratelimit 响应头转换为前端展示的 quota 结构。"""
         # 修改原因：主动查询和被动 wrapper 都要用同一套响应头解析规则，避免两个路径展示不一致。
         # 修改方式：CodexProvider 方法委托给模块级 _parse_ratelimit_headers，供测试和 wrapper 共用。
-        # 目的：让 quota_5h、quota_7d 与 raw 字段在所有采集路径中保持稳定。
+        # 目的：让 quota_inner、quota_outer 与 raw 字段在所有采集路径中保持稳定。
         return _parse_ratelimit_headers(headers)
 
     async def fetch_quota(self, credential: dict, config: dict | None = None) -> dict | None:
@@ -386,7 +405,8 @@ class CodexProvider(OAuthProvider):
             "input": [{"role": "user", "content": "hi"}],
         }
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
+            proxy = self._resolve_proxy(config)
+            async with httpx.AsyncClient(timeout=20, proxy=proxy) as client:
                 response = await client.post(quota_url, json=payload, headers=headers)
         except Exception:
             return None
@@ -402,8 +422,10 @@ class CodexProvider(OAuthProvider):
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Encoding": "identity",
         }
-        async with httpx.AsyncClient(timeout=30) as client:
+        proxy = self._resolve_proxy(config)
+        async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
             response = await client.post(token_url, data=data, headers=headers)
             if response.status_code >= 400:
                 raise ValueError(f"{response.status_code} {response.text}")
@@ -485,38 +507,59 @@ def _decode_codex_identity(id_token: str | None) -> dict[str, str]:
 
 CODEX_USER_AGENT = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 
-# 修改原因：Codex OAuth 的 plan tier 存在响应头 raw 数据中，默认 QuotaArcs 只能显示百分比。
-# 修改方式：注册 quota_display 内联脚本，从 raw['x-codex-plan-type'] 或 raw.plan_type 读取 tier，并与 5h/7d 最低百分比组合显示。
-# 目的：让 Codex key 行能显示 Plus 80%、Pro 60% 这类 tier + quota 标签。
+# 修改原因：Codex 的 plan_type 和百分比现在共用 quota_display，前端只保留一个额度挂载点。
+# 修改方式：从 data.raw 读取 plan_type，从 data.quota_inner/data.quota_outer 读取最低百分比，并组合为同一个标签。
+# 目的：删除独立标签脚本后仍在原 quota_display 位置显示 Codex 套餐和额度。
 CODEX_QUOTA_DISPLAY = """
 export default function render(ctx) {
-    const { el, data } = ctx || {};
+    ctx = ctx || {};
+    const { el, data } = ctx;
     if (!el) return;
+    const mode = ctx.context?.mode || ctx.mode || 'row';
+
+    // 修改原因：Codex quota_display 同时挂载在完整 Key 行和机房卡片圆环中心，完整行药丸样式会在小圆环内溢出。
+    // 修改方式：读取 ctx.context.mode 区分 row/rack；rack 只输出短百分比或短 planType，row 保留 planType + 百分比药丸。
+    // 目的：让 Codex 在完整行保持原有信息密度，同时在机房卡片中心不再显示过长内容。
     const raw = data?.raw || {};
-    
-    // 读 tier
     const planType = raw['x-codex-plan-type'] || raw.plan_type || '';
-    const tierLabel = planType ? planType.charAt(0).toUpperCase() + planType.slice(1).toLowerCase() : '';
-    // "plus" → "Plus", "pro" → "Pro", "team" → "Team", "free" → "Free", "prolite" → "Prolite"
-    
-    // 读 quota 百分比
-    const q5 = typeof data?.quota_5h === 'number' ? data.quota_5h : null;
-    const q7 = typeof data?.quota_7d === 'number' ? data.quota_7d : null;
-    const pcts = [q5, q7].filter(v => v != null);
+    const qInner = typeof data?.quota_inner === 'number' ? data.quota_inner : null;
+    const qOuter = typeof data?.quota_outer === 'number' ? data.quota_outer : null;
+    const pcts = [qInner, qOuter].filter(v => v != null);
     const minPct = pcts.length ? Math.round(Math.min(...pcts)) : null;
-    
-    // 读 credits
-    const credits = raw.credits || raw['x-codex-credits'];
-    
-    if (minPct != null) {
-        const colorCls = minPct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : minPct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
-        el.textContent = tierLabel ? tierLabel + ' ' + minPct + '%' : minPct + '%';
+
+    if (mode === 'rack') {
+        if (minPct != null) {
+            el.style.display = '';
+            el.textContent = minPct + '%';
+            el.removeAttribute('title');
+            const colorCls = minPct >= 50 ? 'text-emerald-600' : minPct >= 20 ? 'text-amber-600' : 'text-red-500';
+            el.className = 'text-[9px] font-bold font-mono leading-none ' + colorCls;
+        } else if (planType) {
+            el.style.display = '';
+            el.textContent = planType;
+            el.title = planType;
+            el.className = 'text-[8px] font-semibold leading-none text-blue-500 truncate max-w-[50px]';
+        } else {
+            el.textContent = '';
+            el.removeAttribute('title');
+            el.style.display = 'none';
+        }
+        return;
+    }
+
+    const parts = [];
+    if (planType) parts.push(planType);
+    if (minPct != null) parts.push(minPct + '%');
+
+    if (parts.length) {
+        const colorCls = minPct == null ? 'bg-blue-500/15 text-blue-500' : minPct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : minPct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+        el.style.display = '';
+        el.textContent = parts.join(' ');
+        el.title = parts.join(' · ');
         el.className = 'flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-default ' + colorCls;
-    } else if (tierLabel) {
-        el.textContent = tierLabel;
-        el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 relative z-[2] cursor-default';
     } else {
         el.textContent = '';
+        el.removeAttribute('title');
         el.style.display = 'none';
     }
 }
@@ -598,10 +641,13 @@ def register():
         # 修改方式：注册渠道时直接创建并传入 CodexProvider 实例，由 registry 保存给启动流程使用。
         # 目的：让 Codex 与插件 OAuth 渠道走同一条自动 provider 注册路径。
         oauth_provider=CodexProvider(),
-        # 修改原因：Codex 默认额度标签无法显示 OAuth plan tier。
-        # 修改方式：注册 quota_display 插槽，由前端加载 CODEX_QUOTA_DISPLAY 渲染 plan_type 与最低百分比。
-        # 目的：让响应头采集到的 x-codex-plan-type 直接展示在 key 行标签中。
-        ui_slots={"quota_display": CODEX_QUOTA_DISPLAY},
+        # 修改原因：Codex plan_type 已合并到 quota_display，前端不再提供独立标签挂载点。
+        # 修改方式：只注册 quota_display，并保留导入占位配置不变。
+        # 目的：让 Codex 在同一个额度插槽内同时显示套餐和百分比。
+        ui_slots={
+            "quota_display": CODEX_QUOTA_DISPLAY,
+            "import_placeholder": "rt_xxxxxxxx...",
+        },
         source="builtin",
     )
 

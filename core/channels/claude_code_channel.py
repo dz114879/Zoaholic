@@ -431,19 +431,19 @@ class ClaudeCodeProvider(OAuthProvider):
         # five_hour → 5h 窗口
         fh = data.get("five_hour")
         if fh and isinstance(fh, dict):
-            result["quota_5h"] = round(100 - (fh.get("utilization") or 0), 1)
-            result["quota_5h_resets_at"] = fh.get("resets_at")
+            result["quota_inner"] = round(100 - (fh.get("utilization") or 0), 1)
+            result["quota_inner_resets_at"] = fh.get("resets_at")
         # seven_day → 7d 窗口
         sd = data.get("seven_day")
         if sd and isinstance(sd, dict):
-            result["quota_7d"] = round(100 - (sd.get("utilization") or 0), 1)
-            result["quota_7d_resets_at"] = sd.get("resets_at")
+            result["quota_outer"] = round(100 - (sd.get("utilization") or 0), 1)
+            result["quota_outer_resets_at"] = sd.get("resets_at")
         # model-specific weekly
         for key, val in data.items():
             if key.startswith("seven_day_") and isinstance(val, dict):
                 model_tag = key[len("seven_day_"):]
-                result[f"quota_7d_{model_tag}"] = round(100 - (val.get("utilization") or 0), 1)
-                result[f"quota_7d_{model_tag}_resets_at"] = val.get("resets_at")
+                result[f"quota_outer_{model_tag}"] = round(100 - (val.get("utilization") or 0), 1)
+                result[f"quota_outer_{model_tag}_resets_at"] = val.get("resets_at")
         # extra_usage
         eu = data.get("extra_usage")
         if eu and isinstance(eu, dict) and eu.get("is_enabled"):
@@ -1185,22 +1185,43 @@ async def _passthrough_sanitize(payload, modifications, request, engine, provide
 
 
 # 修改原因：Claude Code 的 extra_usage 可视化属于渠道专属 UI，不能继续由 Channels.tsx 写死计算和样式。
-# 修改方式：在渠道文件中注册 key_background、quota_label、balance_summary 三个内联 JS 插槽。
+# 修改方式：在渠道文件中注册 key_background、quota_display、balance_summary 三个内联 JS 插槽，旧金额脚本常量仅保留给外部兼容。
 # 目的：前端只提供通用挂载点，CC 的额度条、金额标签和余额汇总都随渠道元数据下发。
 CC_KEY_BACKGROUND_UI = """
 export default function render(ctx) {
   const { el, account } = ctx;
-  // 修改原因：只有开启 extra_usage 的 Claude Code 账号才需要背景条。
-  // 修改方式：从账号透传字段读取 limit/used，并兼容旧 monthly limit 字段。
-  // 目的：让背景条宽度和颜色完全由 CC 渠道脚本控制。
-  if (!account?.extra_usage_enabled) { el.style.width = '0%'; el.style.background = 'transparent'; return; }
+  const mode = ctx.context?.mode || ctx.mode || 'row';
+  // 修改原因：Claude Code 背景条同一个脚本会挂载到完整行和机房卡片，机房卡片需要纵向填充才不会遮挡圆环内容。
+  // 修改方式：从 ctx.context.mode 读取布局；rack 模式改为 bottom-up 高度填充，row 模式保持原横向宽度填充。
+  // 目的：保留完整行的横向金额背景，同时让机房卡片中的背景装饰适配小卡片布局。
+  if (!account?.extra_usage_enabled) {
+    el.style.width = mode === 'rack' ? '100%' : '0%';
+    el.style.height = '0%';
+    el.style.background = 'transparent';
+    return;
+  }
   const limit = account.extra_usage_limit ?? account.extra_usage_monthly_limit ?? 0;
   const used = account.extra_usage_used ?? 0;
   const pct = limit > 0 ? Math.max(1, ((limit - used) / limit) * 100) : 0;
   const colors = { green: 'rgba(34,197,94,0.08)', yellow: 'rgba(234,179,8,0.08)', red: 'rgba(239,68,68,0.08)' };
   const color = pct >= 50 ? colors.green : pct >= 20 ? colors.yellow : colors.red;
-  el.style.width = pct + '%';
   el.style.background = color;
+  if (mode === 'rack') {
+    el.style.position = 'absolute';
+    el.style.top = 'auto';
+    el.style.right = '0';
+    el.style.bottom = '0';
+    el.style.left = '0';
+    el.style.width = '100%';
+    el.style.height = pct + '%';
+  } else {
+    el.style.top = '';
+    el.style.right = '';
+    el.style.bottom = '';
+    el.style.left = '';
+    el.style.height = '';
+    el.style.width = pct + '%';
+  }
 }
 """.strip()
 
@@ -1222,34 +1243,67 @@ export default function render(ctx) {
 }
 """.strip()
 
-# 修改原因：Claude Code 默认 quota_display 只能显示百分比，用户无法在 key 行直接识别 Pro、Max 等订阅层级。
-# 修改方式：新增 quota_display 插槽，从账号 context 或 quota raw 中读取 subscription_type，再与最低 quota 百分比组合显示。
-# 目的：让 CC key 行显示 Max 80%、Pro 50% 这类 tier + quota 标签。
+# 修改原因：Claude Code 的 quota_display 需要同时承接订阅层级、quota 百分比和 extra_usage 金额。
+# 修改方式：从 account/data.raw 读取 subscription_type 和标准 quota，从 account 读取 extra_usage，并组合为单个标签。
+# 目的：前端删除独立标签挂载点后仍能在 quota_display 位置显示完整额度信息。
 CC_QUOTA_DISPLAY = """
 export default function render(ctx) {
-    const { el, data, account } = ctx || {};
+    ctx = ctx || {};
+    const { el, data, account } = ctx;
     if (!el) return;
-    
-    // 读 tier — 从 account 或 data.raw
+    const mode = ctx.context?.mode || ctx.mode || 'row';
+
+    // 修改原因：合并后单一 quota_display 同时服务完整行和机房卡片，extra_usage 金额在圆环中心会溢出。
+    // 修改方式：rack 模式只输出百分比或 tier 缩写；row 模式继续组合 tier、百分比和 extra_usage 金额。
+    // 目的：完整行保留 Claude Code 的完整额度信息，机房卡片中心只保留可读的短文本。
     const subType = account?.subscription_type || account?.subscriptionType || data?.raw?.subscription_type || '';
     const tierMap = { 'pro': 'Pro', 'max': 'Max', 'team': 'Team', 'enterprise': 'Enterprise' };
     const tierLabel = tierMap[subType.toLowerCase()] || (subType ? subType.charAt(0).toUpperCase() + subType.slice(1) : '');
-    
-    // 读 quota
-    const q5 = typeof data?.quota_5h === 'number' ? data.quota_5h : null;
-    const q7 = typeof data?.quota_7d === 'number' ? data.quota_7d : null;
+    const shortTierLabel = tierLabel === 'Enterprise' ? 'Ent' : tierLabel;
+    const q5 = typeof data?.quota_inner === 'number' ? data.quota_inner : null;
+    const q7 = typeof data?.quota_outer === 'number' ? data.quota_outer : null;
     const pcts = [q5, q7].filter(v => v != null);
     const minPct = pcts.length ? Math.round(Math.min(...pcts)) : null;
-    
-    if (minPct != null) {
-        const colorCls = minPct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : minPct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
-        el.textContent = tierLabel ? tierLabel + ' ' + minPct + '%' : minPct + '%';
+
+    if (mode === 'rack') {
+        if (minPct != null) {
+            el.style.display = '';
+            el.textContent = minPct + '%';
+            el.removeAttribute('title');
+            const colorCls = minPct >= 50 ? 'text-emerald-600' : minPct >= 20 ? 'text-amber-600' : 'text-red-500';
+            el.className = 'text-[9px] font-bold font-mono leading-none ' + colorCls;
+        } else if (shortTierLabel) {
+            el.style.display = '';
+            el.textContent = shortTierLabel;
+            el.title = tierLabel;
+            el.className = 'text-[8px] font-semibold leading-none text-blue-500 truncate max-w-[50px]';
+        } else {
+            el.textContent = '';
+            el.removeAttribute('title');
+            el.style.display = 'none';
+        }
+        return;
+    }
+
+    const quotaLabel = minPct != null ? (tierLabel ? tierLabel + ' ' + minPct + '%' : minPct + '%') : tierLabel;
+    const limit = account?.extra_usage_enabled ? (account.extra_usage_limit ?? account.extra_usage_monthly_limit ?? 0) : 0;
+    const used = account?.extra_usage_enabled ? (account.extra_usage_used ?? 0) : 0;
+    const remaining = Math.max(0, limit - used);
+    const extraPct = account?.extra_usage_enabled && limit > 0 ? (remaining / limit) * 100 : null;
+    const extraUsageLabel = account?.extra_usage_enabled ? '$' + remaining.toFixed(0) + ' / $' + limit.toFixed(0) : '';
+    const parts = [quotaLabel, extraUsageLabel].filter(Boolean);
+
+    if (parts.length) {
+        const scores = [minPct, extraPct].filter(v => typeof v === 'number');
+        const colorBasis = scores.length ? Math.min(...scores) : null;
+        const colorCls = colorBasis == null ? 'bg-blue-500/15 text-blue-500' : colorBasis >= 50 ? 'bg-emerald-500/15 text-emerald-500' : colorBasis >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+        el.style.display = '';
+        el.textContent = parts.join(' · ');
+        el.title = parts.join(' · ');
         el.className = 'flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-default ' + colorCls;
-    } else if (tierLabel) {
-        el.textContent = tierLabel;
-        el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 relative z-[2] cursor-default';
     } else {
         el.textContent = '';
+        el.removeAttribute('title');
         el.style.display = 'none';
     }
 }
@@ -1296,13 +1350,13 @@ def register():
         stream_adapter=fetch_claude_code_response_stream,
         is_oauth=True,
         # 修改原因：Claude Code 的 extra_usage 背景、金额标签、按钮汇总和订阅 tier 标签都属于渠道专属 UI。
-        # 修改方式：注册 key_background、quota_label、balance_summary 和 quota_display 四个插槽，不注册 key_border。
+        # 修改方式：注册 key_background、balance_summary 和合并后的 quota_display 三个展示插槽，不注册 key_border。
         # 目的：让前端通用挂载点加载 CC 专属脚本，同时继续使用默认 QuotaBorderOverlay 绘制 5h/7d 弧线。
         ui_slots={
             "key_background": CC_KEY_BACKGROUND_UI,
-            "quota_label": CC_QUOTA_LABEL_UI,
             "balance_summary": CC_BALANCE_SUMMARY_UI,
             "quota_display": CC_QUOTA_DISPLAY,
+            "import_placeholder": "sk-ant-oat01-xxxxxxxx...",
         },
         # 修改原因：OAuth provider 注册要从 main.py 硬编码迁移到渠道注册声明。
         # 修改方式：在 Claude Code 渠道定义中直接传入 ClaudeCodeProvider 实例。

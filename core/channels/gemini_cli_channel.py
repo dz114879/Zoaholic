@@ -624,6 +624,9 @@ def register():
         # 修改方式：在渠道注册时直接传入 GeminiCLIProvider 实例，交给 registry 保存。
         # 目的：让 Gemini CLI 与内置、插件 OAuth 渠道共享同一条自动注册路径。
         oauth_provider=GeminiCLIProvider(),
+        ui_slots={
+            "import_placeholder": "1//0xxxxxxxx...",
+        },
         source="builtin",
     )
 

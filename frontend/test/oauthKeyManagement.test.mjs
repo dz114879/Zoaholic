@@ -8,6 +8,10 @@ import { fileURLToPath } from 'node:url';
 // 目的：避免后续维护时把 OAuth 账号管理退回为普通余额条和 sk-* 输入体验。
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const channelsSource = readFileSync(path.resolve(__dirname, '../src/pages/Channels.tsx'), 'utf8');
+// 修改原因：OAuth engine 硬编码集合已经删除，测试仍要确认旧常量没有回归。
+// 修改方式：通过拼接生成旧常量名，避免测试源码本身形成静态引用。
+// 目的：让全项目搜索结果保持干净，同时保留回归保护。
+const oldOAuthEngineSetName = ['OAUTH', 'ENGINES'].join('_');
 
 function sliceBetween(startMarker, endMarker, fromIndex = 0) {
   const start = channelsSource.indexOf(startMarker, fromIndex);
@@ -18,8 +22,8 @@ function sliceBetween(startMarker, endMarker, fromIndex = 0) {
 }
 
 assert.match(channelsSource, /ClipboardPaste, LogIn/, 'Channels.tsx 应该导入 OAuth 导入和登录按钮图标');
-assert.match(channelsSource, /const OAUTH_ENGINES = new Set\(\['codex', 'claude-code', 'antigravity', 'gemini-cli'\]\);/, '应该集中声明 OAuth 类型引擎集合');
-assert.match(channelsSource, /const isOAuthEngine = selectedChannelType\?\.is_oauth \?\? OAUTH_ENGINES\.has\(formData\?\.engine \|\| ''\);/, '编辑面板应该优先从渠道元数据并回退到当前 engine 派生 isOAuthEngine');
+assert.doesNotMatch(channelsSource, new RegExp(oldOAuthEngineSetName), '前端不应再声明 OAuth 类型引擎集合');
+assert.match(channelsSource, /const isOAuthEngine = selectedChannelType\?\.is_oauth \?\? false;/, '编辑面板应该只从渠道元数据派生 isOAuthEngine');
 assert.match(channelsSource, /const \[oauthAccounts, setOauthAccounts\] = useState<Record<string, any>>\(\{\}\);/, '应该保存 OAuth 账号列表');
 assert.match(channelsSource, /const \[importModalIdx, setImportModalIdx\] = useState<number \| null>\(null\);/, '应该保存导入弹窗目标 Key 下标');
 assert.match(channelsSource, /const \[importToken, setImportToken\] = useState\(''\);/, '应该保存待导入 refresh_token');
@@ -28,7 +32,7 @@ assert.match(channelsSource, /const \[importing, setImporting\] = useState\(fals
 const oauthAccountsEffect = sliceBetween('// ── 打开 OAuth 编辑面板时同步账号状态 ──', 'const openModal');
 assert.match(channelsSource, /const refreshOAuthAccounts = useCallback\(async \(\) => \{/, '应该把 OAuth 账号拉取封装为可复用函数');
 assert.match(channelsSource, /apiFetch\(`\/v1\/oauth\/accounts\?provider=\$\{encodeURIComponent\(providerName\)\}`, \{ headers: \{ Authorization: `Bearer \$\{token\}` \} \}\)/, '账号列表请求应该携带当前渠道名和管理员 token');
-assert.match(channelsSource, /setOauthAccounts\(data \|\| \{\}\)/, '账号列表响应应该落入 oauthAccounts');
+assert.match(channelsSource, /setOauthAccounts\(normalizeOAuthAccountStateMap\(data\)\)/, '账号列表响应应该先归一化再落入 oauthAccounts');
 assert.match(oauthAccountsEffect, /if \(isModalOpen && isOAuthEngine\)/, '只应在 OAuth 编辑面板打开时拉取账号列表');
 assert.match(oauthAccountsEffect, /refreshOAuthAccounts\(\);/, '打开 OAuth 编辑面板时应该复用账号刷新函数');
 
@@ -68,20 +72,22 @@ assert.match(manualExchangeBlock, /apiFetch\('\/v1\/oauth\/exchange', \{[\s\S]*m
 assert.match(manualExchangeBlock, /updateKey\(oauthManualState\.idx, data\.key_id \|\| ''\);/, 'manual 交换成功后应该自动填入 key_id');
 assert.match(manualExchangeBlock, /await refreshOAuthAccounts\(\);[\s\S]*setOauthManualState\(null\);[\s\S]*setManualUrl\(''\);/, 'manual 交换成功后应该刷新账号列表并关闭粘贴弹窗');
 
-assert.match(channelsSource, /const QuotaArcs = \(\{ quota5h, quota7d \}: \{ quota5h\?: number; quota7d\?: number \}\) => \{/, '应该提供双弧配额 SVG 组件');
-assert.match(channelsSource, /quota5h == null && quota7d == null/, '双弧组件没有配额时应该不渲染');
-assert.match(channelsSource, /5h: \$\{quota5h \?\? '\?'\}% · 7d: \$\{quota7d \?\? '\?'\}%/, '双弧组件 title 应该同时展示 5h 和 7d');
+assert.match(channelsSource, /function QuotaRings\(\{ gauges, hideText \}: \{ gauges: QuotaGauge\[\]; hideText\?: boolean \}\)/, '应该提供通用 QuotaRings 圆环组件');
+assert.match(channelsSource, /visibleGauges\.length === 0[\s\S]*暂无额度数据/, 'QuotaRings 没有 gauge 时应该渲染空态灰环');
+assert.match(channelsSource, /visibleGauges\.length === 1[\s\S]*RackRingCircle radius=\{25\}/, 'QuotaRings 单 gauge 时应该渲染单环');
+assert.match(channelsSource, /filter\(Boolean\)\.slice\(0, 2\)[\s\S]*RackRingCircle radius=\{26\}[\s\S]*RackRingCircle radius=\{18\}/, 'QuotaRings 两个及以上 gauge 时应该渲染双环并只取前两个');
 
-const keyRows = sliceBetween('{formData.api_keys.map((keyObj, idx) => {', '{formData.api_keys.length === 0');
+const keyRows = sliceBetween('const renderFullKeyRow =', '\n  };\n\n  return (', channelsSource.indexOf('const renderFullKeyRow ='));
 assert.match(keyRows, /const oauthAccount = oauthAccounts\[keyObj\.key\];/, 'Key 行应该按 key_id 查找 OAuth 账号');
-assert.match(keyRows, /const oauthQuota = getOAuthQuota\(oauthAccount, formData\.engine\);/, 'Key 行应该按当前 engine 归一化 OAuth 配额字段');
-assert.match(keyRows, /!isOAuthEngine && !isFocused && balColor && balPct != null/, '普通余额进度条不应该覆盖 OAuth 专属行');
+assert.match(keyRows, /const rowQuota = buildRowQuota\(bal, oauthAccount, isOAuthEngine\);/, 'Key 行应该把 OAuth quota 和普通 balance quota 统一为 RowQuota');
+assert.match(keyRows, /const rowQuotaPair = getQuotaPairFromGauges\(rowQuota\.gauges\);/, 'Key 行应该从 gauges 派生默认双弧边框数据');
+assert.match(keyRows, /!hasKeyBackgroundSlot && !isFocused && balColor && balPct != null/, '默认余额进度条不应该覆盖自定义背景');
 assert.match(keyRows, /placeholder=\{isOAuthEngine \? "邮箱或标识符" : "sk-\.\.\."\}/, 'OAuth Key 输入框 placeholder 应该改为邮箱或标识符');
 assert.match(keyRows, /isOAuthEngine && !keyObj\.key[\s\S]*openImportModal\(idx\)[\s\S]*<ClipboardPaste className="w-3 h-3" \/> 导入/, 'OAuth 空条目应该显示导入按钮');
 assert.match(keyRows, /isOAuthEngine && !keyObj\.key[\s\S]*startOAuthLogin\(idx\)[\s\S]*<LogIn className="w-3 h-3" \/> 登录/, 'OAuth 空条目应该显示登录按钮');
-assert.match(keyRows, /isOAuthEngine && !isFocused && oauthQuota[\s\S]*<QuotaArcs quota5h=\{oauthQuota\.quota_5h\} quota7d=\{oauthQuota\.quota_7d\} \/>/, 'OAuth 已有账号应该显示双弧配额');
-assert.match(keyRows, /isOAuthEngine && !isFocused && oauthAccount && !oauthQuota[\s\S]*已连接[\s\S]*刷新失败[\s\S]*冷却中/, 'OAuth 无配额账号应该显示连接状态标签');
-assert.match(keyRows, /!isOAuthEngine && !isFocused && balLabel/, '普通余额标签不应该显示在 OAuth 行上');
+assert.match(keyRows, /showRowDecorations && rowQuotaHasValues[\s\S]*<QuotaRings gauges=\{rowQuota\.gauges\} \/>/, '已有标准 gauges 的账号或普通 Key 应显示通用圆环');
+assert.match(keyRows, /isOAuthEngine && !isFocused && oauthAccount && !rowQuotaHasValues[\s\S]*已连接[\s\S]*刷新失败[\s\S]*冷却中/, 'OAuth 无配额账号应该显示连接状态标签');
+assert.doesNotMatch(keyRows, /const balLabel|const tierLabel|<QuotaArcs/, 'Key 行不应该保留旧余额标签或 QuotaArcs 展示路径');
 
 // 修改原因：OAuth 弹窗已经迁移到 document.body portal，旧的编辑抽屉前置位置断言会误判。
 // 修改方式：分别截取导入弹窗和手动粘贴弹窗的 createPortal 代码段做断言。
@@ -90,8 +96,8 @@ const importModalSource = sliceBetween('{importModalIdx !== null && createPortal
 const manualModalSource = sliceBetween('{oauthManualState !== null && createPortal(', 'document.body', channelsSource.indexOf('{oauthManualState !== null && createPortal('));
 assert.match(importModalSource, /tabIndex=\{-1\}/, '导入弹窗的 portal 遮罩应该允许焦点回退');
 assert.match(importModalSource, /导入 Refresh Token/, '页面应该渲染导入 Refresh Token 弹窗');
-assert.match(importModalSource, /从 CLIProxyAPI 配置或本地 OAuth 文件中复制 refresh_token 粘贴到下方/, '导入弹窗应该说明 token 来源');
-assert.match(importModalSource, /placeholder="rt_xxxxxxxx\.\.\."/, '导入弹窗应该提供 refresh_token 示例 placeholder');
+assert.match(importModalSource, /粘贴 refresh_token 到下方/, '导入弹窗应该说明粘贴 refresh_token');
+assert.match(importModalSource, /placeholder=\{importPlaceholder\}/, '导入弹窗应该使用渠道元数据提供的 refresh_token placeholder');
 assert.match(importModalSource, /disabled=\{!importToken\.trim\(\) \|\| importing\}/, '导入按钮应该在空 token 或请求中禁用');
 assert.match(manualModalSource, /tabIndex=\{-1\}/, '手动粘贴弹窗的 portal 遮罩应该允许焦点回退');
 assert.match(manualModalSource, /完成 OAuth 登录/, '页面应该渲染手动完成 OAuth 登录弹窗');

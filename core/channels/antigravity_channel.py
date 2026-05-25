@@ -375,7 +375,7 @@ class AntigravityProvider(OAuthProvider):
             return None
 
         # 修改原因：Antigravity 前端把上弧定义为 Gemini 组最低值、下弧定义为 Claude/GPT 外部模型组最低值。
-        # 修改方式：优先从 raw.modelQuotas 按 provider 计算 quota_5h/quota_7d；无法识别 provider 时再回退到旧的全模型最低值。
+        # 修改方式：优先从 raw.modelQuotas 按 provider 计算 quota_inner/quota_outer；无法识别 provider 时再回退到旧的全模型最低值。
         # 目的：/v1/channels/balance、OAuth 缓存和管理端 Key 行使用同一套分组语义。
         quota_result: dict[str, Any] = {"raw": raw}
         provider_quota = _compute_antigravity_provider_quota_percentages(raw.get("modelQuotas", []))
@@ -389,8 +389,8 @@ class AntigravityProvider(OAuthProvider):
             ]
             if fractions:
                 min_pct = min(fractions) * 100.0
-                quota_result["quota_5h"] = min_pct
-                quota_result["quota_7d"] = min_pct
+                quota_result["quota_inner"] = min_pct
+                quota_result["quota_outer"] = min_pct
             else:
                 # fallback: 从 credits 提取
                 credits_list = raw.get("availableCredits")
@@ -401,8 +401,8 @@ class AntigravityProvider(OAuthProvider):
                         try:
                             amount = float(credit.get("creditAmount", 0))
                             if amount > 0:
-                                quota_result["quota_5h"] = min(amount / 10.0, 100.0)
-                                quota_result["quota_7d"] = quota_result["quota_5h"]
+                                quota_result["quota_inner"] = min(amount / 10.0, 100.0)
+                                quota_result["quota_outer"] = quota_result["quota_inner"]
                                 break
                         except (TypeError, ValueError):
                             continue
@@ -743,7 +743,7 @@ def _coerce_remaining_fraction(value: Any) -> float | None:
     """把 remainingFraction 清洗为 0 到 1 之间的浮点数。"""
     # 修改原因：fetchAvailableModels 的 remainingFraction 可能来自 JSON 数字，也可能经过反代或缓存后变成字符串。
     # 修改方式：统一尝试转 float，非法值返回 None，合法值裁剪到 0..1。
-    # 目的：后端兼容 quota_5h/quota_7d 计算，前端 QUOTA_UI 也能收到稳定 number。
+    # 目的：后端兼容 quota_inner/quota_outer 计算，前端 QUOTA_UI 也能收到稳定 number。
     if value is None or value == "":
         return None
     try:
@@ -779,7 +779,7 @@ def _classify_antigravity_quota_provider(model_quota: dict[str, Any]) -> str | N
 def _compute_antigravity_provider_quota_percentages(model_quotas: Any) -> dict[str, float]:
     """按 Gemini 与外部模型 provider 计算 Antigravity 上下弧百分比。"""
     # 修改原因：旧实现把所有模型 remainingFraction 取一个最低值，无法让前端复用 QuotaBorderOverlay 分别绘制 Gemini 和 External。
-    # 修改方式：过滤 tab_*、chat_* 后按 provider 归类，Gemini 最低值写入 quota_5h，Claude/GPT 最低值写入 quota_7d。
+    # 修改方式：过滤 tab_*、chat_* 后按 provider 归类，Gemini 最低值写入 quota_inner，Claude/GPT 最低值写入 quota_outer。
     # 目的：balance 接口、OAuth 缓存和前端标签使用一致的数据语义。
     if not isinstance(model_quotas, list):
         return {}
@@ -796,9 +796,9 @@ def _compute_antigravity_provider_quota_percentages(model_quotas: Any) -> dict[s
         grouped[provider_kind].append(fraction)
     result: dict[str, float] = {}
     if grouped["gemini"]:
-        result["quota_5h"] = min(grouped["gemini"]) * 100.0
+        result["quota_inner"] = min(grouped["gemini"]) * 100.0
     if grouped["external"]:
-        result["quota_7d"] = min(grouped["external"]) * 100.0
+        result["quota_outer"] = min(grouped["external"]) * 100.0
     return result
 
 
@@ -1344,17 +1344,19 @@ async def fetch_antigravity_response_stream(client, url, headers, payload, model
 # 目的：key 行显示最低 quota，点击展开按模型组的额度列表。
 QUOTA_UI = """
 export default function render(ctx) {
-    const { el, data } = ctx || {};
+    ctx = ctx || {};
+    const { el, data } = ctx;
     if (!el) return;
+    const mode = ctx.context?.mode || ctx.mode || 'row';
     const raw = data?.raw || {};
-    // 修改原因：Antigravity 的边框弧已由 React QuotaBorderOverlay 负责，Blob 插槽只应该提供标签和点击详情。
-    // 修改方式：脚本只读取 raw.modelQuotas，回写 data.quota_5h/quota_7d，并用纯 DOM 在点击时创建 tooltip。
-    // 目的：让上下边框复用现有组件，同时保留 CPA shared quota group 的明细查看能力。
+    // 修改原因：Antigravity quota_display 同时挂载到完整行和机房卡片，机房卡片不能再通过 DOM 宽度猜测布局。
+    // 修改方式：脚本读取 ctx.context.mode；rack 模式只输出短百分比或 tier 缩写，row 模式保留完整标签和点击详情。
+    // 目的：让上下边框复用现有组件，同时避免圆环中心显示长 tier 或 credits 金额而溢出。
     const modelQuotas = Array.isArray(raw?.modelQuotas) ? raw.modelQuotas : [];
     const credits = Array.isArray(raw?.availableCredits) ? raw.availableCredits : [];
     const paidTier = raw?.paidTier;
-    const initialQuota5h = typeof data?.quota_5h === 'number' && Number.isFinite(data.quota_5h) ? data.quota_5h : undefined;
-    const initialQuota7d = typeof data?.quota_7d === 'number' && Number.isFinite(data.quota_7d) ? data.quota_7d : undefined;
+    const initialQuota5h = typeof data?.quota_inner === 'number' && Number.isFinite(data.quota_inner) ? data.quota_inner : undefined;
+    const initialQuota7d = typeof data?.quota_outer === 'number' && Number.isFinite(data.quota_outer) ? data.quota_outer : undefined;
 
     const normalizeFraction = value => {
         if (value == null || value === '') return null;
@@ -1379,6 +1381,7 @@ export default function render(ctx) {
         return null;
     };
     const colorOf = pct => pct >= 50 ? 'bg-emerald-500/15 text-emerald-500' : pct >= 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+    const textColorOf = pct => pct >= 50 ? 'text-emerald-600' : pct >= 20 ? 'text-amber-600' : 'text-red-500';
     const strokeColorOf = pct => pct >= 50 ? '#10b981' : pct >= 20 ? '#f59e0b' : '#ef4444';
     const shortProviderName = providerKind => providerKind === 'external' ? 'Claude + GPT' : 'Gemini';
     const prettyModelName = model => {
@@ -1452,35 +1455,63 @@ export default function render(ctx) {
     const externalPcts = filteredQuotas.filter(modelQuota => providerKindOf(modelQuota) === 'external').map(modelQuota => percentFromFraction(modelQuota?.remainingFraction)).filter(value => value != null);
     const geminiPct = geminiPcts.length ? Math.min(...geminiPcts) : undefined;
     const externalPct = externalPcts.length ? Math.min(...externalPcts) : undefined;
-    if (geminiPct != null) data.quota_5h = geminiPct;
-    if (externalPct != null) data.quota_7d = externalPct;
+    if (geminiPct != null) data.quota_inner = geminiPct;
+    if (externalPct != null) data.quota_outer = externalPct;
 
     const fallbackPcts = [geminiPct, externalPct, initialQuota5h, initialQuota7d].filter(value => typeof value === 'number' && Number.isFinite(value));
     const minPct = fallbackPcts.length ? Math.round(Math.min(...fallbackPcts)) : null;
-    const compactWidth = el.offsetWidth || el.parentElement?.offsetWidth || 0;
-    const isCompact = compactWidth > 0 && compactWidth < 100;
+    // 修改原因：Python 三引号字符串会解析反斜杠，JavaScript 正则中的 \\s 必须在源码中写成双反斜杠。
+    // 修改方式：tier 清洗正则统一使用 \\s，运行到浏览器后仍按空白字符匹配。
+    // 目的：消除 py_compile 的无效转义告警，并保持 tier 名称清洗行为不变。
     const tierName = paidTier?.name
-        ? String(paidTier.name).replace(/Google\s*(AI\s*)?/i, '').replace(/Gemini Code Assist in /i, '').trim()
+        ? String(paidTier.name).replace(/Google\\s*(AI\\s*)?/i, '').replace(/Gemini Code Assist in /i, '').trim()
         : '';
-    if (isCompact) {
-        // 小容器（机房卡片）：简化文字，但继续注册 tooltip
-        if (typeof el.__antigravityQuotaCleanup === 'function') {
-            el.__antigravityQuotaCleanup();
+    const shortTierName = value => {
+        const cleaned = String(value || '').replace(/Google One /i, '').replace(/Google\\s*(AI\\s*)?/i, '').replace(/Gemini Code Assist in /i, '').trim();
+        if (!cleaned) return '';
+        const mapped = { 'Standard': 'Std', 'Enterprise': 'Ent', 'Professional': 'Pro' }[cleaned];
+        return mapped || (cleaned.length > 6 ? cleaned.slice(0, 6) : cleaned);
+    };
+    if (mode === 'rack') {
+        // 修改原因：机房卡片圆环中心空间很小，Antigravity 的 tier 和 credits 金额都可能溢出。
+        // 修改方式：rack 模式优先只显示最低百分比；没有百分比时才显示 tier 缩写，并且不渲染 credits 金额。
+        // 目的：保持圆环中心可读，同时让完整行继续展示完整 quota 和 credits 信息。
+        const rackTier = shortTierName(tierName || paidTier?.name || '');
+        if (minPct != null) {
+            el.style.display = '';
+            el.textContent = `${minPct}%`;
+            el.removeAttribute('title');
+            el.className = `text-[9px] font-bold font-mono leading-none cursor-pointer ${textColorOf(minPct)}`;
+        } else if (rackTier) {
+            el.style.display = '';
+            el.textContent = rackTier;
+            el.title = tierName || String(paidTier?.name || '');
+            el.className = 'text-[8px] font-semibold leading-none text-blue-500 truncate max-w-[50px] cursor-pointer';
+        } else {
+            el.textContent = '';
+            el.removeAttribute('title');
+            el.style.display = 'none';
+            if (typeof el.__antigravityQuotaCleanup === 'function') {
+                el.__antigravityQuotaCleanup();
+            }
+            return;
         }
-        el.textContent = minPct != null ? (tierName ? `${tierName} ${minPct}%` : `${minPct}%`) : (tierName || '—');
-        el.className = `text-[9px] font-semibold font-mono leading-none cursor-pointer ${minPct != null ? colorOf(minPct) : 'text-foreground'}`;
     } else if (minPct != null) {
+        el.style.display = '';
         el.textContent = tierName ? `${tierName} ${minPct}%` : `${minPct}%`;
         el.className = `flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-pointer ${colorOf(minPct)}`;
     } else if (paidTier?.name) {
+        el.style.display = '';
         el.textContent = String(paidTier.name).replace(/Gemini Code Assist in /i, '').replace(/Google One /i, '');
         el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 relative z-[2] cursor-pointer';
     } else if (credits.length) {
         const amount = Number.parseFloat(credits[0]?.creditAmount || 0);
         const displayAmount = Number.isFinite(amount) ? (amount >= 1000 ? `${(amount / 1000).toFixed(1)}k` : amount.toFixed(0)) : '0';
+        el.style.display = '';
         el.textContent = `${displayAmount} cr`;
         el.className = `flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-pointer ${colorOf(amount >= 500 ? 80 : amount >= 100 ? 30 : 5)}`;
     } else {
+        el.style.display = '';
         el.textContent = 'N/A';
         el.className = 'flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-muted text-muted-foreground relative z-[2] cursor-default';
         // 修改原因：如果额度数据消失，旧 tooltip 不能继续悬挂在 document.body 中。
@@ -1635,7 +1666,7 @@ export default function render(ctx) {
 """.strip()
 
 
-# 修改原因：QuotaBorderOverlay 读取 OAuth 缓存中的 quota_5h/quota_7d，可能落后于 QUOTA_UI 从 raw.modelQuotas 算出的实时百分比。
+# 修改原因：QuotaBorderOverlay 读取 OAuth 缓存中的 quota_inner/quota_outer，可能落后于 QUOTA_UI 从 raw.modelQuotas 算出的实时百分比。
 # 修改方式：新增 key_border 插槽脚本，直接从 data.raw.modelQuotas 分组计算 Gemini 与 External 最低额度，并在插槽 div 内绘制 SVG 上下弧。
 # 目的：让 Antigravity Key 行的边框弧和额度气泡使用同一个实时数据源，避免上弧或下弧停留在 100%。
 AG_KEY_BORDER_UI = """
@@ -1688,8 +1719,8 @@ export default function render(ctx) {
         if (kind === 'external') externalMin = externalMin == null ? pct : Math.min(externalMin, pct);
     }
 
-    const q5 = normalizePercent(geminiMin ?? data?.quota_5h);
-    const q7 = normalizePercent(externalMin ?? data?.quota_7d);
+    const q5 = normalizePercent(geminiMin ?? data?.quota_inner);
+    const q7 = normalizePercent(externalMin ?? data?.quota_outer);
     if (q5 == null && q7 == null) return;
 
     const buildTopHalfPath = (x, y, bw, bh, r) => {
@@ -1875,6 +1906,7 @@ def register():
         ui_slots={
             "quota_display": QUOTA_UI,
             "override_hint": AG_OVERRIDE_HINT,
+            "import_placeholder": "1//0xxxxxxxx...",
         },
         source="builtin",
     )

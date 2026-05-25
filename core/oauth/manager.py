@@ -38,6 +38,31 @@ class OAuthManager:
         self._quota_persisted_generation = 0
         self._quota_persist_handle = None
         self._quota_flush_delay = 30
+        # 修改原因：渠道注册表现在支持在 register_channel 时声明 oauth_provider，manager 初始化后应立即接入该机制。
+        # 修改方式：安装一个 registry 回调，并要求重放已有渠道，处理 manager 创建前已经完成的渠道注册。
+        # 目的：让 OAuth provider 注册从 main.py 硬编码扫描迁移到渠道注册表自动同步，同时保留旧兜底逻辑。
+        self._install_channel_oauth_registrar()
+
+    def _install_channel_oauth_registrar(self) -> None:
+        """把当前 OAuthManager 接入渠道注册表的自动注册回调。"""
+        # 修改原因：直接在模块顶部导入渠道注册表会增加 OAuth 子模块与 channels 子模块的循环导入风险。
+        # 修改方式：在实例初始化阶段做局部导入，只获取轻量的回调安装函数。
+        # 目的：让 OAuthManager 生命周期内持续接收渠道 oauth_provider 注册事件。
+        from core.channels.registry import set_oauth_provider_registrar
+
+        set_oauth_provider_registrar(self._register_channel_oauth_provider, replay_existing=True)
+
+    def _register_channel_oauth_provider(self, channel_id: str, provider) -> None:
+        """注册由 ChannelDefinition.oauth_provider 声明的 provider。"""
+        # 修改原因：部分 provider 需要反向持有 OAuthManager，才能在响应处理或额度更新时访问 manager 能力。
+        # 修改方式：若 provider 暴露 set_oauth_manager，则在注册到 provider 表前先注入当前 manager。
+        # 目的：让渠道声明式 provider 与旧的手工 register_oauth_provider 行为保持一致。
+        if provider is None:
+            return
+        bind_oauth_manager = getattr(provider, "set_oauth_manager", None)
+        if callable(bind_oauth_manager):
+            bind_oauth_manager(self)
+        self.register_provider(channel_id, provider)
 
     def register_provider(self, type_name: str, provider):
         """注册 OAuth provider。渠道 register() 或插件 setup() 中调用。"""
@@ -394,15 +419,15 @@ class OAuthManager:
     def _get_cached_quota(self, cred: dict) -> dict | None:
         """从 oauth_state 凭据中读取已缓存 quota。"""
         # 修改原因：Codex 普通响应会被动写入 quota，前端按需查询时应优先使用缓存而不是再消耗一次上游请求。
-        # 修改方式：只读取顶层 quota_5h、quota_7d 和 quota_raw，并把 quota_raw 映射回接口返回的 raw 字段。
+        # 修改方式：只读取顶层 quota_inner、quota_outer 和 quota_raw，并把 quota_raw 映射回接口返回的 raw 字段。
         # 目的：保持 list_accounts 可直接展示百分比，同时让 /quota 返回结构与主动查询一致。
         if not isinstance(cred, dict):
             return None
         result = {}
-        if cred.get("quota_5h") is not None:
-            result["quota_5h"] = cred.get("quota_5h")
-        if cred.get("quota_7d") is not None:
-            result["quota_7d"] = cred.get("quota_7d")
+        if cred.get("quota_inner") is not None:
+            result["quota_inner"] = cred.get("quota_inner")
+        if cred.get("quota_outer") is not None:
+            result["quota_outer"] = cred.get("quota_outer")
         if isinstance(cred.get("quota_raw"), dict):
             result["raw"] = cred.get("quota_raw")
         # extra_usage 字段（如 Claude Code 额外消费额度）
@@ -462,7 +487,7 @@ class OAuthManager:
             return False
 
         changed = False
-        for field in ("quota_5h", "quota_7d"):
+        for field in ("quota_inner", "quota_outer"):
             if field in quota_data and quota_data.get(field) is not None:
                 if cred.get(field) != quota_data.get(field):
                     cred[field] = quota_data.get(field)
@@ -544,6 +569,26 @@ class OAuthManager:
         if old_lock_key in self._locks:
             self._locks[new_lock_key] = self._locks.pop(old_lock_key)
         await self._persist()
+
+    async def copy_channel_state(self, source_channel_id: str, target_channel_id: str):
+        """复制一个渠道的所有 OAuth 账号 state 到另一个渠道。"""
+        # 修改原因：复制 OAuth 渠道时 api.yaml 会复制账号 key，但新 provider 下没有 token state，运行时会查不到 access_token。
+        # 修改方式：读取源渠道账号，按 key_id 深拷贝到目标渠道；目标已有同名账号时保留目标现有凭据。
+        # 目的：让复制出的 OAuth 渠道保存后可以立即使用同一批账号凭据，同时避免覆盖用户已导入的新渠道账号。
+        import copy
+
+        source_accounts = self._get_channel_accounts(source_channel_id)
+        if not source_accounts:
+            return
+        target_accounts = self._get_channel_accounts(target_channel_id, create=True)
+        changed = False
+        for key_id, cred in source_accounts.items():
+            if key_id in target_accounts:
+                continue
+            target_accounts[key_id] = copy.deepcopy(cred)
+            changed = True
+        if changed:
+            await self._persist()
 
     def _copy_account(self, cred: dict, include_tokens: bool) -> dict:
         """复制账号对象，并按调用场景决定是否脱敏 token。"""
