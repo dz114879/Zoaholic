@@ -391,10 +391,11 @@ def _register_oauth_providers_from_registry(oauth_manager) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 禁用 gen2 自动 GC — gen2 遍历所有存活对象会 stop-the-world 20~30s
-    # gen0/gen1 保持正常回收短期循环引用，凌晨定时任务手动 gc.collect() 回收 gen2
-    gc.set_threshold(700, 10, 0)
-    logger.info(f"[GC] Disabled gen2 auto-collect, thresholds={gc.get_threshold()}")
+    # gen2 GC 调优：降低触发频率但不完全禁用
+    # 默认 (700,10,10) 导致 gen2 频繁触发 stop-the-world 20~30s
+    # 改为 (700,50,50)：gen2 触发频率降 5 倍，减少卡顿但仍能回收循环引用
+    gc.set_threshold(700, 50, 50)
+    logger.info(f"[GC] Tuned thresholds={gc.get_threshold()}")
 
     # 启动时的代码
     # 设置各模块的调试模式
@@ -635,27 +636,67 @@ async def lifespan(app: FastAPI):
 
     asyncio.get_running_loop().create_task(daily_maintenance())
 
-    async def gc_maintenance():
-        """凌晨 4 点手动执行 gen2 GC，回收禁用自动 gen2 后积累的循环引用"""
-        while True:
-            now = datetime.now(timezone(timedelta(hours=8)))  # CST
-            tomorrow_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
-            if tomorrow_4am <= now:
-                tomorrow_4am += timedelta(days=1)
-            await asyncio.sleep((tomorrow_4am - now).total_seconds())
-            try:
-                before = gc.get_count()
-                collected = gc.collect()  # full gen2 collect
-                after = gc.get_count()
-                logger.info(f"[gc_maintenance] gen2 collect done: freed {collected} objects, counts {before} -> {after}")
-            except Exception as e:
-                logger.warning(f"[gc_maintenance] gc.collect() failed: {e}")
+    # 定期 malloc_trim：强制 glibc 归还 free 了但没还给 OS 的内存
+    # Python 大字符串（请求/响应体）释放后 pymalloc 标记为可用但 RSS 不降，
+    # malloc_trim(0) 让 glibc 把空闲页还给 OS，降低 RSS
+    try:
+        import ctypes
+        _libc = ctypes.CDLL("libc.so.6")
+        _has_malloc_trim = hasattr(_libc, 'malloc_trim')
+    except Exception:
+        _libc = None
+        _has_malloc_trim = False
 
-    asyncio.get_running_loop().create_task(gc_maintenance())
+    async def memory_maintenance():
+        """每 5 分钟 malloc_trim + 凌晨 4 点 gen2 GC"""
+        tick = 0
+        while True:
+            await asyncio.sleep(300)  # 5 分钟
+            tick += 1
+
+            # malloc_trim 每轮都做
+            if _has_malloc_trim:
+                try:
+                    _libc.malloc_trim(0)
+                    if tick % 12 == 1:  # 每小时日志一次
+                        logger.info("[memory_maintenance] malloc_trim(0) executed")
+                except Exception as e:
+                    logger.warning(f"[memory_maintenance] malloc_trim failed: {e}")
+
+            # 凌晨 4 点做一次 gen2 GC
+            now = datetime.now(timezone(timedelta(hours=8)))  # CST
+            if now.hour == 4 and now.minute < 5:
+                try:
+                    before = gc.get_count()
+                    collected = gc.collect()
+                    after = gc.get_count()
+                    logger.info(f"[memory_maintenance] gen2 collect done: freed {collected} objects, counts {before} -> {after}")
+                    if _has_malloc_trim:
+                        _libc.malloc_trim(0)
+                except Exception as e:
+                    logger.warning(f"[memory_maintenance] gc.collect() failed: {e}")
+
+    asyncio.get_running_loop().create_task(memory_maintenance())
+
+    # 启动完成，删除热重载标记文件（通知 monitor 服务已恢复）
+    _reload_marker = os.path.join(os.path.dirname(__file__), 'data', '.reloading')
+    try:
+        os.remove(_reload_marker)
+    except FileNotFoundError:
+        pass
 
     app.state.startup_completed = True
     yield
     # 关闭时的代码
+    # 写热重载标记文件（通知 monitor 跳过检查）
+    try:
+        os.makedirs(os.path.dirname(_reload_marker), exist_ok=True)
+        with open(_reload_marker, 'w') as f:
+            f.write(str(os.getpid()))
+        logger.info("[lifespan] Wrote .reloading marker for health monitor")
+    except Exception:
+        pass
+
     # 取消清理任务
     if cleanup_task:
         cleanup_task.cancel()

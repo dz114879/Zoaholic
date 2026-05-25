@@ -27,7 +27,7 @@ from starlette.types import ASGIApp, Receive, Send, Scope, Message
 from core.log_config import logger
 from core.models import ModerationRequest, UnifiedRequest
 from core.metrics import on_request_start, on_request_end
-from core.stats import update_stats
+from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from core.error_response import openai_error_response
 from utils import safe_get
@@ -427,7 +427,10 @@ class StatsMiddleware:
                                 current_info["process_time"] = process_time
                                 current_info["is_flagged"] = is_flagged
                                 current_info["text"] = moderated_content
-                                await update_stats(current_info, app=app)
+                                # 修改原因：直接 await update_stats 会在 SQLite 单写信号量前堆积请求协程。
+                                # 修改方式：改为同步入队，由 core.stats 的常驻 consumer 批量写入 request_stats。
+                                # 目的：在道德审查拦截路径也避免协程积压，同时保留完整请求统计。
+                                enqueue_stats(current_info, app=app)
                                 response = openai_error_response("Content did not pass the moral check, please modify and try again.", 400)
                                 await response(scope, receive_wrapper, send)
                                 return

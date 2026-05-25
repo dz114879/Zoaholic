@@ -10,6 +10,7 @@
 """
 
 import asyncio
+from collections import deque
 
 from core.env import env_bool
 from asyncio import Semaphore
@@ -28,6 +29,15 @@ from core.d1_client import format_d1_datetime
 # SQLite 写入重试配置
 SQLITE_MAX_RETRIES = 3
 SQLITE_RETRY_DELAY = 0.5  # 初始重试延迟（秒）
+
+# 修改原因：请求结束路径直接 await update_stats 会在 SQLite 单写信号量前堆积大量协程。
+# 修改方式：把 request_stats 写入改为固定长度 deque 缓冲，由单个常驻 consumer 批量写入。
+# 目的：限制后台统计写入的协程数量，避免请求高峰或 database locked 重试导致内存持续增长。
+_stats_buffer: deque = deque(maxlen=10000)
+_stats_consumer_started = False
+_stats_flush_event: asyncio.Event | None = None
+_STATS_BATCH_SIZE = 20
+_STATS_FLUSH_INTERVAL = 2.0
 
 # Prompt Caching 新增列需要在各数据库的简易迁移中显式带 DEFAULT 0，避免旧表新增列后出现 NULL。
 PROMPT_CACHE_STAT_COLUMNS = {"cached_tokens", "cache_creation_tokens"}
@@ -617,6 +627,178 @@ async def _query_token_usage_d1(
 
 # ============== 统计写入 ==============
 
+
+def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> None:
+    """将请求统计放入 buffer，由常驻 consumer 批量写入。"""
+    # 修改原因：请求路径不能再直接等待 SQLite 写入，否则会在 db_semaphore 前堆积协程并阻塞事件循环。
+    # 修改方式：同步计算价格后只保存 current_info.copy() 快照，再启动或唤醒唯一的后台 consumer。
+    # 目的：让请求结束路径保持轻量，同时防止调用方后续修改 current_info 影响待写入统计。
+    if DISABLE_DATABASE:
+        return
+
+    try:
+        if current_info.get("success") and current_info.get("model"):
+            if get_model_prices_func:
+                prompt_price, completion_price = get_model_prices_func(current_info["model"])
+            elif app:
+                prompt_price, completion_price = get_current_model_prices(
+                    app, current_info["model"], provider_name=current_info.get("provider"))
+            else:
+                prompt_price, completion_price = 0.0, 0.0
+            current_info["prompt_price"] = prompt_price
+            current_info["completion_price"] = completion_price
+    except Exception:
+        pass
+
+    _stats_buffer.append((current_info.copy(), app))
+    _ensure_stats_consumer_started()
+    if len(_stats_buffer) >= _STATS_BATCH_SIZE and _stats_flush_event is not None:
+        _stats_flush_event.set()
+
+
+def _ensure_stats_consumer_started() -> None:
+    """确保 request stats 常驻 consumer 已经启动。"""
+    global _stats_consumer_started, _stats_flush_event
+    # 修改原因：enqueue_stats 是同步入口，不能 await 后台任务，也不能为每条统计创建一个 task。
+    # 修改方式：在当前事件循环上创建一个常驻 consumer，并复用同一个 asyncio.Event 作为批量唤醒信号。
+    # 目的：保持请求路径无等待，且在启动或关闭阶段没有 running loop 时安全返回。
+    if _stats_consumer_started:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _stats_flush_event = asyncio.Event()
+    loop.create_task(_stats_consumer())
+    _stats_consumer_started = True
+
+
+async def _stats_consumer() -> None:
+    """常驻后台任务：每 2 秒或攒满 20 条时批量写入 request_stats。"""
+    global _stats_consumer_started, _stats_flush_event
+    # 修改原因：SQLite 写入需要串行化，逐请求协程在锁等待时会造成内存和事件循环压力。
+    # 修改方式：consumer 按固定批量从 deque 取出请求统计，并调用 _batch_write_stats 在一个事务内写入。
+    # 目的：把后台协程数量固定为一个，减少事务次数，并在任务取消时尽量 flush 剩余统计。
+    try:
+        while True:
+            try:
+                if _stats_flush_event is None:
+                    await asyncio.sleep(_STATS_FLUSH_INTERVAL)
+                else:
+                    await asyncio.wait_for(
+                        _stats_flush_event.wait(),
+                        timeout=_STATS_FLUSH_INTERVAL,
+                    )
+                    _stats_flush_event.clear()
+            except asyncio.TimeoutError:
+                pass
+
+            if not _stats_buffer:
+                continue
+
+            batch = []
+            while _stats_buffer and len(batch) < _STATS_BATCH_SIZE:
+                batch.append(_stats_buffer.popleft())
+
+            await _batch_write_stats(batch)
+    except asyncio.CancelledError:
+        while _stats_buffer:
+            batch = []
+            while _stats_buffer and len(batch) < _STATS_BATCH_SIZE:
+                batch.append(_stats_buffer.popleft())
+            try:
+                await _batch_write_stats(batch)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Stats consumer crashed: {e}")
+    finally:
+        _stats_consumer_started = False
+        _stats_flush_event = None
+
+
+async def _batch_write_stats(batch: list) -> None:
+    """批量写入 request_stats，一个事务多条 INSERT。"""
+    # 修改原因：逐条调用 update_stats 会让 SQLite 每条请求统计都开启一次事务，锁等待时会放大后台积压。
+    # 修改方式：consumer 传入一批 current_info 快照，SQLAlchemy 路径用一个 session 事务，D1 路径在同一信号量内逐条写入。
+    # 目的：减少事务数量、fsync 次数和信号量等待协程数量，同时保持 request_stats 表结构和字段清洗规则不变。
+    if not batch:
+        return
+
+    for attempt in range(SQLITE_MAX_RETRIES):
+        try:
+            if (DB_TYPE or "sqlite").lower() == "d1":
+                from db import d1_client
+                if d1_client is None:
+                    return
+                async with db_semaphore:
+                    for current_info, app in batch:
+                        columns = [column.key for column in RequestStat.__table__.columns]
+                        filtered_info = {k: v for k, v in current_info.items() if k in columns}
+                        for key, value in list(filtered_info.items()):
+                            if isinstance(value, str):
+                                filtered_info[key] = value.replace('\x00', '')
+                            elif isinstance(value, bool):
+                                filtered_info[key] = 1 if value else 0
+                            elif isinstance(value, datetime):
+                                filtered_info[key] = format_d1_datetime(value)
+
+                        insert_cols = [k for k in filtered_info.keys() if k != "id"]
+                        placeholders = ", ".join(["?" for _ in insert_cols])
+                        sql = (
+                            f"INSERT INTO request_stats ({', '.join(insert_cols)}) "
+                            f"VALUES ({placeholders})"
+                        )
+                        params = [filtered_info[k] for k in insert_cols]
+                        await d1_client.execute(sql, params)
+
+                for current_info, app in batch:
+                    check_key = current_info.get("api_key")
+                    if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
+                        if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
+                            await update_paid_api_keys_states(app, check_key)
+                return
+
+            async with db_semaphore:
+                async with async_session_scope() as session:
+                    async with session.begin():
+                        for current_info, app in batch:
+                            columns = [column.key for column in RequestStat.__table__.columns]
+                            filtered_info = {k: v for k, v in current_info.items() if k in columns}
+
+                            # 修改原因：request_stats 仍可能保存上游原始文本，NUL 字符会导致部分数据库写入失败。
+                            # 修改方式：批量写入前沿用 update_stats 的字段过滤和字符串清洗规则。
+                            # 目的：只改变写入调度方式，不改变数据库中可接受的数据形态。
+                            for key, value in filtered_info.items():
+                                if isinstance(value, str):
+                                    filtered_info[key] = value.replace('\x00', '')
+
+                            new_request_stat = RequestStat(**filtered_info)
+                            session.add(new_request_stat)
+
+            for current_info, app in batch:
+                check_key = current_info.get("api_key")
+                if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
+                    if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
+                        await update_paid_api_keys_states(app, check_key)
+            return
+
+        except Exception as e:
+            error_str = str(e).lower()
+            is_lock_error = 'database is locked' in error_str or 'busy' in error_str
+
+            if is_lock_error and attempt < SQLITE_MAX_RETRIES - 1:
+                delay = SQLITE_RETRY_DELAY * (2 ** attempt)
+                logger.warning(f"Database locked (batch stats), retrying in {delay}s (attempt {attempt + 1}/{SQLITE_MAX_RETRIES})")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"Error batch updating stats: {str(e)}")
+                if is_debug:
+                    import traceback
+                    traceback.print_exc()
+                break
+
+
 async def update_stats(current_info: dict, app=None, get_model_prices_func=None):
     """
     更新请求统计到数据库
@@ -772,6 +954,106 @@ async def update_channel_stats(request_id, provider, model, api_key, success, pr
                 await asyncio.sleep(delay)
             else:
                 logger.error(f"Error updating channel stats: {str(e)}")
+                if is_debug:
+                    import traceback
+                    traceback.print_exc()
+                break
+
+
+async def batch_update_channel_stats(items: list) -> None:
+    """批量写入 channel stats，一个事务多条 INSERT。"""
+    # 修改原因：逐条调用 update_channel_stats 会让 SQLite 每条统计都开启一次事务，锁等待时也会放大后台积压。
+    # 修改方式：把 consumer 传入的一批统计合并写入，SQLAlchemy 路径使用一个 session 事务，D1 路径优先使用多 VALUES INSERT。
+    # 目的：把常见场景下 50 条统计的提交次数从 50 次降到 1 次，降低 SQLite fsync 和锁竞争成本。
+    if DISABLE_DATABASE or not items:
+        return
+
+    for attempt in range(SQLITE_MAX_RETRIES):
+        try:
+            if (DB_TYPE or "sqlite").lower() == "d1":
+                from db import d1_client
+                if d1_client is None:
+                    return
+
+                # 修改原因：D1 走 HTTP API，逐条请求会产生额外网络往返；但当前 D1 客户端没有专门 batch 方法。
+                # 修改方式：优先拼接 SQLite 兼容的多 VALUES INSERT；如果当前 D1 环境不支持，再回退到原逐条函数。
+                # 目的：让 D1 路径也能在支持时批量写入，并在不支持时保持统计不丢失。
+                placeholders = ", ".join(
+                    ["(?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)" for _ in items]
+                )
+                sql = (
+                    "INSERT INTO channel_stats "
+                    "(request_id, provider, model, api_key, provider_api_key, success, timestamp) "
+                    f"VALUES {placeholders}"
+                )
+                params = []
+                for item in items:
+                    params.extend([
+                        item["request_id"],
+                        item["provider"],
+                        item["model"],
+                        item["api_key"],
+                        item.get("provider_api_key"),
+                        1 if item["success"] else 0,
+                    ])
+
+                fallback_to_single = False
+                async with db_semaphore:
+                    try:
+                        await d1_client.execute(sql, params)
+                    except Exception as batch_exc:
+                        error_str = str(batch_exc).lower()
+                        is_lock_error = 'database is locked' in error_str or 'busy' in error_str
+                        if is_lock_error:
+                            raise
+                        logger.warning(f"D1 batch channel stats insert failed, falling back to single inserts: {batch_exc}")
+                        fallback_to_single = True
+
+                if fallback_to_single:
+                    # 修改原因：update_channel_stats 内部也会获取 db_semaphore，不能在持有信号量时回退调用它。
+                    # 修改方式：先退出 D1 批量写入的 semaphore 作用域，再逐条调用原函数。
+                    # 目的：避免 D1 批量不支持时发生自我等待，同时保持原有逐条重试逻辑。
+                    for item in items:
+                        await update_channel_stats(
+                            item["request_id"],
+                            item["provider"],
+                            item["model"],
+                            item["api_key"],
+                            item["success"],
+                            provider_api_key=item.get("provider_api_key"),
+                        )
+                return
+
+            async with db_semaphore:
+                async with async_session_scope() as session:
+                    async with session.begin():
+                        # 修改原因：ChannelStat 对象仍需交给 SQLAlchemy ORM 生成，以保持字段默认值和现有模型一致。
+                        # 修改方式：一次构造本批次的 ORM 对象并 add_all，在同一个事务上下文内提交。
+                        # 目的：保持旧数据结构不变，只减少事务数量和提交次数。
+                        channel_stats = [
+                            ChannelStat(
+                                request_id=item["request_id"],
+                                provider=item["provider"],
+                                model=item["model"],
+                                api_key=item["api_key"],
+                                provider_api_key=item.get("provider_api_key"),
+                                success=item["success"],
+                            )
+                            for item in items
+                        ]
+                        session.add_all(channel_stats)
+            return
+
+        except Exception as e:
+            error_str = str(e).lower()
+            is_lock_error = 'database is locked' in error_str or 'busy' in error_str
+
+            if is_lock_error and attempt < SQLITE_MAX_RETRIES - 1:
+                delay = SQLITE_RETRY_DELAY * (2 ** attempt)
+                logger.warning(f"Database locked (batch channel stats), retrying in {delay}s (attempt {attempt + 1}/{SQLITE_MAX_RETRIES})")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"Error batch updating channel stats: {str(e)}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()

@@ -13,7 +13,7 @@ from starlette.responses import Response
 from starlette.types import Scope, Receive, Send
 
 from core.log_config import logger
-from core.stats import update_stats
+from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from utils import safe_get
 
@@ -23,7 +23,7 @@ class LoggingStreamingResponse(Response):
     包装底层流式响应：
     - 透传 chunk 给客户端
     - 解析 usage 字段，填充 current_info 中的 token 统计
-    - 在完成后调用 update_stats 写入数据库
+    - 在完成后调用 enqueue_stats 入队，由后台 consumer 批量写入数据库
     """
 
     def __init__(
@@ -179,9 +179,12 @@ class LoggingStreamingResponse(Response):
                     pass
 
                 try:
-                    await update_stats(current_info, app=app)
+                    # 修改原因：流式响应结束时直接 await update_stats 会让请求协程等待 SQLite 串行写入。
+                    # 修改方式：改为同步 enqueue_stats 保存 current_info 快照，后续由常驻 consumer 批量落库。
+                    # 目的：释放流式请求上下文，避免统计写入和 db_semaphore 等待造成协程堆积。
+                    enqueue_stats(current_info, app=app)
                 except Exception as e:
-                    logger.error(f"Error updating stats in LoggingStreamingResponse: {str(e)}")
+                    logger.error(f"Error enqueueing stats in LoggingStreamingResponse: {str(e)}")
             finally:
                 # 修改原因：current_info 和 body_iterator 会连接 provider、api_key、上游响应迭代器等请求级对象。
                 # 修改方式：无论流式发送、关闭迭代器或统计写入是否异常，最终都断开这些强引用。

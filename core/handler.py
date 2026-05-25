@@ -20,7 +20,7 @@ from core.passthrough import (
 
 import json
 import asyncio
-from collections import defaultdict
+from collections import OrderedDict, deque
 from core.json_utils import json_dumps_text, json_loads
 from datetime import datetime, timedelta, timezone
 from time import time
@@ -36,7 +36,7 @@ from core.log_config import logger
 from core.streaming import LoggingStreamingResponse
 from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream, check_response
-from core.stats import update_stats
+from core.stats import batch_update_channel_stats, update_channel_stats, enqueue_stats
 from core.models import (
     RequestModel,
     ImageGenerationRequest,
@@ -59,11 +59,46 @@ DEFAULT_TIMEOUT = 600
 # 调试模式标志
 is_debug = False
 
+# 修改原因：每个请求结束时单独 create_task 写 channel_stats，会在 SQLite 锁等待时堆积大量协程。
+# 修改方式：使用固定上限 deque 保存轻量统计参数，并由一个常驻 consumer 批量写入。
+# 目的：限制内存占用，避免后台统计写入协程随请求数量线性增长。
+_channel_stats_buffer: deque = deque(maxlen=10000)
+_channel_stats_consumer_started = False
+_channel_stats_flush_event: Optional[asyncio.Event] = None
+_CHANNEL_STATS_BATCH_SIZE = 50
+_CHANNEL_STATS_FLUSH_INTERVAL = 2
+
 
 def set_debug_mode(debug: bool):
     """设置调试模式"""
     global is_debug
     is_debug = debug
+
+
+# 修改原因：provider 轮转游标和锁表原来使用 defaultdict，会随着请求模型和虚拟优先级 key 无上限增长。
+# 修改方式：基于 OrderedDict 实现一个轻量 LRU 字典，访问时刷新顺序，写入后超过 maxsize 就淘汰最久未使用项。
+# 目的：不新增第三方依赖的前提下限制内存占用，并保留现有 dict 风格调用方式。
+class LRUDict(OrderedDict):
+    def __init__(self, maxsize=500):
+        super().__init__()
+        self._maxsize = maxsize
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self._maxsize:
+            self.popitem(last=False)
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
 
 
 async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str], channel_id: Optional[str] = None) -> Optional[str]:
@@ -108,29 +143,118 @@ def _fill_failure_provider_info(
         current_info["model"] = request_model_name
 
 
-def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
-    """异步写入 ChannelStat，不依赖 FastAPI BackgroundTasks。
+def _channel_stats_item_from_call(args: tuple, kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """把 update_channel_stats 的调用参数转换为批量写入所需的字典。"""
+    # 修改原因：consumer 收到的是旧函数签名的 *args/**kwargs，批量写入函数需要结构化条目。
+    # 修改方式：兼容当前调用方使用的前四个位置参数，以及 success/provider_api_key 关键字参数。
+    # 目的：保持 _fire_and_forget_channel_stats 对外签名不变，同时让内部可以批量落库。
+    required_names = ("request_id", "provider", "model", "api_key", "success")
+    values: Dict[str, Any] = {}
+    for index, name in enumerate(required_names):
+        if len(args) > index:
+            values[name] = args[index]
+        elif name in kwargs:
+            values[name] = kwargs[name]
+        else:
+            return None
+    values["provider_api_key"] = args[5] if len(args) > 5 else kwargs.get("provider_api_key")
+    return values
 
-    背景：
-    - BackgroundTasks 会在响应生命周期结束后执行。
-    - 对于流式接口/客户端提前断开等场景，BackgroundTasks 有可能不被执行，
-      导致 channel_stats 缺失，从而 /v1/stats 的成功率永远是 0 或空。
 
-    这里用 create_task 让统计写入尽量独立于请求/响应生命周期。
-    """
+async def _flush_channel_stats_batch(batch: List[tuple]) -> None:
+    """批量刷新 channel stats，非标准调用回退到原函数逐条执行。"""
+    # 修改原因：生产路径传入 core.stats.update_channel_stats，可以合并为一次批量写入；测试或扩展路径可能传入其他可调用对象。
+    # 修改方式：只把标准 update_channel_stats 调用转换为 batch_update_channel_stats，其余调用仍逐条 await 原函数。
+    # 目的：在修复生产协程泄漏和 SQLite 写放大的同时，不破坏旧的可调用参数兼容性。
+    batch_items: List[Dict[str, Any]] = []
+    fallback_calls: List[tuple] = []
+    for func, args, kwargs in batch:
+        if func is update_channel_stats:
+            item = _channel_stats_item_from_call(args, kwargs)
+            if item is not None:
+                batch_items.append(item)
+                continue
+        fallback_calls.append((func, args, kwargs))
 
-    async def _run():
+    if batch_items:
         try:
-            await update_channel_stats_func(*args, **kwargs)
+            await batch_update_channel_stats(batch_items)
         except Exception as e:
-            # 避免 "Task exception was never retrieved"
+            logger.error(f"Error updating channel stats (batch): {e}")
+
+    for func, args, kwargs in fallback_calls:
+        try:
+            await func(*args, **kwargs)
+        except Exception as e:
             logger.error(f"Error updating channel stats: {str(e)}")
 
+
+def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
+    """将统计数据放入 buffer，由常驻 consumer 批量写入。"""
+    # 修改原因：每次调用都 create_task 会在 SQLite 串行写入和 database locked 重试时堆积协程。
+    # 修改方式：这里只追加轻量参数到固定长度 deque，并确保单个 consumer 负责后续写入。
+    # 目的：把后台任务数量固定为一个，极端情况下由 deque(maxlen=10000) 丢弃最旧统计兜底。
+    _channel_stats_buffer.append((update_channel_stats_func, args, kwargs))
+    _ensure_consumer_started()
+    if len(_channel_stats_buffer) >= _CHANNEL_STATS_BATCH_SIZE and _channel_stats_flush_event is not None:
+        _channel_stats_flush_event.set()
+
+
+def _ensure_consumer_started() -> None:
+    """确保 channel stats 常驻 consumer 已经启动。"""
+    global _channel_stats_consumer_started, _channel_stats_flush_event
+    # 修改原因：请求路径是同步函数，不能 await 启动后台任务，也不能为每条统计创建新任务。
+    # 修改方式：在存在 running loop 时创建一个常驻 consumer，并复用同一 loop 上的唤醒事件。
+    # 目的：既保持调用方无需修改，又避免启动或关闭阶段没有事件循环时抛出异常。
+    if _channel_stats_consumer_started:
+        return
     try:
-        asyncio.create_task(_run())
+        loop = asyncio.get_running_loop()
+        _channel_stats_flush_event = asyncio.Event()
+        loop.create_task(_channel_stats_consumer())
+        _channel_stats_consumer_started = True
     except RuntimeError:
-        # event loop 未就绪（极少数启动/关闭阶段），忽略即可
         pass
+
+
+async def _channel_stats_consumer() -> None:
+    """常驻后台任务：每 2 秒或攒满 50 条时批量写入。"""
+    global _channel_stats_consumer_started, _channel_stats_flush_event
+    # 修改原因：SQLite 写入需要串行化，逐请求后台协程会在锁等待时消耗大量内存。
+    # 修改方式：consumer 按固定批量从 deque 取出统计项，并调用 batch_update_channel_stats 一次提交多条。
+    # 目的：降低协程数量、事务次数和 fsync 次数，同时在任务取消时尽量 flush 剩余统计。
+    try:
+        while True:
+            try:
+                if _channel_stats_flush_event is None:
+                    await asyncio.sleep(_CHANNEL_STATS_FLUSH_INTERVAL)
+                else:
+                    await asyncio.wait_for(
+                        _channel_stats_flush_event.wait(),
+                        timeout=_CHANNEL_STATS_FLUSH_INTERVAL,
+                    )
+                    _channel_stats_flush_event.clear()
+            except asyncio.TimeoutError:
+                pass
+
+            if not _channel_stats_buffer:
+                continue
+
+            batch = []
+            while _channel_stats_buffer and len(batch) < _CHANNEL_STATS_BATCH_SIZE:
+                batch.append(_channel_stats_buffer.popleft())
+            await _flush_channel_stats_batch(batch)
+    except asyncio.CancelledError:
+        while _channel_stats_buffer:
+            batch = []
+            while _channel_stats_buffer and len(batch) < _CHANNEL_STATS_BATCH_SIZE:
+                batch.append(_channel_stats_buffer.popleft())
+            await _flush_channel_stats_batch(batch)
+    except Exception as e:
+        logger.error(f"Channel stats consumer crashed: {e}")
+    finally:
+        _channel_stats_consumer_started = False
+        _channel_stats_flush_event = None
 
 
 def get_preference_value(provider_timeouts: Dict[str, Any], original_model: str) -> Optional[int]:
@@ -219,8 +343,11 @@ class ModelRequestHandler:
         self.request_info_getter = request_info_getter
         self.update_channel_stats_func = update_channel_stats_func
         self.default_timeout = default_timeout
-        self.last_provider_indices = defaultdict(lambda: -1)
-        self.locks = defaultdict(asyncio.Lock)
+        # 修改原因：defaultdict 会让游标表和锁表随着新 key 自动增长，长期运行会增加内存占用。
+        # 修改方式：改用固定上限为 500 的 LRUDict；游标和锁在读取处显式处理缺失值。
+        # 目的：保留现有轮转和并发控制行为，同时限制缓存规模。
+        self.last_provider_indices = LRUDict(maxsize=500)
+        self.locks = LRUDict(maxsize=500)
 
     async def _build_attempt_providers(
         self,
@@ -251,14 +378,26 @@ class ModelRequestHandler:
 
             start_index = 0
             if should_rotate_slots:
-                async with self.locks[cursor_key]:
+                # 修改原因：locks 改为 LRU 普通字典后，读取缺失 key 不会再自动创建 asyncio.Lock。
+                # 修改方式：先用 get 查询，缺失时显式创建并写回，写入时由 LRUDict 控制容量。
+                # 目的：保持同一 cursor_key 串行更新游标，同时避免锁表无上限增长。
+                lock = self.locks.get(cursor_key)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self.locks[cursor_key] = lock
+
+                async with lock:
+                    # 修改原因：last_provider_indices 改为 LRU 普通字典后，读取缺失 key 不会再自动写入默认值。
+                    # 修改方式：用 get 读取当前游标，默认值沿用原 defaultdict(lambda: -1) 的行为。
+                    # 目的：不改变首次轮转从第一个 provider 开始的逻辑，同时避免游标表无上限增长。
+                    current_index = self.last_provider_indices.get(cursor_key, -1)
                     if advance_cursor:
-                        self.last_provider_indices[cursor_key] = (
-                            self.last_provider_indices[cursor_key] + 1
-                        ) % len(provider_slots)
-                    elif self.last_provider_indices[cursor_key] < 0:
-                        self.last_provider_indices[cursor_key] = 0
-                    start_index = self.last_provider_indices[cursor_key] % len(provider_slots)
+                        current_index = (current_index + 1) % len(provider_slots)
+                        self.last_provider_indices[cursor_key] = current_index
+                    elif current_index < 0:
+                        current_index = 0
+                        self.last_provider_indices[cursor_key] = current_index
+                    start_index = current_index % len(provider_slots)
 
             ordered_slots = provider_slots[start_index:] + provider_slots[:start_index]
 
@@ -411,7 +550,11 @@ class ModelRequestHandler:
             注意：没有配置 api（例如无需 key 的渠道）也按 1 计。
             """
             try:
-                enabled = provider_api_circular_list[p["provider"]].get_enabled_items_count()
+                # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 时不能再隐式创建空 key 池。
+                # 修改方式：使用 get 读取现有循环列表，缺失时按 0 个启用 key 处理。
+                # 目的：保持重试次数下限逻辑不变，同时避免读路径产生长期驻留对象。
+                circular_list = provider_api_circular_list.get(p["provider"])
+                enabled = circular_list.get_enabled_items_count() if circular_list else 0
             except Exception:
                 enabled = 0
             try:
@@ -489,19 +632,25 @@ class ModelRequestHandler:
             # 检查是否所有 API 密钥都被速率限制
             model_dict = provider["_model_dict_cache"]
             original_model = model_dict[request_model_name]
-            if not override_providers and provider_name in provider_api_circular_list:
-                if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
+            # 修改原因：provider_api_circular_list 改为普通 dict 后，读不存在的 provider 不应自动创建空列表。
+            # 修改方式：先用 get 取得当前 provider 的循环列表，缺失时跳过限流耗尽检查。
+            # 目的：保留原有可用 provider 流程，同时避免缺失配置造成内存增长。
+            provider_circular_list = provider_api_circular_list.get(provider_name)
+            if not override_providers and provider_circular_list:
+                if await provider_circular_list.is_all_rate_limited(original_model):
                     error_message = "All API keys are rate limited and stop auto retry!"
                     if num_matching_providers == 1:
                         break
                     # 虚拟路由：检查同 priority group 是否全部耗尽
                     if _is_virtual_route:
                         grp_start, grp_end = _get_priority_group_range(current_index)
-                        group_all_exhausted = all(
-                            await provider_api_circular_list[matching_providers[gi]["provider"]].is_all_rate_limited(original_model)
-                            if matching_providers[gi]["provider"] in provider_api_circular_list else True
-                            for gi in range(grp_start, grp_end)
-                        )
+                        group_all_exhausted = True
+                        for gi in range(grp_start, grp_end):
+                            gi_provider_name = matching_providers[gi]["provider"]
+                            gi_circular_list = provider_api_circular_list.get(gi_provider_name)
+                            if gi_circular_list and not await gi_circular_list.is_all_rate_limited(original_model):
+                                group_all_exhausted = False
+                                break
                         if not group_all_exhausted:
                             # 同组还有可用渠道 → 跳到组内下一个，不降级
                             continue
@@ -694,8 +843,13 @@ class ModelRequestHandler:
                 # 避免并发场景下 after_next_current() 返回其他请求的 key，
                 # 导致冷却/禁用操作作用在错误的 key 上。
                 _current_info_for_key = self.request_info_getter()
-                current_api = _current_info_for_key.get("_used_api_key") or \
-                    await provider_api_circular_list[channel_id].after_next_current()
+                # 修改原因：provider_api_circular_list 已不再自动创建缺失 provider 的 key 池。
+                # 修改方式：用 get 复用当前渠道循环列表；只有列表存在时才回退读取 after_next_current。
+                # 目的：错误处理路径仍能定位实际 key，同时避免缺失渠道名生成空对象。
+                channel_circular_list = provider_api_circular_list.get(channel_id)
+                current_api = _current_info_for_key.get("_used_api_key")
+                if not current_api and channel_circular_list:
+                    current_api = await channel_circular_list.after_next_current()
 
                 should_consider_channel_cooldown = (
                     self.app.state.channel_manager.cooldown_period > 0
@@ -705,19 +859,22 @@ class ModelRequestHandler:
                 )
 
                 # 仅统计"启用"的 key 数量，避免禁用 key 造成误判。
-                try:
-                    api_key_count_before_rule = provider_api_circular_list[channel_id].get_enabled_items_count()
-                except Exception:
-                    api_key_count_before_rule = provider_api_circular_list[channel_id].get_items_count()
+                if channel_circular_list:
+                    try:
+                        api_key_count_before_rule = channel_circular_list.get_enabled_items_count()
+                    except Exception:
+                        api_key_count_before_rule = channel_circular_list.get_items_count()
+                else:
+                    api_key_count_before_rule = 0
 
                 key_rule_disabled_current = False
                 # ── 应用 Key Rules 规则：冷却 / 禁用 ──
-                if _rule_result and current_api:
+                if _rule_result and current_api and channel_circular_list:
                     _duration = _rule_result.get("duration", 0)
                     _reason = _rule_result.get("reason", "key_rule")
                     if _duration == -1:
                         # 永久禁用
-                        await provider_api_circular_list[channel_id].set_auto_disabled(
+                        await channel_circular_list.set_auto_disabled(
                             current_api, duration=0, reason=_reason
                         )
                         key_rule_disabled_current = True
@@ -729,7 +886,7 @@ class ModelRequestHandler:
                             (api_key_count_before_rule > 1 or should_consider_channel_cooldown)
                             and all(error not in error_message for error in exclude_error_rate_limit)
                         ):
-                            await provider_api_circular_list[channel_id].set_auto_disabled(
+                            await channel_circular_list.set_auto_disabled(
                                 current_api, duration=_duration, reason=_reason
                             )
                             key_rule_disabled_current = True
@@ -738,10 +895,13 @@ class ModelRequestHandler:
                 # 修改原因：旧逻辑先冷却渠道再冷却 key，会把同渠道剩余 key 从候选列表中埋没。
                 # 修改方式：key 级规则执行后，再检查该渠道是否还有启用 key。
                 # 目的：只有当前渠道所有 key 都不可用时，才进入渠道级冷却和候选列表重建。
-                try:
-                    api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
-                except Exception:
-                    api_key_count = provider_api_circular_list[channel_id].get_items_count()
+                if channel_circular_list:
+                    try:
+                        api_key_count = channel_circular_list.get_enabled_items_count()
+                    except Exception:
+                        api_key_count = channel_circular_list.get_items_count()
+                else:
+                    api_key_count = 0
 
                 should_rebuild_after_channel_cooldown = (
                     should_consider_channel_cooldown
@@ -775,10 +935,16 @@ class ModelRequestHandler:
                 # 不能 index = current_index，否则 index 永远到不了 max_attempts，死循环。
 
                 # 有些错误并没有请求成功，所以需要删除请求记录
-                if (current_api 
-                    and any(error in error_message for error in exclude_error_rate_limit) 
-                    and provider_api_circular_list[provider_name].requests[current_api][original_model]):
-                    provider_api_circular_list[provider_name].requests[current_api][original_model].pop()
+                # 修改原因：直接访问 requests[current_api][original_model] 会在没有记录时创建空 deque。
+                # 修改方式：先通过 get 读取 provider、api_key、model 三层对象，只有已有记录时才 pop。
+                # 目的：兼容 deque 的同时避免错误路径制造新的空 requests 索引。
+                provider_circular_list_for_requests = provider_api_circular_list.get(provider_name)
+                api_request_map = provider_circular_list_for_requests.requests.get(current_api) if provider_circular_list_for_requests and current_api else None
+                model_requests = api_request_map.get(original_model) if api_request_map else None
+                if (current_api
+                    and any(error in error_message for error in exclude_error_rate_limit)
+                    and model_requests):
+                    model_requests.pop()
 
                 # 根据错误消息调整状态码
                 if "string_above_max_length" in error_message:
@@ -860,8 +1026,12 @@ class ModelRequestHandler:
                             group_has_available = False
                             for gi in range(grp_start, grp_end):
                                 gi_name = matching_providers[gi]["provider"]
-                                if gi_name in provider_api_circular_list:
-                                    if not await provider_api_circular_list[gi_name].is_all_rate_limited(original_model):
+                                # 修改原因：provider_api_circular_list 改为普通 dict 后，读取缺失 provider 需要显式判空。
+                                # 修改方式：使用 get 取得已有循环列表，再执行 is_all_rate_limited 检查。
+                                # 目的：避免虚拟路由重试检查创建空 key 池。
+                                gi_circular_list = provider_api_circular_list.get(gi_name)
+                                if gi_circular_list:
+                                    if not await gi_circular_list.is_all_rate_limited(original_model):
                                         group_has_available = True
                                         break
                             if group_has_available:
@@ -889,7 +1059,10 @@ class ModelRequestHandler:
                     process_time = time() - current_info["start_time"]
                     current_info["process_time"] = process_time
                 # 写入失败统计
-                background_tasks.add_task(update_stats, current_info, app=self.app)
+                # 修改原因：BackgroundTasks 仍会为每条失败统计创建待执行任务，SQLite 锁等待时会继续堆积。
+                # 修改方式：改为同步 enqueue_stats 入队，由 core.stats 的单个 consumer 批量写入。
+                # 目的：让不重试失败路径不再增加后台协程数量，同时保留失败统计。
+                enqueue_stats(current_info, app=self.app)
                 return openai_error_response(
                     f"Error: Current provider response failed: {error_message}",
                     status_code,
@@ -913,7 +1086,10 @@ class ModelRequestHandler:
             process_time = time() - current_info["start_time"]
             current_info["process_time"] = process_time
         # 写入失败统计
-        background_tasks.add_task(update_stats, current_info, app=self.app)
+        # 修改原因：所有重试失败路径可能在高并发下集中进入 SQLite 写入，BackgroundTasks 会放大协程积压。
+        # 修改方式：改为同步 enqueue_stats 入队，并交给 request_stats consumer 批量提交。
+        # 目的：保留重试耗尽后的失败日志，同时避免请求结束阶段阻塞事件循环。
+        enqueue_stats(current_info, app=self.app)
         return openai_error_response(
             f"All {request_data.model} error: {error_message}",
             status_code,

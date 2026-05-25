@@ -256,7 +256,13 @@ async def process_request_passthrough(
     if is_local_api_key(provider["provider"]):
         api_key = provider["provider"]
     elif provider.get("api"):
-        api_key = await provider_api_circular_list[provider["provider"]].next(original_model)
+        # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 不应再创建空 key 池。
+        # 修改方式：使用 get 读取现有循环列表，缺失时返回明确的配置错误。
+        # 目的：避免透传请求路径因 provider 名不存在而产生长期驻留的空 ThreadSafeCircularList。
+        circular_list = provider_api_circular_list.get(provider["provider"])
+        if not circular_list:
+            raise HTTPException(status_code=404, detail=f"Provider '{provider['provider']}' API key pool not found")
+        api_key = await circular_list.next(original_model)
     else:
         api_key = None
 

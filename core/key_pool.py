@@ -10,7 +10,7 @@ import asyncio
 import json
 import random
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from time import time
 
 from fastapi import HTTPException
@@ -162,7 +162,11 @@ class ThreadSafeCircularList:
         self.lock = asyncio.Lock()
         # sticky_ip session 表: {client_ip: (key_index, expire_time)}
         self._sticky_sessions: dict[str, tuple[int, float]] = {}
-        self.requests = defaultdict(lambda: defaultdict(list))
+        # 修改原因：最内层 list 会保留所有历史时间戳，并且按 model 自动增长后长期不清理。
+        # 修改方式：将 self.requests[api_key][model] 初始化为 deque(maxlen=1000)，并记录 next 调用次数用于惰性清理。
+        # 目的：限制单个 model 的时间戳数量，同时给过期 model/api_key 项提供清理入口。
+        self.requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=1000)))
+        self._request_cleanup_counter = 0
         self.cooling_until = defaultdict(float)
         self.rate_limits = {}
         self.reordering_task = None
@@ -220,8 +224,9 @@ class ThreadSafeCircularList:
         now = time()
         async with self.lock:
             self.cooling_until[item] = now + cooling_time
-            # 清空该 item 的请求记录
-            # self.requests[item] = []
+            # 修改原因：requests 的值已经是按 model 分组的 deque，不能再按旧 list 结构直接替换。
+            # 修改方式：冷却时只设置 cooling_until，不主动改写 requests 结构，交给窗口清理和过期清理处理。
+            # 目的：避免把 requests[item] 误改成 list，保持嵌套 deque 结构一致。
             logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
 
     async def set_auto_disabled(self, item: str, duration: int = 0, reason: str = ""):
@@ -310,6 +315,23 @@ class ThreadSafeCircularList:
         """
         self.disabled_keys = set(disabled_keys) if disabled_keys else set()
 
+    def _cleanup_stale_request_keys(self):
+        """清理超过 1 小时没有新请求的 requests 索引。
+
+        调用方应在持有 self.lock 时执行本方法，避免清理期间与请求记录写入交错。
+        """
+        now = time()
+        stale_before = now - 3600
+        # 修改原因：即使单个 deque 有 maxlen，不再使用的 model key 仍会留在嵌套字典中。
+        # 修改方式：删除空时间戳队列，以及最后一条时间戳早于 1 小时前的 model；再删除空 api_key 项。
+        # 目的：释放长期不再访问的 model/api_key 索引，避免 requests 字典无限增长。
+        for api_key, model_requests in list(self.requests.items()):
+            for model_key, timestamps in list(model_requests.items()):
+                if not timestamps or timestamps[-1] <= stale_before:
+                    del model_requests[model_key]
+            if not model_requests:
+                del self.requests[api_key]
+
     async def is_rate_limited(self, item, model: str = None, is_check: bool = False) -> bool:
         now = time()
         # 检查是否被禁用
@@ -361,7 +383,13 @@ class ThreadSafeCircularList:
 
         # 清理太旧的请求记录
         max_period = max(period for _, period in rate_limit)
-        self.requests[item][model_key] = [req for req in self.requests[item][model_key] if req > now - max_period]
+        model_requests = self.requests[item][model_key]
+        cutoff = now - max_period
+        # 修改原因：requests 最内层已改为 deque，若用列表推导重新赋值会丢失 maxlen 上限。
+        # 修改方式：按时间顺序从左侧弹出超出限流窗口的时间戳，保留同一个 deque 对象。
+        # 目的：继续清理窗口外记录，同时保持 deque(maxlen=1000) 的内存上限。
+        while model_requests and model_requests[0] <= cutoff:
+            model_requests.popleft()
 
         # 记录新的请求
         if not is_check:
@@ -372,6 +400,13 @@ class ThreadSafeCircularList:
 
     async def next(self, model: str = None):
         async with self.lock:
+            self._request_cleanup_counter += 1
+            # 修改原因：requests 的嵌套 model key 只靠 maxlen 不能释放不再使用的字典项。
+            # 修改方式：在已有锁内每 100 次 next 调用执行一次轻量过期清理。
+            # 目的：保证清理操作线程安全，并把额外开销分摊到请求路径中。
+            if self._request_cleanup_counter % 100 == 0:
+                self._cleanup_stale_request_keys()
+
             client_ip = ""  # sticky_ip 用
 
             if self.schedule_algorithm == "fixed_priority":
@@ -507,7 +542,10 @@ def circular_list_encoder(obj):
         return obj.to_dict()
     raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
 
-provider_api_circular_list = defaultdict(ThreadSafeCircularList)
+# 修改原因：defaultdict 会在读取不存在 provider 时自动创建空 ThreadSafeCircularList，造成长期驻留对象。
+# 修改方式：改为普通 dict，配置加载仍用 provider_api_circular_list[key] = value 显式写入。
+# 目的：避免读路径隐式分配 key 池，降低 provider 名拼写错误或缺失配置带来的内存增长。
+provider_api_circular_list = {}
 
 
 class ApiKeyRateLimitRegistry(dict):
