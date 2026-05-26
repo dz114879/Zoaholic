@@ -338,6 +338,30 @@ def save_api_yaml(config_data):
     processed_data = _quote_colon_strings(processed_data)
 
     target_path = os.path.abspath(API_YAML_PATH)
+
+    # 修改原因：手动编辑 api.yaml 或配置解析失败时，规范化后的 providers 可能变成空列表。
+    # 修改方式：在实际写文件前读取旧文件，如果旧文件有 providers 而新配置为 0 个 providers，则拒绝本次写入。
+    # 目的：避免启动或同步配置时把原本正确的渠道配置覆盖成空配置。
+    if os.path.exists(target_path):
+        try:
+            with open(target_path, 'r', encoding='utf-8') as f:
+                existing_data = yaml.load(f)
+            existing_providers = existing_data.get('providers', []) if isinstance(existing_data, dict) else []
+            new_providers = processed_data.get('providers', [])
+            if len(existing_providers) > 0 and len(new_providers) == 0:
+                logger.error(
+                    f"[save_api_yaml] BLOCKED: refusing to overwrite {len(existing_providers)} providers with empty list. "
+                    f"This usually indicates a config parsing error. Original file preserved."
+                )
+                return
+            if len(existing_providers) > 5 and len(new_providers) < len(existing_providers) * 0.2:
+                logger.warning(
+                    f"[save_api_yaml] WARNING: providers count dropped from {len(existing_providers)} to {len(new_providers)}. "
+                    f"Proceeding with write, but this might indicate a problem."
+                )
+        except Exception as e:
+            logger.warning(f"[save_api_yaml] Could not read existing file for safety check: {e}")
+
     target_dir = os.path.dirname(target_path) or "."
     os.makedirs(target_dir, exist_ok=True)
 
@@ -1538,7 +1562,10 @@ def post_all_models(api_index, config, api_list, models_list):
                                 # 过滤掉作为别名映射上游的模型名
                                 # 比较时去掉 prefix，因为 upstream_candidates 存的是不带 prefix 的上游名
                                 bare_name = model_item[len(prefix):] if prefix and model_item.startswith(prefix) else model_item
-                                if bare_name in upstream_candidates:
+                                # 修改原因：有 model_prefix 时，get_model_dict 会生成 prefix+model -> model，导致所有模型都像别名映射。
+                                # 修改方式：只在没有 prefix 时按 bare_name 过滤纯重定向上游原名。
+                                # 目的：保留无前缀别名隐藏规则，同时让带前缀的对外模型名正常出现在列表中。
+                                if not prefix and bare_name in upstream_candidates:
                                     continue
                                 # 如果有前缀，只返回带前缀的模型名
                                 if prefix and not model_item.startswith(prefix):
@@ -1605,7 +1632,10 @@ def post_all_models(api_index, config, api_list, models_list):
                                 # 过滤掉作为别名映射上游的模型名
                                 # 比较时去掉 prefix，因为 upstream_candidates 存的是不带 prefix 的上游名
                                 bare_name = model_item[len(prefix):] if prefix and model_item.startswith(prefix) else model_item
-                                if bare_name in upstream_candidates:
+                                # 修改原因：有 model_prefix 时，get_model_dict 会生成 prefix+model -> model，导致所有模型都像别名映射。
+                                # 修改方式：只在没有 prefix 时按 bare_name 过滤纯重定向上游原名。
+                                # 目的：保留无前缀别名隐藏规则，同时让带前缀的对外模型名正常出现在列表中。
+                                if not prefix and bare_name in upstream_candidates:
                                     continue
                                 # 如果有前缀，只返回带前缀的模型名
                                 if prefix and not model_item.startswith(prefix):
@@ -1685,7 +1715,10 @@ def get_all_models(config, allowed_groups=None):
             # 过滤掉作为别名映射上游的模型名
             # 比较时去掉 prefix，因为 upstream_candidates 存的是不带 prefix 的上游名
             bare_name = model[len(prefix):] if prefix and model.startswith(prefix) else model
-            if bare_name in upstream_candidates:
+            # 修改原因：有 model_prefix 时，get_model_dict 会生成 prefix+model -> model，导致所有模型都像别名映射。
+            # 修改方式：只在没有 prefix 时按 bare_name 过滤纯重定向上游原名。
+            # 目的：保留无前缀别名隐藏规则，同时让带前缀的对外模型名正常出现在列表中。
+            if not prefix and bare_name in upstream_candidates:
                 continue
             # 如果有前缀，只返回带前缀的模型名，过滤掉不带前缀的原始模型名
             if prefix and not model.startswith(prefix):
