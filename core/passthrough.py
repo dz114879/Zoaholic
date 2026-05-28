@@ -21,7 +21,7 @@ from core.request import get_payload
 from core.response import check_response
 from core.streaming import LoggingStreamingResponse
 from core.utils import get_engine, is_local_api_key, provider_api_circular_list
-from utils import apply_custom_headers, has_header_case_insensitive, safe_get
+from utils import apply_custom_headers, has_header_case_insensitive, safe_get, wait_for_timeout, iter_sse_with_keepalive
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -150,12 +150,12 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout, en
     yield result
 
 
-async def _passthrough_error_wrapper(generator, channel_id):
+async def _passthrough_error_wrapper(generator, channel_id, keepalive_interval: Optional[int] = None):
     """
-    透传模式的简单错误包装器
-    
-    只检测 HTTP 错误（由 check_response 完成），不做 JSON 解析
-    直接透传所有内容
+    透传模式的简单错误包装器。
+
+    - 只检测 HTTP 错误（由 check_response 完成），不做 JSON 解析。
+    - 对 SSE 透传流注入注释帧 keepalive，保持与普通流式路径一致的空闲保活语义。
     """
     from time import time as time_now
     start_time = time_now()
@@ -204,20 +204,49 @@ async def _passthrough_error_wrapper(generator, channel_id):
             
             yield chunk
     
-    # 透传模式：直接获取第一个 chunk，不做额外过滤
-    # SSE 流的内容（如 event:, data:）都是有效内容，不应该被跳过
+    # 透传模式：直接获取第一个 chunk，不做额外过滤。
+    # SSE 流的内容（如 event:, data:）都是有效内容，不应该被跳过。
     gen = wrapped()
+
+    async def final_gen(first=None, wait_task=None, emit_initial_keepalive: bool = False):
+        if first is not None:
+            yield first
+
+        if keepalive_interval:
+            # 修改原因：透传 keepalive 此前是独立复制的一份 pump，与 utils 中的实现重复，
+            #   keepalive 帧样式与挂起任务清理需要两处同步维护。
+            # 修改方式：改调 utils.iter_sse_with_keepalive 共用同一套保活循环；不传 transform，
+            #   保持透传“不解析/不改写协议内容”的约束，仅注入 SSE 注释帧。上游 EOF 由该函数内部
+            #   转为正常结束，挂起的 __anext__ 任务也在其 finally 中统一清理。
+            # 目的：消除重复实现，统一 keepalive 帧样式与保活语义。
+            try:
+                async for chunk in iter_sse_with_keepalive(
+                    gen,
+                    interval=keepalive_interval,
+                    wait_task=wait_task,
+                    emit_initial=emit_initial_keepalive,
+                ):
+                    yield chunk
+            except asyncio.CancelledError:
+                logger.debug(f"provider: {channel_id:<11} passthrough stream cancelled by client")
+                return
+        else:
+            async for chunk in gen:
+                yield chunk
+
     try:
-        first = await gen.__anext__()
+        if keepalive_interval:
+            first, status = await wait_for_timeout(gen, timeout=keepalive_interval)
+            if status == "timeout":
+                return final_gen(wait_task=first, emit_initial_keepalive=True), 3.1415
+            if status == "reentrant":
+                return final_gen(emit_initial_keepalive=True), 3.1415
+        else:
+            first = await gen.__anext__()
     except StopAsyncIteration:
         raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
     
-    async def final_gen():
-        yield first
-        async for chunk in gen:
-            yield chunk
-    
-    return final_gen(), first_response_time or (time_now() - start_time)
+    return final_gen(first=first), first_response_time or (time_now() - start_time)
 
 
 async def process_request_passthrough(
@@ -426,7 +455,7 @@ async def process_request_passthrough(
                     )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
-                    generator, channel_id
+                    generator, channel_id, keepalive_interval=keepalive_interval
                 )
 
                 if client_wants_stream:
