@@ -1356,8 +1356,9 @@ async def error_handling_wrapper(
         # minimax
         if isinstance(first_item_str, dict) and safe_get(first_item_str, "base_resp", "status_msg", default=None) == "success":
             full_audio_hex = safe_get(first_item_str, "data", "audio", default=None)
-            audio_bytes = bytes.fromhex(full_audio_hex)
-            return audio_bytes, first_response_time
+            if full_audio_hex:
+                audio_bytes = bytes.fromhex(full_audio_hex)
+                return audio_bytes, first_response_time
 
         if isinstance(first_item_str, dict) and 'error' in first_item_str and first_item_str.get('error') != {"message": "","type": "","param": "","code": None}:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException

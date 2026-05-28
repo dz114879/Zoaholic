@@ -502,13 +502,19 @@ export default function Settings() {
                 />
               </div>
               <div>
-                <label className="text-sm font-medium text-foreground mb-1.5 block">Keepalive 心跳间隔 (秒)</label>
+                {/* 修改原因：后端 keepalive_interval 默认值已从关闭心跳改为 15 秒，前端需要展示一致的默认值与关闭方式。
+                    修改方式：把数字输入框的 fallback 改为 15，并在输入框下方补充单位语义和 0 关闭说明。
+                    目的：让管理员在全局配置页能清楚理解 SSE 心跳的默认行为。 */}
+                <label className="text-sm font-medium text-foreground mb-1.5 block">SSE 心跳间隔 (秒)</label>
                 <input
                   type="number" min="0" max="300"
                   value={preferences.keepalive_interval?.default ?? 15}
                   onChange={e => updatePreference('keepalive_interval', { ...(preferences.keepalive_interval || {}), default: parseInt(e.target.value) })}
                   className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
                 />
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  流式请求时，上游无响应超过此秒数将发送 SSE 心跳，防止连接超时断开。设为 0 关闭
+                </p>
               </div>
             </div>
 

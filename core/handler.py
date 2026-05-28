@@ -718,9 +718,12 @@ class ModelRequestHandler:
             if override_timeout is not None and override_timeout > 0:
                 local_timeout_value = override_timeout
 
+            # 修改原因：keepalive_interval 默认值需要与启动初始化保持一致，避免运行时回退到关闭心跳。
+            # 修改方式：把 get_preference 的 fallback 从 99999 改为 15 秒。
+            # 目的：没有显式配置时默认发送 SSE 心跳，降低流式连接空闲断开的风险。
             keepalive_interval = get_preference(
                 self.app.state.keepalive_interval, provider_name, 
-                original_request_model, 99999
+                original_request_model, 15
             )
             keepalive_interval = normalize_keepalive_interval(keepalive_interval, local_timeout_value)
             if is_local_api_key(provider_name):

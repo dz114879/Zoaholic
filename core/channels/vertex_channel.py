@@ -575,7 +575,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
             else:
                 payload[field] = value
 
-    payload["generationConfig"] = generation_config
+    payload.setdefault("generationConfig", {}).update(generation_config)
     if "max_output_tokens" not in generation_config:
         payload["generationConfig"]["max_output_tokens"] = 32768
 
