@@ -597,6 +597,33 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                                 + cache_creation_tokens
                                 + cached_tokens
                             )
+                    # 处理 message_delta 中的拒绝回答（Refusal）信号
+                    # 必须在 usage 处理和 break 之前检查，否则 refusal 会被跳过
+                    delta_for_refusal = safe_get(resp, "delta", default={})
+                    if delta_for_refusal.get("stop_reason") == "refusal":
+                        stop_details = delta_for_refusal.get("stop_details", {})
+                        refusal_reason = (
+                            stop_details.get("explanation")
+                            or stop_details.get("type")
+                            or stop_details.get("category")
+                            or "This request triggered Claude safeguards and was refused."
+                        )
+                        mark_content_start()
+                        sse_content_filter = await generate_sse_response(
+                            timestamp, model, content=f"\n[Safeguards Refusal] {refusal_reason}\n", stop="content_filter"
+                        )
+                        yield sse_content_filter
+                        err_payload = {
+                            "error": {
+                                "message": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
+                                "type": "invalid_request_error",
+                                "param": None,
+                                "code": "content_filter"
+                            }
+                        }
+                        yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
+                        # refusal 后仍然需要写 usage 再 break
+
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
                         total_tokens = input_tokens + output_tokens
@@ -686,40 +713,6 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                         current_block_id = None
                         current_tc_index = None
                         continue
-
-                    # 处理 message_delta，提取拒绝回答 (Refusal) 信号
-                    if event_type == "message_delta":
-                        delta = resp.get("delta", {})
-                        if delta.get("stop_reason") == "refusal":
-                            stop_details = delta.get("stop_details", {})
-                            # 优先提取 explanation（最详细的说明），次优为 type 或 category，没有则兜底
-                            refusal_reason = (
-                                stop_details.get("explanation")
-                                or stop_details.get("type")
-                                or stop_details.get("category")
-                                or "This request triggered Claude safeguards and was refused."
-                            )
-                            mark_content_start()
-                            
-                            # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
-                            # 这能让那些只认 choices.delta.content 的套壳网页前端正常把原因打印在气泡里
-                            sse_content_filter = await generate_sse_response(
-                                timestamp, model, content=f"\n[Safeguards Refusal] {refusal_reason}\n", stop="content_filter"
-                            )
-                            yield sse_content_filter
-
-                            # 2. 方案 C：紧接着再追加发送一个标准的 OAI Error 裸 chunk
-                            # 此时因为 HTTP 200 已发无法改变，裸吐 error chunk 强行让前端和 SDK 报错，杜绝工作流/Agent 误读
-                            err_payload = {
-                                "error": {
-                                    "message": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
-                                    "type": "invalid_request_error",
-                                    "param": None,
-                                    "code": "content_filter"
-                                }
-                            }
-                            yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
-                            continue
 
                     # 正常文本输出
                     text = safe_get(resp, "delta", "text", default="")

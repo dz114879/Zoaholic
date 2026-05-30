@@ -13,12 +13,15 @@ Claude Tools 插件
 - -code: 启用 code_execution 工具
 - -computer: 启用 computer_use 工具（beta）
 - -artifacts: 启用 artifacts 工具
+- -fast: 启用 fast mode（speed=fast + beta header）
 
 使用方式：
 - claude-sonnet-4-thinking → 启用思考模式
 - claude-sonnet-4-thinking-32768 → 启用思考模式，budget=32768
 - claude-sonnet-4-search → 启用搜索
 - claude-sonnet-4-thinking-search → 同时启用思考和搜索
+- claude-opus-4-fast → 启用 fast mode
+- claude-sonnet-4-thinking-fast → 思考 + fast mode
 """
 
 import re
@@ -35,7 +38,7 @@ from core.plugins import (
 PLUGIN_INFO = {
     "name": "claude_tools",
     "version": "1.0.0",
-    "description": "Claude 后缀工具插件 — 在模型名后追加 -thinking/-search/-code/-computer/-artifacts 等后缀，自动注入对应的原生 Claude API 参数。后缀可自由组合，如 claude-sonnet-4-thinking-search。",
+    "description": "Claude 后缀工具插件 — 在模型名后追加 -thinking/-search/-code/-computer/-artifacts/-fast 等后缀，自动注入对应的原生 Claude API 参数。后缀可自由组合，如 claude-sonnet-4-thinking-fast。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
@@ -57,6 +60,7 @@ SUPPORTED_SUFFIXES = {
     "-code": "code",
     "-computer": "computer",
     "-artifacts": "artifacts",
+    "-fast": "fast",
 }
 
 # 默认的 thinking budget tokens
@@ -284,6 +288,7 @@ def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) ->
         # "search": 不需要 beta header，已是正式功能
         "code": "code-execution-2025-05-22",
         "computer": "computer-use-2025-01-24",
+        "fast": "fast-mode-2026-02-01",
     }
 
     for feature in features:
@@ -334,9 +339,14 @@ async def claude_tools_request_interceptor(
         payload["_thinking_features"] = features  # 传 effort 级别给 apply_thinking_config
         apply_thinking_config(payload, thinking_budget, model=base_model)
 
+    # 应用 fast mode
+    if "fast" in features:
+        payload["speed"] = "fast"
+        logger.debug("[claude_tools] Enabled fast mode: speed=fast")
+
     # 应用工具配置
     for feature in features:
-        if feature != "thinking":
+        if feature not in ("thinking", "fast"):
             apply_tool_config(payload, feature)
 
     # 更新 anthropic-beta header
