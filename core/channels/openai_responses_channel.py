@@ -231,27 +231,18 @@ async def get_responses_payload(request, engine, provider, api_key=None):
 
     # 处理 reasoning effort + summary（对齐 b119589）
     if any(m in original_model for m in ["o1", "o3", "o4", "gpt-5"]):
-        reasoning_config = {}
+        existing_reasoning = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else {}
+        defaults = {}
 
         # o1-preview 和 o1-mini 不支持 reasoning effort
         if "o1-preview" not in original_model and "o1-mini" not in original_model:
-            effort = "medium"
-            if request.model.endswith("-high"):
-                effort = "high"
-            elif request.model.endswith("-low"):
-                effort = "low"
-            reasoning_config["effort"] = effort
+            defaults["effort"] = "medium"
 
-        # 启用 reasoning summary 以获取推理过程
-        reasoning_config["summary"] = "auto"
+        defaults["summary"] = "auto"
 
-        # 允许覆盖，但补齐默认值
-        if "reasoning" not in payload:
-            payload["reasoning"] = reasoning_config
-        elif isinstance(payload.get("reasoning"), dict):
-            for k, v in reasoning_config.items():
-                if k not in payload["reasoning"]:
-                    payload["reasoning"][k] = v
+        # 用户传入的字段优先，只补缺省
+        merged = {**defaults, **existing_reasoning}
+        payload["reasoning"] = merged
 
     # 可选参数（严格按 Responses API 支持字段映射，避免上游报 Unsupported parameter）
     miss_fields = ['model', 'messages', 'stream', 'instructions']

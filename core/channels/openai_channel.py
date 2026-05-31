@@ -334,26 +334,9 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         payload.pop("presence_penalty", None)
         payload.pop("frequency_penalty", None)
 
-    if "grok-3-mini" in original_model:
-        if request.model.endswith("high"):
-            payload["reasoning_effort"] = "high"
-        elif request.model.endswith("low"):
-            payload["reasoning_effort"] = "low"
-
     if "o1" in original_model or \
     "o3" in original_model or "o4" in original_model or \
     "gpt-oss" in original_model or "gpt-5" in original_model:
-        if request.model.endswith("high"):
-            if "v1/responses" in url:
-                payload["reasoning"] = {"effort": "high"}
-            else:
-                payload["reasoning_effort"] = "high"
-        elif request.model.endswith("low"):
-            if "v1/responses" in url:
-                payload["reasoning"] = {"effort": "low"}
-            else:
-                payload["reasoning_effort"] = "low"
-
         if "temperature" in payload:
             payload.pop("temperature")
 
@@ -369,24 +352,7 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         if "temperature" not in payload:
             payload["temperature"] = 0.6
 
-    if request.model.endswith("-search") and "gemini" in original_model:
-        if "tools" not in payload:
-            payload["tools"] = [{
-                "type": "function",
-                "function": {
-                    "name": "googleSearch",
-                    "description": "googleSearch"
-                }
-            }]
-        else:
-            if not any(tool["function"]["name"] == "googleSearch" for tool in payload["tools"]):
-                payload["tools"].append({
-                    "type": "function",
-                    "function": {
-      "name": "googleSearch",
-                        "description": "googleSearch"
-                    }
-                })
+
 
 
     # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错

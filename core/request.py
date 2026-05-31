@@ -139,6 +139,8 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
                                 target[real_key] = list(_v)
                             else:
                                 target[real_key] = _v
+                        elif _v is None:
+                            target.pop(_k, None)
                         elif isinstance(_v, dict) and isinstance(target.get(_k), dict):
                             _deep_merge(target[_k], _v)
                         else:

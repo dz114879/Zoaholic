@@ -219,20 +219,15 @@ async def parse_responses_request(
         "stream": stream,
     }
 
-    # 处理 reasoning 参数
-    reasoning = native_body.get("reasoning")
-    if reasoning and isinstance(reasoning, dict):
-        effort = reasoning.get("effort")
-        if effort in ("high", "low"):
-            # 通过在模型名后添加后缀来传递 reasoning effort
-            # 这是因为 RequestModel 没有 reasoning_effort 字段
-            if not model.endswith(f"-{effort}"):
-                request_data["model"] = f"{model}-{effort}"
-
     # 转换 tools
     tools = convert_responses_tools(native_body.get("tools"))
     if tools:
         request_data["tools"] = tools
+
+    # 透传 reasoning 参数（如 {"effort": "high"}），由 channel 层决定如何处理
+    reasoning = native_body.get("reasoning")
+    if reasoning is not None:
+        request_data["reasoning"] = reasoning
 
     # 可选参数映射
     optional_fields = [

@@ -204,7 +204,10 @@ class ThreadSafeCircularList:
 
     async def _reorder_keys(self):
         """Performs the actual reordering logic."""
-        from utils import get_sorted_api_keys
+        # 修改原因：core.key_pool 属于 core 底层单例模块，反向导入根 utils 门面会扩大循环依赖风险。
+        # 修改方式：直接从归位后的 core.key_stats 导入排序函数，不再经过 utils.py。
+        # 目的：保持全局 key pool 单例稳定，并让依赖方向回到 core 内部业务模块。
+        from core.key_stats import get_sorted_api_keys
         try:
             sorted_keys = await get_sorted_api_keys(self.provider_name, self.original_items, group_size=100)
             if sorted_keys:

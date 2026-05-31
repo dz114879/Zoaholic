@@ -46,6 +46,7 @@ from core.models import (
 )
 from core.utils import get_engine, provider_api_circular_list, truncate_for_logging, is_local_api_key
 from core.routing import get_right_order_providers
+from core.byok import get_byok_real_key, get_byok_template_key, is_byok_provider
 from core.error_response import openai_error_response
 from utils import safe_get, error_handling_wrapper, apply_custom_headers, has_header_case_insensitive
 
@@ -555,6 +556,24 @@ class ModelRequestHandler:
                 default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8]
             )
 
+        # 修改原因：标准路由没有原始 FastAPI Request 参数，BYOK 真实 key 只能从鉴权阶段写入的请求上下文读取。
+        # 修改方式：只把 request_info/ContextVar 中的 BYOK 上下文识别为 BYOK；显式 force_api_key 继续保留为渠道测试或直接调用用 key。
+        # 目的：BYOK provider 在真实请求中能拿到用户上游 key，同时避免单渠道测试的显式 key 被误当作 BYOK 而跳过重试和统计。
+        current_info_for_byok_lookup = self.request_info_getter()
+        byok_real_key = (
+            current_info_for_byok_lookup.get("_byok_real_key")
+            or current_info_for_byok_lookup.get("byok_real_key")
+            or get_byok_real_key()
+        )
+        byok_template_key = (
+            current_info_for_byok_lookup.get("_byok_template_key")
+            or current_info_for_byok_lookup.get("byok_template_key")
+            or get_byok_template_key()
+        )
+        if byok_template_key:
+            current_info_for_byok = self.request_info_getter()
+            current_info_for_byok["api_key"] = byok_template_key
+
         status_code = 500
         error_message = None
 
@@ -573,6 +592,11 @@ class ModelRequestHandler:
 
             注意：没有配置 api（例如无需 key 的渠道）也按 1 计。
             """
+            if is_byok_provider(p):
+                # 修改原因：BYOK provider 没有本地 circular list，api: ["*"] 只是模式标记。
+                # 修改方式：重试槽位固定按 1 计算，不读取 provider_api_circular_list。
+                # 目的：避免 "*" 被视作本地 key，也避免缺失 key pool 影响重试次数计算。
+                return 1
             try:
                 # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 时不能再隐式创建空 key 池。
                 # 修改方式：使用 get 读取现有循环列表，缺失时按 0 个启用 key 处理。
@@ -652,6 +676,7 @@ class ModelRequestHandler:
             provider = matching_providers[current_index]
 
             provider_name = provider['provider']
+            provider_is_byok = is_byok_provider(provider)
 
             # 检查是否所有 API 密钥都被速率限制
             model_dict = provider["_model_dict_cache"]
@@ -660,7 +685,10 @@ class ModelRequestHandler:
             # 修改方式：先用 get 取得当前 provider 的循环列表，缺失时跳过限流耗尽检查。
             # 目的：保留原有可用 provider 流程，同时避免缺失配置造成内存增长。
             provider_circular_list = provider_api_circular_list.get(provider_name)
-            if not override_providers and provider_circular_list:
+            # 修改原因：BYOK provider 没有本地 key pool，api: ["*"] 也不能进入本地限流耗尽判断。
+            # 修改方式：只有非 BYOK provider 且存在 circular list 时才调用 is_all_rate_limited。
+            # 目的：避免 "*" 被本地限流、冷却或禁用逻辑当成真实 provider key 处理。
+            if not override_providers and provider_circular_list and not provider_is_byok:
                 if await provider_circular_list.is_all_rate_limited(original_model):
                     error_message = "All API keys are rate limited and stop auto retry!"
                     if num_matching_providers == 1:
@@ -670,7 +698,14 @@ class ModelRequestHandler:
                         grp_start, grp_end = _get_priority_group_range(current_index)
                         group_all_exhausted = True
                         for gi in range(grp_start, grp_end):
-                            gi_provider_name = matching_providers[gi]["provider"]
+                            gi_provider = matching_providers[gi]
+                            if is_byok_provider(gi_provider):
+                                # 修改原因：BYOK provider 不依赖本地 key pool，不能被视为本地 key 全部限流。
+                                # 修改方式：虚拟路由分组检查遇到 BYOK provider 时直接认为该组未被本地限流耗尽。
+                                # 目的：避免缺失 circular list 或 "*" 占位符导致 BYOK provider 被错误跳过。
+                                group_all_exhausted = False
+                                break
+                            gi_provider_name = gi_provider["provider"]
                             gi_circular_list = provider_api_circular_list.get(gi_provider_name)
                             if gi_circular_list and not await gi_circular_list.is_all_rate_limited(original_model):
                                 group_all_exhausted = False
@@ -750,6 +785,10 @@ class ModelRequestHandler:
                     continue
 
                 process_fn = process_request_passthrough if (passthrough_ctx and passthrough_ctx.enabled) else process_request
+                # 修改原因：只有 BYOK provider 才应使用请求中的真实上游 key；普通 provider 仍按配置 key pool 轮换。
+                # 修改方式：按当前 provider 是否为 BYOK provider 计算 effective_force_api_key，并传给普通和透传路径。
+                # 目的：避免 BYOK key 误覆盖非 BYOK provider，同时让透传路径也支持 BYOK。
+                effective_force_api_key = byok_real_key if (byok_real_key and is_byok_provider(provider)) else force_api_key
                 response = await process_fn(
                     request_data, provider, background_tasks, self.app,
                     self.request_info_getter, self.update_channel_stats_func,
@@ -758,11 +797,12 @@ class ModelRequestHandler:
                     role=role,
                     timeout_value=local_timeout_value,
                     keepalive_interval=keepalive_interval,
+                    force_api_key=effective_force_api_key,
                 ) if process_fn is process_request_passthrough else await process_request(
                     request_data, provider, background_tasks, self.app,
                     self.request_info_getter, self.update_channel_stats_func,
                     endpoint, role, local_timeout_value, keepalive_interval,
-                    force_api_key=force_api_key
+                    force_api_key=effective_force_api_key
                 )
 
                 # 成功时记录重试路径和重试次数
@@ -840,7 +880,11 @@ class ModelRequestHandler:
 
                 # ── Key Rules 统一错误处理 ──
                 from core.key_rules import apply_key_rule_retry_override, resolve_key_rules, match_key_rules
-                _key_rules = resolve_key_rules(provider.get("preferences") or {})
+                # 修改原因：BYOK provider 没有本地 key pool，上游 401/403 只说明用户自己的 key 有问题。
+                # 修改方式：BYOK 请求跳过 key_rules 匹配和后续自动禁用/冷却。
+                # 目的：避免把不存在的 provider key pool 冷却或禁用，也避免真实 key 出现在运行时禁用快照。
+                is_current_byok_request = bool(byok_real_key) and is_byok_provider(provider)
+                _key_rules = [] if is_current_byok_request else resolve_key_rules(provider.get("preferences") or {})
                 _rule_result = match_key_rules(_key_rules, status_code, error_message) if _key_rules else None
 
                 # 规则中的 remap: 把上游非标准状态码映射为标准码
@@ -878,7 +922,8 @@ class ModelRequestHandler:
                     current_api = await channel_circular_list.after_next_current()
 
                 should_consider_channel_cooldown = (
-                    self.app.state.channel_manager.cooldown_period > 0
+                    not is_current_byok_request
+                    and self.app.state.channel_manager.cooldown_period > 0
                     and override_providers is None
                     and num_matching_providers > 1
                     and all(error not in error_message for error in exclude_error_rate_limit)
@@ -895,7 +940,7 @@ class ModelRequestHandler:
 
                 key_rule_disabled_current = False
                 # ── 应用 Key Rules 规则：冷却 / 禁用 ──
-                if _rule_result and current_api and channel_circular_list:
+                if _rule_result and current_api and channel_circular_list and not is_current_byok_request:
                     _duration = _rule_result.get("duration", 0)
                     _reason = _rule_result.get("reason", "key_rule")
                     if _duration == -1:
@@ -1000,7 +1045,11 @@ class ModelRequestHandler:
                 if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
                     status_code = 429
 
-                logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
+                # 修改原因：BYOK 失败日志不能输出用户真实上游 key。
+                # 修改方式：BYOK 请求只打印模板身份或空值，普通请求保留原有 current_api 便于排障。
+                # 目的：上游 401/403 等错误返回给用户即可，不在服务端日志泄露 BYOK key。
+                log_api_key = byok_template_key if (byok_real_key and is_byok_provider(provider)) else current_api
+                logger.error(f"Error {status_code} with provider {channel_id} API key: {log_api_key}: {error_message}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()
@@ -1011,6 +1060,7 @@ class ModelRequestHandler:
 
                 retry_enabled = (
                     auto_retry
+                    and not is_current_byok_request
                     and (
                         status_code not in [400, 413, 401, 403]
                         or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'
@@ -1051,7 +1101,14 @@ class ModelRequestHandler:
                             # 即将越过当前 group → 检查组内是否还有可用 key
                             group_has_available = False
                             for gi in range(grp_start, grp_end):
-                                gi_name = matching_providers[gi]["provider"]
+                                gi_provider = matching_providers[gi]
+                                if is_byok_provider(gi_provider):
+                                    # 修改原因：BYOK provider 没有本地限流状态，不能因为没有 circular list 就被视为不可用。
+                                    # 修改方式：虚拟路由重试检查遇到 BYOK provider 时直接认为组内仍有可用渠道。
+                                    # 目的：避免 "*" 占位符进入 key pool，同时保持 BYOK provider 的路由兼容性。
+                                    group_has_available = True
+                                    break
+                                gi_name = gi_provider["provider"]
                                 # 修改原因：provider_api_circular_list 改为普通 dict 后，读取缺失 provider 需要显式判空。
                                 # 修改方式：使用 get 取得已有循环列表，再执行 is_all_rate_limited 检查。
                                 # 目的：避免虚拟路由重试检查创建空 key 池。

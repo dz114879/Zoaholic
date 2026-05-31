@@ -81,6 +81,11 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None):
             save_to_db=save_to_db,
             changed_providers=changed_providers,
         )
+        # 修改原因：update_config 保持三元返回，BYOK 前缀表属于运行时派生状态。
+        # 修改方式：热更新配置后基于最新 api_keys_db 重建 app.state.byok_prefixes。
+        # 目的：管理端保存 BYOK 通配符 key 后，标准和方言鉴权立即生效。
+        from core.byok import build_byok_prefixes
+        app.state.byok_prefixes = build_byok_prefixes(app.state.api_keys_db)
         try:
             _rebuild_runtime_rate_limits(app)
         except ValueError as e:

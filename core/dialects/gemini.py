@@ -497,9 +497,12 @@ def parse_gemini_usage(data: Any) -> Optional[Dict[str, int]]:
 
 async def _get_gemini_models(api_index: int, app):
     """获取格式化后的 Gemini 模型列表"""
-    from utils import post_all_models
+    # 修改原因：Gemini 方言的 /v1beta/models 也要支持 BYOK 动态模型列表。
+    # 修改方式：复用 routes.models.build_models_for_request，保持 OpenAI 和 Gemini 模型列表来源一致。
+    # 目的：用户使用 x-goog-api-key 提交 BYOK token 时，也能用真实上游 key 拉取模型。
+    from routes.models import build_models_for_request
 
-    models = post_all_models(api_index, app.state.config, app.state.api_list, app.state.models_list)
+    models = await build_models_for_request(api_index, app)
     
     gemini_models = []
     for m in models:

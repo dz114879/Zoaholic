@@ -410,7 +410,10 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         ))}
                       </>
                     )}
-                    {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥</div>}
+                    {/* 修改原因：BYOK provider 现在必须在密钥列表中显式填写 "*"，空列表不再表示 BYOK。 */}
+                    {/* 修改方式：把空状态提示改为提醒管理员新增 "*" 作为 BYOK 标记。 */}
+                    {/* 目的：避免管理员误以为空密钥仍会启用 BYOK 模式。 */}
+                    {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥。请新增并填写 * 表示 BYOK 模式；空密钥不会启用 BYOK</div>}
                   </div>
                   {isOAuthEngine && (
                     <div className="mt-2 flex justify-end">

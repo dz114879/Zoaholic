@@ -30,6 +30,13 @@ from core.metrics import on_request_start, on_request_end
 from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from core.error_response import openai_error_response
+from core.byok import (
+    get_byok_prefixes,
+    reset_byok_context,
+    resolve_byok_token,
+    set_byok_context,
+    store_byok_scope_state,
+)
 from utils import safe_get
 from db import DISABLE_DATABASE
 
@@ -203,6 +210,10 @@ class StatsMiddleware:
 
         start_time = time()
         headers = scope.get("headers", [])
+        # 修改原因：标准鉴权和方言鉴权都可能在请求上下文中写入 BYOK 真实 key。
+        # 修改方式：请求开始时建立空 BYOK ContextVar，并在请求结束或早退时恢复。
+        # 目的：确保真实上游 key 只在本次请求内可见，不会残留到后续协程上下文。
+        byok_context_tokens = set_byok_context(None, None)
 
         # ── 运行时指标：标记请求开始 ──
         _metrics_model: Optional[str] = None
@@ -224,15 +235,45 @@ class StatsMiddleware:
             if not token:
                 response = openai_error_response("Invalid or missing API Key", 403)
                 await response(scope, receive, send)
+                reset_byok_context(byok_context_tokens)
                 return
 
+            # 修改原因：BYOK token 由“本地模板前缀 + 用户真实上游 key”组成，不会出现在 api_list 中。
+            # 修改方式：精确匹配失败后按 app.state.byok_prefixes 做最长前缀匹配，并把统计 token 改为模板 key。
+            # 目的：本地鉴权仍按 api_keys 条目计费/限速，真实上游 key 只放入请求上下文供上游调用。
+            byok_real_key = None
+            byok_template_key = None
             try:
                 api_list = app.state.api_list
                 api_index = api_list.index(token)
+                try:
+                    from core.byok import is_byok_api_key
+
+                    if is_byok_api_key(getattr(app.state, "api_keys_db", []), api_index):
+                        # 修改原因：中间件标准鉴权路径也可能精确命中 BYOK 模板 key。
+                        # 修改方式：把模板命中视为未完成鉴权，继续进入 BYOK 前缀解析。
+                        # 目的：所有入口都保持同一约束：模板 key 只用于统计归集，不能单独调用上游。
+                        api_index = None
+                except Exception:
+                    pass
             except ValueError:
                 api_index = None
 
+            if api_index is None:
+                byok_result = resolve_byok_token(token, get_byok_prefixes(app))
+                if byok_result is None:
+                    api_index = None
+                else:
+                    api_index, byok_template_key, byok_real_key = byok_result
+                    token = byok_template_key
+
             if api_index is not None:
+                store_byok_scope_state(
+                    scope,
+                    byok_real_key=byok_real_key,
+                    template_key=byok_template_key,
+                    token_for_stats=token,
+                )
                 enable_moderation = safe_get(
                     config,
                     "api_keys",
@@ -256,10 +297,12 @@ class StatsMiddleware:
                     ):
                         response = openai_error_response("Balance is insufficient, please check your account.", 429)
                         await response(scope, receive, send)
+                        reset_byok_context(byok_context_tokens)
                         return
             else:
                 response = openai_error_response("Invalid or missing API Key", 403)
                 await response(scope, receive, send)
+                reset_byok_context(byok_context_tokens)
                 return
 
         # 获取 client IP
@@ -347,9 +390,11 @@ class StatsMiddleware:
         
             # 如果配置了保留时间，保存请求头和请求体
             if raw_data_retention_hours > 0:
-                # 过滤敏感头信息
+                # 修改原因：Gemini 原生入口会使用 x-goog-api-key，BYOK 模式下该头可能携带真实上游 key。
+                # 修改方式：请求原始头日志按大小写归一后的名称过滤所有常见认证头。
+                # 目的：保留排障头信息时不泄露用户 BYOK 真实 key。
                 safe_headers = {k: v for k, v in headers_dict.items()
-                              if k not in ("authorization", "x-api-key")}
+                              if k not in ("authorization", "x-api-key", "api-key", "x-goog-api-key")}
                 current_info["request_headers"] = json.dumps(safe_headers, ensure_ascii=False)
             
                 # 保存请求体（使用深度截断，保留结构同时限制大小）
@@ -485,6 +530,7 @@ class StatsMiddleware:
 
         finally:
             request_info.reset(current_request_info)
+            reset_byok_context(byok_context_tokens)
 
     async def _moderate_content(
         self, content: str, api_index: int, background_tasks: BackgroundTasks, app: Any

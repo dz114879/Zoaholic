@@ -101,11 +101,38 @@ async def verify_api_key(
     if not token:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
+    # 修改原因：BYOK token 不是配置中的完整 api key，精确匹配失败后还需要按通配符前缀解析。
+    # 修改方式：先保持原有精确匹配，再用 app.state.byok_prefixes 做最长前缀匹配；统计身份只使用模板 key。
+    # 目的：让用户提交 byok-gemini-<真实上游key> 时通过本地鉴权，同时避免真实 key 进入 request_info。
     api_index: Optional[int] = None
+    token_for_stats = token
+    byok_real_key: Optional[str] = None
+    byok_template_key: Optional[str] = None
     try:
         api_index = api_list.index(token)
+        try:
+            from core.byok import is_byok_api_key
+
+            if is_byok_api_key(getattr(app.state, "api_keys_db", []), api_index):
+                # 修改原因：BYOK 配置中的 byok-xxx-* 是本地模板身份，不是可直接使用的完整客户端 key。
+                # 修改方式：精确命中通配符模板时不立即放行，继续走前缀解析；前缀解析会拒绝 real_key == "*"。
+                # 目的：强制客户端必须提交 byok-xxx-<真实上游key>，不能只提交模板 key。
+                api_index = None
+        except Exception:
+            pass
     except ValueError:
         api_index = None
+
+    if api_index is None:
+        try:
+            from core.byok import get_byok_prefixes, resolve_byok_token
+
+            byok_result = resolve_byok_token(token, get_byok_prefixes(app))
+            if byok_result is not None:
+                api_index, byok_template_key, byok_real_key = byok_result
+                token_for_stats = byok_template_key
+        except Exception:
+            api_index = None
 
     # 兼容 admin JWT：映射到 admin api_key 的 index
     if api_index is None:
@@ -114,11 +141,29 @@ async def verify_api_key(
 
             if is_admin_jwt(token):
                 api_index = _resolve_admin_api_index(app)
+                if api_index is not None and 0 <= api_index < len(api_list):
+                    token_for_stats = api_list[api_index]
         except Exception:
             api_index = None
 
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+
+    try:
+        from core.byok import store_byok_request_state, update_request_info_auth
+
+        store_byok_request_state(
+            request,
+            byok_real_key=byok_real_key,
+            template_key=byok_template_key,
+            token_for_stats=token_for_stats,
+        )
+        # 修改原因：StatsMiddleware 会先用原始 Header 初始化 request_info，普通 Depends 鉴权成功后也需要同步真实配置身份。
+        # 修改方式：复用 BYOK 模块中的统计字段更新函数，普通 key、admin JWT 和 BYOK 都统一写 api_key/name/group。
+        # 目的：避免方言或普通路由的统计记录保留 dialect-pending、JWT 或原始 BYOK 真实 key。
+        update_request_info_auth(app, api_index, token_for_stats, byok_real_key, byok_template_key)
+    except Exception:
+        pass
 
     return api_index
 
@@ -158,6 +203,16 @@ async def verify_admin_api_key(
     api_index: Optional[int] = None
     try:
         api_index = api_list.index(token)
+        try:
+            from core.byok import is_byok_api_key
+
+            if is_byok_api_key(getattr(app.state, "api_keys_db", []), api_index):
+                # 修改原因：BYOK 配置中的 byok-xxx-* 是本地模板身份，不是可直接使用的完整客户端 key。
+                # 修改方式：精确命中通配符模板时不立即放行，继续走前缀解析；前缀解析会拒绝 real_key == "*"。
+                # 目的：强制客户端必须提交 byok-xxx-<真实上游key>，不能只提交模板 key。
+                api_index = None
+        except Exception:
+            pass
     except ValueError:
         api_index = None
 

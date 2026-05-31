@@ -14,6 +14,7 @@ import httpx
 from fastapi import BackgroundTasks, HTTPException
 from starlette.responses import Response
 
+from core.byok import get_byok_real_key, is_byok_provider
 from core.json_utils import json_dumps_text
 from core.log_config import logger
 from core.models import RequestModel
@@ -261,6 +262,7 @@ async def process_request_passthrough(
     role: Optional[str] = None,
     timeout_value: int = DEFAULT_TIMEOUT,
     keepalive_interval: Optional[int] = None,
+    force_api_key: Optional[str] = None,
 ) -> Response:
     """
     透传模式请求处理：
@@ -282,7 +284,21 @@ async def process_request_passthrough(
     original_model = model_dict[request.model]
 
     channel_id = f"{provider['provider']}"
-    if is_local_api_key(provider["provider"]):
+    current_info_early = request_info_getter()
+    byok_context_key = (
+        current_info_early.get("_byok_real_key")
+        or current_info_early.get("byok_real_key")
+        or get_byok_real_key()
+    )
+    # 修改原因：透传路径也会被渠道测试传入 force_api_key，不能把所有空 api provider 都视作 BYOK。
+    # 修改方式：只有 force_api_key 与当前 BYOK 上下文真实 key 一致时才启用 BYOK 统计脱敏分支。
+    # 目的：BYOK 不泄露真实 key，同时保留普通测试和直接调用的 key 定位能力。
+    byok_provider_request = bool(force_api_key) and force_api_key == byok_context_key and is_byok_provider(provider)
+    if byok_provider_request:
+        api_key = force_api_key
+    elif force_api_key:
+        api_key = force_api_key
+    elif is_local_api_key(provider["provider"]):
         api_key = provider["provider"]
     elif provider.get("api"):
         # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 不应再创建空 key 池。
@@ -295,10 +311,12 @@ async def process_request_passthrough(
     else:
         api_key = None
 
-    original_api_key = api_key
+    # 修改原因：BYOK 透传统计需要挂到 provider api 的显式占位符，而不能继续写入空值。
+    # 修改方式：真实上游请求仍使用 force_api_key 中的用户 key，统计和 _used_api_key 只写入 "*"。
+    # 目的：让透传请求的 channel_stats.provider_api_key 与普通请求一样按 "*" 统一聚合，同时不泄露真实 key。
+    original_api_key = "*" if byok_provider_request else api_key
 
     # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
-    current_info_early = request_info_getter()
     current_info_early["_used_api_key"] = original_api_key
     # 修改原因：透传路径同样可能命中 OAuth 渠道，且 Codex 被动 quota 采集发生在响应读取阶段。
     # 修改方式：在透传请求早期保存 _oauth_channel_id，并按当前 provider name 解析 OAuth key_id。
@@ -394,7 +412,15 @@ async def process_request_passthrough(
 
     current_info["provider_id"] = channel_id
     current_info["_provider_cfg"] = provider  # stream_guard key_rules 用
-    if original_api_key:
+    if byok_provider_request:
+        # 修改原因：BYOK 透传请求没有本地 provider key pool 索引，不能把真实上游 key 映射到 provider_key_index。
+        # 修改方式：显式写 None，覆盖测试或特殊入口中缺失初始化的 request_info。
+        # 目的：让日志和统计消费者都能明确知道本次没有本地渠道 key 索引。
+        current_info["provider_key_index"] = None
+    # 修改原因：BYOK 透传的 original_api_key 是统计占位符 "*"，不能参与本地 key 索引计算。
+    # 修改方式：仅非 BYOK 请求进入 provider_api_circular_list 索引匹配。
+    # 目的：保持 provider_key_index 为 None，防止 "*" 被当作本地上游 key 处理。
+    if original_api_key and not byok_provider_request:
         try:
             # 修改原因：OAuth 解析后 api_key 已是 access_token，不能用于 provider.api 索引匹配。
             # 修改方式：索引匹配始终使用 original_api_key，也就是配置中的 key_id。

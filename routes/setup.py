@@ -258,6 +258,11 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
                 save_to_file=save_to_file,
                 save_to_db=save_to_db,
             )
+            # 修改原因：setup 修复配置后也需要刷新运行时 BYOK 前缀表。
+            # 修改方式：基于最新 api_keys_db 单独重建 app.state.byok_prefixes。
+            # 目的：首次配置或修复后无需重启即可使用 BYOK 通配符身份。
+            from core.byok import build_byok_prefixes
+            app.state.byok_prefixes = build_byok_prefixes(app.state.api_keys_db)
 
         # 更新内存标记
         app.state.needs_setup = False
@@ -292,6 +297,11 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
         save_to_file=save_to_file,
         save_to_db=save_to_db,
     )
+    # 修改原因：首次初始化配置后也需要刷新运行时 BYOK 前缀表。
+    # 修改方式：基于最新 api_keys_db 单独重建 app.state.byok_prefixes。
+    # 目的：保持 setup 初始化路径和常规配置加载路径一致。
+    from core.byok import build_byok_prefixes
+    app.state.byok_prefixes = build_byok_prefixes(app.state.api_keys_db)
 
     app.state.needs_setup = False
     app.state.admin_api_key = [admin_api_key]

@@ -709,7 +709,10 @@ export default function Admin() {
                       <Wand2 className="w-4 h-4" /> 生成
                     </button>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">建议使用以 zk- 开头的随机字符串</p>
+                  {/* 修改原因：管理员需要知道以星号结尾的 API Key 可作为 BYOK 通配符模板。 */}
+                  {/* 修改方式：仅补充说明文字和代码样式示例，不改变 API Key 输入、生成或保存逻辑。 */}
+                  {/* 目的：让 BYOK 模式的配置方式在管理页可见，减少误配置。 */}
+                  <p className="text-xs text-muted-foreground mt-1">建议使用以 zk- 开头的随机字符串。BYOK 模式：以 * 结尾作为通配符模板（如 <code className="font-mono bg-muted px-1 rounded">byok-gemini-*</code>），用户拼接真实上游 Key 后使用</p>
                 </div>
 
                 <div>
@@ -1006,7 +1009,10 @@ export default function Admin() {
                     />
                     <button onClick={addModelsFromInput} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加</p>
+                  {/* 修改原因：BYOK 渠道需要通过“渠道名/*”这类模型规则授权全部模型。 */}
+                  {/* 修改方式：仅扩展手动输入模型规则下方的说明文字，并加入代码样式示例。 */}
+                  {/* 目的：让管理员在配置模型访问规则时能直接看到 BYOK 授权写法。 */}
+                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加。BYOK 用户可用 <code className="font-mono bg-muted px-1 rounded">渠道名/*</code> 授权访问指定 BYOK 渠道的所有模型</p>
                 </div>
               </section>
             </div>

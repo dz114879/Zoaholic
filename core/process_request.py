@@ -25,6 +25,7 @@ from core.models import (
 from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream
 from core.streaming import LoggingStreamingResponse
+from core.byok import get_byok_real_key, is_byok_provider
 from core.utils import get_engine, is_local_api_key, provider_api_circular_list
 from utils import apply_custom_headers, error_handling_wrapper, safe_get
 
@@ -81,7 +82,19 @@ async def process_request(
     original_model = model_dict[request.model]
     
     channel_id = f"{provider['provider']}"
-    if force_api_key:
+    current_info_early = request_info_getter()
+    byok_context_key = (
+        current_info_early.get("_byok_real_key")
+        or current_info_early.get("byok_real_key")
+        or get_byok_real_key()
+    )
+    # 修改原因：force_api_key 同时被渠道测试和 BYOK 使用，不能仅凭 provider.api 为空判断为 BYOK。
+    # 修改方式：只有 force_api_key 与鉴权阶段写入的 BYOK 上下文真实 key 一致时，才按 BYOK 请求处理。
+    # 目的：真实 BYOK 请求不进入本地 key 池；普通单渠道测试仍保留 provider_api_key 统计和 key_rules 定位能力。
+    byok_provider_request = bool(force_api_key) and force_api_key == byok_context_key and is_byok_provider(provider)
+    if byok_provider_request:
+        api_key = force_api_key
+    elif force_api_key:
         api_key = force_api_key
     elif is_local_api_key(provider['provider']):
         api_key = provider['provider']
@@ -96,10 +109,12 @@ async def process_request(
     else:
         api_key = None
 
-    original_api_key = api_key
+    # 修改原因：BYOK 的渠道统计需要归集到 provider api 的显式占位符，而不能继续写入空值。
+    # 修改方式：真实上游请求仍使用 force_api_key 中的用户 key，统计和 _used_api_key 只写入 "*"。
+    # 目的：让 channel_stats.provider_api_key 可按 BYOK provider 的 "*" 统一聚合，同时不泄露真实 key。
+    original_api_key = "*" if byok_provider_request else api_key
 
     # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
-    current_info_early = request_info_getter()
     current_info_early["_used_api_key"] = original_api_key
     # 修改原因：OAuth 凭据现在按 provider name 分层，响应 wrapper 的被动 quota 采集也需要知道当前渠道。
     # 修改方式：在请求早期写入 _oauth_channel_id，并把同一 channel_id 传给 OAuthManager.resolve。
@@ -139,8 +154,11 @@ async def process_request(
     if current_info.get("raw_data_expires_at"):
         try:
             # 记录上游请求头（过滤敏感头信息）
+            # 修改原因：Gemini BYOK 会把真实上游 key 放在 x-goog-api-key，上游请求头日志不能保存该值。
+            # 修改方式：在原有认证头过滤基础上补充 x-goog-api-key。
+            # 目的：开启原始日志保留时也不会泄露用户提供的真实上游 key。
             safe_upstream_headers = {k: v for k, v in headers.items()
-                                    if k.lower() not in ("authorization", "x-api-key", "api-key")}
+                                    if k.lower() not in ("authorization", "x-api-key", "api-key", "x-goog-api-key")}
             current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
             
             # upstream_request_body 已移到 response.py fetch 层记录（能抓到 force_stream 等插件修改后的真实值）
@@ -153,7 +171,15 @@ async def process_request(
     # 记录渠道ID和上游key索引
     current_info["provider_id"] = channel_id
     current_info["_provider_cfg"] = provider  # stream_guard key_rules 用
-    if original_api_key:
+    if byok_provider_request:
+        # 修改原因：BYOK 请求没有本地 provider key pool 索引，不能把真实上游 key 映射到 provider_key_index。
+        # 修改方式：显式写 None，覆盖测试或特殊入口中缺失初始化的 request_info。
+        # 目的：让日志和统计消费者都能明确知道本次没有本地渠道 key 索引。
+        current_info["provider_key_index"] = None
+    # 修改原因：BYOK 的 original_api_key 是统计占位符 "*"，不能参与本地 key 索引计算。
+    # 修改方式：仅非 BYOK 请求进入 provider_api_circular_list 索引匹配。
+    # 目的：保持 provider_key_index 为 None，防止 "*" 被当作本地上游 key 处理。
+    if original_api_key and not byok_provider_request:
         try:
             # 修改原因：OAuth 解析后 api_key 已是 access_token，不能用于 provider.api 索引匹配。
             # 修改方式：索引匹配始终使用 original_api_key，也就是配置中的 key_id。
