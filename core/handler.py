@@ -902,6 +902,25 @@ class ModelRequestHandler:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
+                # ── CDN/WAF 误判修正 ──
+                # 修改原因：Cloudflare Workers 等反代被 WAF 拦截时返回 HTTP 403 + HTML 页面，
+                # 但 error_message 包含 <!DOCTYPE html> 等 CDN 特征，不是上游 API 的真实 403。
+                # 如果直接传给 key_rules，会命中 {status: [403], duration: -1} 导致 key 被永久禁用。
+                # 修改方式：在 key_rules 匹配前，检测 error_message 是否为 HTML/CDN 响应，
+                # 如果是则将 status_code 从 401/403 改为 502 (Bad Gateway)。
+                # 目的：CDN 层面的错误按网络故障处理（走 default 冷却），不误杀 key。
+                if status_code in (401, 403) and error_message:
+                    _err_lower = error_message[:500].lower()
+                    if any(sig in _err_lower for sig in (
+                        '<!doctype', '<html', 'cloudflare', 'cf-ray',
+                        '<head><title>', 'nginx', 'access denied',
+                    )):
+                        logger.info(
+                            f"[cdn_403_fix] Remapping CDN {status_code}→502 for provider {provider.get('provider','?')}, "
+                            f"error starts with: {error_message[:80]!r}"
+                        )
+                        status_code = 502
+
                 # ── Key Rules 统一错误处理 ──
                 from core.key_rules import apply_key_rule_retry_override, resolve_key_rules, match_key_rules
                 # 修改原因：BYOK provider 没有本地 key pool，上游 401/403 只说明用户自己的 key 有问题。
