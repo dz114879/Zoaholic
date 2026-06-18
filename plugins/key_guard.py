@@ -33,20 +33,43 @@ PLUGIN_INFO = {
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
-        "params_hint": "填写 key_guard 冒号后的参数，例如 ua:sillytavern,ua:chatbox,no_tools。留空表示不检测 UA，并默认剥离 tools。",
+        "params_hint": "UA 白名单多个关键词用 | 分隔；Tools 剥离默认开启。旧格式 ua:sillytavern,ua:chatbox,no_tools 仍兼容。",
         "params_schema": [
             {
-                "key": "rules",
-                "label": "规则",
+                "key": "allowed_ua",
+                "label": "UA 白名单",
                 "type": "text",
                 "default": "",
-                "placeholder": "ua:sillytavern,ua:chatbox,no_tools",
-            }
+                "placeholder": "sillytavern|chatbox|kobold",
+                "serialize": "key_value",
+            },
+            {
+                "key": "strip_tools",
+                "label": "剥离 tools",
+                "type": "toggle",
+                "default": True,
+                "serialize": "key_value",
+            },
         ],
     },
 }
 
 logger = logging.getLogger("Zoaholic")
+
+
+def _split_ua_keywords(value: str) -> list:
+    """拆分 UA 关键词。新格式使用 | 分隔，旧手写配置也兼容分号和空白。"""
+    normalized = value.replace(';', '|').replace('\n', '|')
+    return [item.strip().lower() for item in normalized.split('|') if item.strip()]
+
+
+def _parse_bool(value: str, default: bool = True) -> bool:
+    text = str(value or '').strip().lower()
+    if text in {'1', 'true', 'yes', 'on', 'strip_tools'}:
+        return True
+    if text in {'0', 'false', 'no', 'off', 'no_tools'}:
+        return False
+    return default
 
 
 def _parse_opts(enabled_plugins: list) -> tuple:
@@ -71,11 +94,21 @@ def _parse_opts(enabled_plugins: list) -> tuple:
                 kw = part[3:].strip().lower()
                 if kw:
                     allowed_ua.append(kw)
+            elif part.startswith('allowed_ua='):
+                allowed_ua.extend(_split_ua_keywords(part.split('=', 1)[1]))
+            elif part.startswith('ua='):
+                allowed_ua.extend(_split_ua_keywords(part.split('=', 1)[1]))
+            elif part.startswith('strip_tools='):
+                do_strip_tools = _parse_bool(part.split('=', 1)[1], default=do_strip_tools)
+            elif part.startswith('tools='):
+                do_strip_tools = _parse_bool(part.split('=', 1)[1], default=do_strip_tools)
             elif part == 'no_tools':
                 do_strip_tools = False
             elif part == 'strip_tools':
                 do_strip_tools = True
 
+    # 去重并保持顺序，避免重复配置导致日志过长。
+    allowed_ua = list(dict.fromkeys(allowed_ua))
     return allowed_ua, do_strip_tools
 
 

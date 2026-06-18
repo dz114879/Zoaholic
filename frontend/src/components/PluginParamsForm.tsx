@@ -16,6 +16,7 @@ export interface ParamSchema {
   min?: number;
   max?: number;
   visible_when?: Record<string, string>;
+  serialize?: 'positional' | 'key_value';
 }
 
 interface PluginParamsFormProps {
@@ -51,6 +52,10 @@ function hasExplicitKeyValueMode(options: string, schema: ParamSchema[]): boolea
 
 function shouldSerializeAsKeyValue(currentOptions: string, schema: ParamSchema[]): boolean {
   if (hasExplicitKeyValueMode(currentOptions, schema)) return true;
+  // 修改原因：部分插件有多个可视化参数，但后端 options 字符串必须保留字段名，否则 positional 格式无法表达含逗号的列表或布尔开关。
+  // 修改方式：允许 params_schema 用 serialize=key_value 显式声明 key=value 序列化。
+  // 目的：key_guard 等插件可以展示多个控件，同时不破坏既有单字符串 options 机制。
+  if (schema.some(param => param.serialize === 'key_value')) return true;
   // 修改原因：metadata.params_schema 当前没有显式声明序列化格式，但 claude_tools 的 cache 参数必须保留 key=value。
   // 修改方式：对已知需要显示参数名的单参数 key 使用 key=value；其他单参数继续使用 positional 值。
   // 目的：兼容 cache=1h，同时不破坏 retries、mode、message 等既有短格式。
@@ -92,6 +97,27 @@ export function parsePluginOptions(options: string, schemaInput: ParamSchema[]):
       if (schema.some(param => param.key === key)) result[key] = part.slice(idx + 1).trim();
     }
     return result;
+  }
+
+  if (schema.some(param => param.key === 'allowed_ua') && schema.some(param => param.key === 'strip_tools')) {
+    // 修改原因：key_guard 旧配置使用 ua:xxx,no_tools 这类 token 语法，升级为多控件后仍需正确回显旧值。
+    // 修改方式：识别 ua:、no_tools、strip_tools token，映射到 allowed_ua 与 strip_tools 字段。
+    // 目的：旧配置打开后可以自然迁移为 key=value 多参数格式，而不是被 positional 解析错位。
+    const allowedUa: string[] = [];
+    for (const part of trimmed.split(',')) {
+      const token = part.trim();
+      if (!token) continue;
+      if (token.startsWith('ua:')) {
+        const keyword = token.slice(3).trim();
+        if (keyword) allowedUa.push(keyword);
+      } else if (token === 'no_tools') {
+        result.strip_tools = 'false';
+      } else if (token === 'strip_tools') {
+        result.strip_tools = 'true';
+      }
+    }
+    if (allowedUa.length > 0) result.allowed_ua = allowedUa.join(MULTI_VALUE_SEPARATOR);
+    if (allowedUa.length > 0 || result.strip_tools !== undefined) return result;
   }
 
   // 修改原因：单参数插件的 options 可能是完整自由文本，文本中可能包含逗号，不能按逗号拆分。
