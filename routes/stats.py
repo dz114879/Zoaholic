@@ -1821,6 +1821,9 @@ async def api_keys_states(token: str = Depends(verify_admin_api_key)):
     app = get_app()
     
     states_dict = {}
+    # 修改原因：统一配额上线后仍要保留旧 credits 响应，避免旧前端或旧脚本读取 api_keys_states 失败。
+    # 修改方式：原 paid_api_keys_states 循环保持不变，只在后面额外附加 quota_states 字段。
+    # 目的：让 Phase 2 前端可以读取新 quota 状态，同时保持 /v1/api_keys_states 的旧结构兼容。
     for key, state in app.state.paid_api_keys_states.items():
         states_dict[key] = ApiKeyState(
             credits=state["credits"],
@@ -1830,8 +1833,18 @@ async def api_keys_states(token: str = Depends(verify_admin_api_key)):
             enabled=state["enabled"]
         )
 
+    quota_states = {}
+    quota_registry = getattr(app.state, 'quota_registry', None)
+    if quota_registry:
+        for kc in (app.state.config or {}).get('api_keys', []):
+            api = kc.get('api', '')
+            if api and quota_registry.has_quota(api):
+                quota_states[api] = quota_registry.get_key_status(api)
+
     response = ApiKeysStatesResponse(api_keys_states=states_dict)
-    return response
+    resp_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
+    resp_dict['quota_states'] = quota_states
+    return resp_dict
 
 
 @router.post("/v1/add_credits", dependencies=[Depends(rate_limit_dependency)])
