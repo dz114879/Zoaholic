@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../lib/api';
+import { buildEnabledPluginValue, parseEnabledPluginValue, type EnabledPluginValue } from '../lib/pluginEntries';
 import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
 import { PluginParamsForm, type ParamSchema } from './PluginParamsForm';
 import { 
@@ -41,12 +42,12 @@ interface InterceptorSheetProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   allPlugins: PluginOption[];
-  enabledPlugins: string[]; // ["pluginA:config", "pluginB"]
+  enabledPlugins: EnabledPluginValue[]; // ["pluginA:config", { name: "pluginA", params: {...} }]
   providerPreferences: Record<string, unknown>;
   title?: string;
   description?: string;
   returnLabel?: string;
-  onUpdate: (payload: { enabled_plugins: string[]; preferences_patch: Record<string, unknown>; preferences_delete: string[] }) => void;
+  onUpdate: (payload: { enabled_plugins: EnabledPluginValue[]; preferences_patch: Record<string, unknown>; preferences_delete: string[] }) => void;
 }
 
 type InterceptorTab = 'all' | 'channel_inbound' | 'request' | 'response' | 'channel_outbound' | 'key_outbound';
@@ -81,13 +82,9 @@ export function InterceptorSheet({
   const effectivePlugins = localPlugins.length > 0 ? localPlugins : allPlugins;
 
   // Parsing helpers
-  const parseEntry = (entry: string) => {
-    const colonIdx = entry.indexOf(':');
-    if (colonIdx === -1) return { name: entry.trim(), options: '' };
-    return { 
-      name: entry.substring(0, colonIdx).trim(), 
-      options: entry.substring(colonIdx + 1).trim() 
-    };
+  const parseEntry = (entry: EnabledPluginValue) => {
+    const parsed = parseEnabledPluginValue(entry);
+    return { name: parsed.name.trim(), options: (parsed.opts || '').trim() };
   };
 
   // State
@@ -271,9 +268,9 @@ export function InterceptorSheet({
   };
 
   const handleSave = () => {
-    const result: string[] = [];
+    const result: EnabledPluginValue[] = [];
     selected.forEach((options, name) => {
-      result.push(options ? `${name}:${options}` : name);
+      result.push(buildEnabledPluginValue(name, options));
     });
 
     const preferences_patch: Record<string, unknown> = {};

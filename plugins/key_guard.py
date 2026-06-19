@@ -23,7 +23,7 @@ Key 入站防护插件：UA 白名单 + tools 剥离
 
 import logging
 from fastapi import HTTPException
-from core.plugins.interceptors import register_inbound_interceptor
+from core.plugins.interceptors import parse_plugin_entry, register_inbound_interceptor
 
 PLUGIN_INFO = {
     "name": "key_guard",
@@ -33,14 +33,14 @@ PLUGIN_INFO = {
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
-        "params_hint": "UA 白名单多个关键词用 | 分隔；Tools 剥离默认开启。旧格式 ua:sillytavern,ua:chatbox,no_tools 仍兼容。",
+        "params_hint": "UA 白名单每行一个关键词；Tools 剥离默认开启。旧格式 ua:sillytavern,ua:chatbox,no_tools 仍兼容。",
         "params_schema": [
             {
                 "key": "allowed_ua",
                 "label": "UA 白名单",
-                "type": "text",
+                "type": "textarea",
                 "default": "",
-                "placeholder": "sillytavern|chatbox|kobold",
+                "placeholder": "sillytavern\nchatbox\nkobold",
                 "serialize": "key_value",
             },
             {
@@ -57,14 +57,18 @@ PLUGIN_INFO = {
 logger = logging.getLogger("Zoaholic")
 
 
-def _split_ua_keywords(value: str) -> list:
-    """拆分 UA 关键词。新格式使用 | 分隔，旧手写配置也兼容分号和空白。"""
-    normalized = value.replace(';', '|').replace('\n', '|')
-    return [item.strip().lower() for item in normalized.split('|') if item.strip()]
+def _split_ua_keywords(value) -> list:
+    """拆分 UA 关键词。新结构使用列表；旧手写配置继续兼容换行、|、分号。"""
+    if isinstance(value, list):
+        return [str(item).strip().lower() for item in value if str(item).strip()]
+    normalized = str(value or '').replace(';', '\n').replace('|', '\n')
+    return [item.strip().lower() for item in normalized.splitlines() if item.strip()]
 
 
-def _parse_bool(value: str, default: bool = True) -> bool:
-    text = str(value or '').strip().lower()
+def _parse_bool(value, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else '').strip().lower()
     if text in {'1', 'true', 'yes', 'on', 'strip_tools'}:
         return True
     if text in {'0', 'false', 'no', 'off', 'no_tools'}:
@@ -81,11 +85,22 @@ def _parse_opts(enabled_plugins: list) -> tuple:
         return allowed_ua, do_strip_tools
 
     for ep in enabled_plugins:
-        if ep == 'key_guard':
+        plugin_name, options = parse_plugin_entry(ep)
+        if plugin_name != 'key_guard':
             continue
-        if not ep.startswith('key_guard:'):
+
+        if isinstance(options, dict):
+            allowed_ua.extend(_split_ua_keywords(options.get('allowed_ua') or options.get('ua') or []))
+            if 'strip_tools' in options:
+                do_strip_tools = _parse_bool(options.get('strip_tools'), default=do_strip_tools)
+            elif 'tools' in options:
+                do_strip_tools = _parse_bool(options.get('tools'), default=do_strip_tools)
             continue
-        parts = ep.split(':', 1)[1].split(',')
+
+        if not isinstance(options, str) or not options:
+            continue
+
+        parts = options.split(',')
         for part in parts:
             part = part.strip()
             if not part:

@@ -66,9 +66,9 @@ from ..log_config import logger
 # 修改原因：balance_enricher 需要复用 response_interceptor 的插件参数读取方式。
 # 修改方式：继续使用同一个 ContextVar，由 apply_response_interceptors 和 apply_balance_enrichers 在调用前设置。
 # 目的：让插件在响应处理和余额补充两个阶段都能通过 get_current_plugin_options() 读取自身参数。
-_current_enabled_plugins: ContextVar[Optional[List[str]]] = ContextVar('_current_enabled_plugins', default=None)
+_current_enabled_plugins: ContextVar[Optional[List[Any]]] = ContextVar('_current_enabled_plugins', default=None)
 
-def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
+def parse_plugin_entry(entry: Any) -> Tuple[str, Optional[Any]]:
     """
     解析单个插件条目，分离插件名和参数
     
@@ -90,7 +90,25 @@ def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
         >>> parse_plugin_entry("my_plugin:foo,bar")
         ("my_plugin", "foo,bar")
     """
-    if not entry or not isinstance(entry, str):
+    if not entry:
+        return ("", None)
+
+    if isinstance(entry, dict):
+        # 修改原因：字符串式 plugin:options 不适合复杂参数，YAML 中应允许结构化写法。
+        # 修改方式：支持 {name, params/options} 和 {plugin_name: params} 两种对象形式。
+        # 目的：让 key_guard 等多参数插件可以落盘为可读 YAML，同时兼容旧字符串格式。
+        plugin_name = entry.get("name") or entry.get("plugin") or entry.get("plugin_name")
+        if isinstance(plugin_name, str) and plugin_name.strip():
+            options = entry.get("params", entry.get("options"))
+            return (plugin_name.strip(), options if options not in ("", None) else None)
+
+        if len(entry) == 1:
+            key, value = next(iter(entry.items()))
+            if isinstance(key, str) and key.strip():
+                return (key.strip(), value if value not in ("", None) else None)
+        return ("", None)
+
+    if not isinstance(entry, str):
         return ("", None)
     
     entry = entry.strip()
@@ -109,7 +127,7 @@ def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
     return (plugin_name, options if options else None)
 
 
-def parse_enabled_plugins(enabled_plugins: Optional[List[str]]) -> Dict[str, Optional[str]]:
+def parse_enabled_plugins(enabled_plugins: Optional[List[Any]]) -> Dict[str, Optional[Any]]:
     """
     解析 enabled_plugins 列表，返回 {plugin_name: options} 映射
     

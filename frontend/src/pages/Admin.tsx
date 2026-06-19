@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { buildEnabledPluginValue as buildPluginEntryValue, parseEnabledPluginValue, type EnabledPluginValue } from '../lib/pluginEntries';
 import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import {
   Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search,
@@ -148,15 +149,12 @@ function getQuotaStatusKeyFromConfig(key: string): string {
 // 修改方式：从 PipelineView.tsx 抄入 DetailPanel、PluginCard、PluginAddDropdown 及 parseEnabledPlugin/buildEnabledPluginValue。
 // 目的：让 Key 的入站/出站面板与渠道 Pipeline 使用完全一致的 UI 组件。
 
-function parseEnabledPlugin(value: string) {
-  const colonIndex = value.indexOf(':');
-  if (colonIndex < 0) return { name: value, opts: undefined, hasOpts: false };
-  return { name: value.slice(0, colonIndex), opts: value.slice(colonIndex + 1), hasOpts: true };
+function parseEnabledPlugin(value: EnabledPluginValue) {
+  return parseEnabledPluginValue(value);
 }
 
-function buildEnabledPluginValue(name: string, opts: string) {
-  const trimmedOpts = opts.trim();
-  return trimmedOpts ? `${name}:${trimmedOpts}` : name;
+function buildEnabledPluginValue(name: string, opts: string): EnabledPluginValue {
+  return buildPluginEntryValue(name, opts);
 }
 
 function DetailPanel({ icon, title, desc, children }: { icon: ReactNode; title: string; desc: string; children: ReactNode }) {
@@ -316,7 +314,7 @@ export default function Admin() {
   const [formExcludedChannels, setFormExcludedChannels] = useState<string[]>([]);
   const [formExcludedModels, setFormExcludedModels] = useState<string[]>([]);
   const [formIpBlacklistText, setFormIpBlacklistText] = useState('');
-  const [formEnabledPlugins, setFormEnabledPlugins] = useState<string[]>([]);
+  const [formEnabledPlugins, setFormEnabledPlugins] = useState<EnabledPluginValue[]>([]);
   const [formBasePreferences, setFormBasePreferences] = useState<Record<string, unknown>>({});
   const [formPluginPreferenceOverrides, setFormPluginPreferenceOverrides] = useState<Record<string, unknown>>({});
   const [formPluginPreferenceDeletes, setFormPluginPreferenceDeletes] = useState<string[]>([]);
@@ -436,7 +434,7 @@ export default function Admin() {
     return merged;
   }, [formBasePreferences, formPluginPreferenceDeletes, formPluginPreferenceOverrides]);
 
-  const handleKeyPluginSheetUpdate = (payload: { enabled_plugins: string[]; preferences_patch: Record<string, unknown>; preferences_delete: string[] }) => {
+  const handleKeyPluginSheetUpdate = (payload: { enabled_plugins: EnabledPluginValue[]; preferences_patch: Record<string, unknown>; preferences_delete: string[] }) => {
     // 修改原因：Key 面板现在复用完整插件配置 Sheet，需要把启用插件和插件级 preferences 先写回本地表单状态。
     // 修改方式：enabled_plugins 直接替换；preferences_patch 进入 override；preferences_delete 从 override 中清除并加入删除列表。
     // 目的：让用户点击「保存插件配置」后仍可继续编辑 Key，最终由 API Key 保存按钮统一落盘。
@@ -1586,12 +1584,12 @@ export default function Admin() {
                 {(() => {
                   const toggleKN = (id: string) => setActiveKeyNode(prev => prev === id ? null : id);
                   const inboundCount = formEnabledPlugins.filter(p => {
-                    const n = p.includes(':') ? p.slice(0, p.indexOf(':')) : p;
+                    const n = parseEnabledPlugin(p).name;
                     const info = allPlugins.find((pl: any) => (pl.plugin_name || pl.name) === n);
                     return !info || (info.inbound_interceptors?.length ?? 0) > 0;
                   }).length;
                   const outboundCount = formEnabledPlugins.filter(p => {
-                    const n = p.includes(':') ? p.slice(0, p.indexOf(':')) : p;
+                    const n = parseEnabledPlugin(p).name;
                     const info = allPlugins.find((pl: any) => (pl.plugin_name || pl.name) === n);
                     return info && (info.key_outbound_interceptors?.length ?? 0) > 0;
                   }).length;

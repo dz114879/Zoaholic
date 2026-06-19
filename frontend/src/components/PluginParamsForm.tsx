@@ -9,7 +9,7 @@ export interface ParamOption {
 export interface ParamSchema {
   key: string;
   label: string;
-  type: 'select' | 'text' | 'number' | 'toggle' | 'multi-select';
+  type: 'select' | 'text' | 'textarea' | 'number' | 'toggle' | 'multi-select';
   options?: ParamOption[];
   default?: unknown;
   placeholder?: string;
@@ -267,6 +267,16 @@ export function PluginParamsForm({ options, schema: schemaInput, onChange, disab
                 value={value}
                 onChange={event => updateValue(param.key, event.target.value)}
                 placeholder={param.placeholder || paramsHint || '留空使用默认值'}
+              />
+            )}
+            {param.type === 'textarea' && (
+              <textarea
+                {...commonProps}
+                value={value}
+                onChange={event => updateValue(param.key, event.target.value)}
+                placeholder={param.placeholder || paramsHint || '留空使用默认值'}
+                rows={compact ? 3 : 5}
+                className={`${controlBaseClass} ${compact ? 'h-16 py-1' : 'min-h-[96px] py-2'}`}
               />
             )}
             {param.type === 'number' && (

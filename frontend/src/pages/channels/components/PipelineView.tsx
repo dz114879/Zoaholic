@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { ProviderLogo } from '../../../components/ProviderLogos';
 import { UiSlot } from './KeyComponents';
+import { buildEnabledPluginValue as buildPluginEntryValue, parseEnabledPluginValue, type EnabledPluginValue } from '../../../lib/pluginEntries';
 import { hasUiSlot } from '../utils';
 import { PluginParamsForm, type ParamSchema } from '../../../components/PluginParamsForm';
 
@@ -20,7 +21,7 @@ interface PipelineViewProps {
   // 修改原因：Pipeline 面板需要支持 inline 增删插件和编辑参数，不能只打开 InterceptorSheet。
   // 修改方式：新增 onPluginsChange，把更新后的 enabled_plugins 数组交回 ChannelEditor 写入 formData。
   // 目的：让常用插件操作可以在 Pipeline 面板内直接完成。
-  onPluginsChange: (plugins: string[]) => void;
+  onPluginsChange: (plugins: EnabledPluginValue[]) => void;
   formatJsonOnBlur: (json: string, setter: (v: string) => void, label: string) => void;
 }
 
@@ -106,21 +107,12 @@ type EnabledPluginEntry = {
   entryIndex: number;
 };
 
-function parseEnabledPlugin(value: string) {
-  // 修改原因：enabled_plugins 允许使用 plugin:opts 格式，直接 split(':') 会丢失参数中的冒号。
-  // 修改方式：只按第一个冒号拆分，保留后续字符串作为完整参数。
-  // 目的：inline 编辑参数时不破坏已有插件配置。
-  const colonIndex = value.indexOf(':');
-  if (colonIndex < 0) return { name: value, opts: undefined, hasOpts: false };
-  return { name: value.slice(0, colonIndex), opts: value.slice(colonIndex + 1), hasOpts: true };
+function parseEnabledPlugin(value: EnabledPluginValue) {
+  return parseEnabledPluginValue(value);
 }
 
-function buildEnabledPluginValue(name: string, opts: string) {
-  // 修改原因：参数输入框允许用户清空 opts，清空后应回到纯插件名格式。
-  // 修改方式：提交时 trim 参数，非空写 plugin:opts，空值只写 plugin。
-  // 目的：保持 enabled_plugins 数组简洁，并兼容无参数插件。
-  const trimmedOpts = opts.trim();
-  return trimmedOpts ? `${name}:${trimmedOpts}` : name;
+function buildEnabledPluginValue(name: string, opts: string): EnabledPluginValue {
+  return buildPluginEntryValue(name, opts);
 }
 
 function PluginCard({ name, opts, hasOpts, description, paramsSchema, paramsHint, onRemove, onOptsChange }: {
@@ -240,7 +232,7 @@ export function PipelineView({
 }: PipelineViewProps) {
   const [activeNode, setActiveNode] = useState<string | null>(null);
   const [openAddMenu, setOpenAddMenu] = useState<PluginStage | null>(null);
-  const enabledPlugins: string[] = formData.preferences?.enabled_plugins || [];
+  const enabledPlugins: EnabledPluginValue[] = formData.preferences?.enabled_plugins || [];
 
   useEffect(() => {
     // 修改原因：快速添加菜单使用 absolute 定位弹出，需要点击外部时自动关闭。
