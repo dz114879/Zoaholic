@@ -552,6 +552,7 @@ class ModelRequestHandler:
         dialect_id: Optional[str] = None,
         original_payload: Optional[Dict[str, Any]] = None,
         original_headers: Optional[Dict[str, str]] = None,
+        raw_request: Optional[Any] = None,
         passthrough_only: bool = False,
         override_providers: Optional[List[Dict[str, Any]]] = None,
         force_api_key: Optional[str] = None,
@@ -569,6 +570,7 @@ class ModelRequestHandler:
             dialect_id: 入口方言 ID（原生路由传入）
             original_payload: 原始 native 请求体（透传用）
             original_headers: 原始请求头（透传用）
+            raw_request: 原始 FastAPI Request 对象，供入站插件读取请求头
             override_auto_retry: override provider 测试是否允许按候选列表自动重试
             
         Returns:
@@ -729,6 +731,8 @@ class ModelRequestHandler:
             "api_index": api_index,
             "model": request_model_name,
             "role": role,
+            "headers": dict(original_headers or {}),
+            "original_headers": dict(original_headers or {}),
         }
         _key_enabled_plugins = safe_get(
             config, 'api_keys', api_index, 'preferences', 'enabled_plugins',
@@ -737,8 +741,10 @@ class ModelRequestHandler:
         try:
             from core.plugins.interceptors import apply_inbound_interceptors
             request_data = await apply_inbound_interceptors(
-                request_data, None, _interceptor_api_key_info, _key_enabled_plugins
+                request_data, raw_request, _interceptor_api_key_info, _key_enabled_plugins
             )
+        except HTTPException:
+            raise
         except Exception as _inbound_err:
             logger.warning(f"Inbound interceptors error: {_inbound_err}")
 

@@ -57,6 +57,8 @@ from contextvars import ContextVar
 from contextlib import asynccontextmanager
 import re
 
+from fastapi import HTTPException
+
 from ..log_config import logger
 
 
@@ -419,6 +421,9 @@ class InterceptorRegistry:
                 result = await interceptor.callback(request_data, request, api_key_info, enabled_plugins)
                 if result is not None:
                     request_data = result
+            except HTTPException:
+                logger.warning(f"Inbound interceptor '{interceptor.id}' rejected request")
+                raise
             except Exception as e:
                 logger.error(f"Inbound interceptor '{interceptor.id}' error: {e}")
         

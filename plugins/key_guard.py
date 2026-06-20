@@ -127,13 +127,26 @@ def _parse_opts(enabled_plugins: list) -> tuple:
     return allowed_ua, do_strip_tools
 
 
-def _get_ua(request) -> str:
-    if request is None:
-        return ''
-    try:
-        return dict(request.headers).get('user-agent', '').lower()
-    except Exception:
-        return ''
+def _get_ua(request, api_key_info=None) -> str:
+    """从原始请求或 handler 传入的 headers 中读取 User-Agent。"""
+    header_sources = []
+    if request is not None:
+        try:
+            header_sources.append(request.headers)
+        except Exception:
+            pass
+    if api_key_info:
+        header_sources.append(api_key_info.get('headers') or {})
+        header_sources.append(api_key_info.get('original_headers') or {})
+
+    for headers in header_sources:
+        try:
+            for k, v in dict(headers).items():
+                if str(k).lower() == 'user-agent':
+                    return str(v or '').lower()
+        except Exception:
+            continue
+    return ''
 
 
 def _strip_tools(request_data):
@@ -155,7 +168,7 @@ async def key_guard_interceptor(request_data, request, api_key_info, enabled_plu
 
     # UA 白名单检测
     if allowed_ua:
-        ua = _get_ua(request)
+        ua = _get_ua(request, api_key_info)
         matched = any(kw in ua for kw in allowed_ua)
         if not matched:
             logger.warning(f"[key_guard] UA not in whitelist for key {api_key}... (UA: {ua[:80]}), allowed: {allowed_ua}")
