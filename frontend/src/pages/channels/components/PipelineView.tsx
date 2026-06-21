@@ -84,7 +84,7 @@ function PipeNode({ icon, label, badge, badgeEmpty, active, onClick }: {
 
 function Connector() {
   return (
-    <div className="flex items-center h-10 min-w-[8px] flex-1 max-w-[20px] relative mx-0.5 flex-shrink-0">
+    <div className="flex items-center h-10 min-w-[4px] flex-1 max-w-[14px] relative mx-0 shrink">
       <div className="absolute top-1/2 left-0 right-[5px] h-px bg-border" />
       <div className="absolute right-0 top-1/2 -translate-y-1/2 border-t-[3px] border-t-transparent border-b-[3px] border-b-transparent border-l-[5px] border-l-border" />
     </div>
@@ -479,11 +479,11 @@ export function PipelineView({
   };
 
   return (
-    <div className="bg-card border border-border rounded-xl px-4 pt-4 pb-3 overflow-x-auto">
+    <div className="bg-card border border-border rounded-xl px-4 pt-4 pb-3 overflow-visible">
       {/* Pipeline flow — 上游居中 */}
-      <div className="grid grid-cols-[1fr_auto_1fr] items-start min-w-[600px]">
+      <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-start w-full min-w-0 gap-x-1">
         {/* 左侧: start → inbound → overrides → request → */}
-        <div className="flex items-center justify-end gap-0">
+        <div className="flex min-w-0 items-center justify-end gap-0">
           <EndpointDot icon={<Smartphone className="w-3.5 h-3.5" />} label="入" />
           <Connector />
           <PipeNode icon={<ShieldCheck className="w-4 h-4" />} label="渠道入站" badge={channelInboundPlugins.length} badgeEmpty={channelInboundPlugins.length === 0} active={activeNode === 'inbound'} onClick={() => toggle('inbound')} />
@@ -495,7 +495,7 @@ export function PipelineView({
         </div>
 
         {/* 中间: upstream — 使用 ProviderLogo */}
-        <div className="flex flex-col items-center cursor-pointer group flex-shrink-0 mx-1" onClick={() => toggle('upstream')}>
+        <div className="flex flex-col items-center cursor-pointer group flex-shrink-0 mx-0.5" onClick={() => toggle('upstream')}>
           <div className={`relative w-10 h-10 rounded-xl flex items-center justify-center border-[1.5px] border-dashed transition-all overflow-hidden
             ${activeNode === 'upstream'
               ? 'border-cyan-400 bg-cyan-400/5 shadow-[0_0_14px_rgba(34,211,238,0.15)]'
@@ -516,7 +516,7 @@ export function PipelineView({
         </div>
 
         {/* 右侧: → response → key rules → end */}
-        <div className="flex items-center justify-start gap-0">
+        <div className="flex min-w-0 items-center justify-start gap-0">
           <Connector />
           <PipeNode icon={<PackageCheck className="w-4 h-4" />} label="响应" badge={responsePlugins.length} badgeEmpty={responsePlugins.length === 0} active={activeNode === 'response'} onClick={() => toggle('response')} />
           <Connector />
