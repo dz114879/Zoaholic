@@ -496,16 +496,18 @@ export function PipelineView({
 
         {/* 中间: upstream — 使用 ProviderLogo */}
         <div className="flex flex-col items-center cursor-pointer group flex-shrink-0 mx-0.5" onClick={() => toggle('upstream')}>
-          <div className={`relative w-10 h-10 rounded-xl flex items-center justify-center border-[1.5px] border-dashed transition-all overflow-hidden
+          <div className={`relative w-10 h-10 rounded-xl flex items-center justify-center border-[1.5px] border-dashed transition-all overflow-visible
             ${activeNode === 'upstream'
               ? 'border-cyan-400 bg-cyan-400/5 shadow-[0_0_14px_rgba(34,211,238,0.15)]'
               : 'border-cyan-400/40 bg-muted group-hover:border-cyan-400'}`}
           >
-            <div className="scale-[0.8]">
-              <ProviderLogo name={formData.provider || ''} engine={formData.engine} baseUrl={formData.base_url} />
+            <div className="w-full h-full rounded-[10px] overflow-hidden flex items-center justify-center">
+              <div className="scale-[0.8]">
+                <ProviderLogo name={formData.provider || ''} engine={formData.engine} baseUrl={formData.base_url} />
+              </div>
             </div>
             {hasSystemPrompt && (
-              <span className="absolute -top-1.5 -right-1.5 text-[8px] font-bold min-w-5 h-4 px-1 rounded-full flex items-center justify-center border-[1.5px] border-card bg-cyan-500 text-white">
+              <span className="absolute -top-1.5 -right-1.5 z-10 text-[8px] font-bold min-w-5 h-4 px-1 rounded-full flex items-center justify-center border-[1.5px] border-card bg-cyan-500 text-white">
                 SP
               </span>
             )}
